@@ -2079,6 +2079,93 @@ def test_evaluate_patch_and_audit_branch_reject_custom_p1_prefixes_symlink_renam
     assert rc == 0
     assert payload["status"] == "ALLOWED"
 
+    # 8. Binary patches & differ headers targeting immutable paths/symlinks fail closed
+    for idx_bin, bin_patch in enumerate(
+        [
+            (
+                "diff --git a/lab/ok.py b/lab/ok.py\n"
+                "--- a/lab/ok.py\n"
+                "+++ b/lab/ok.py\n"
+                "@@ -1 +1 @@\n"
+                "-OK = 1\n"
+                "+OK = 2\n"
+                "Binary files x/tests/acceptance/evil.bin and y/tests/acceptance/evil.bin differ\n"
+            ),
+            (
+                'Binary files "a/tests/acceptance/evil file.bin" '
+                'and "b/tests/acceptance/evil file.bin" differ\n'
+            ),
+            "Files a/src/contracts/data.bin and b/src/contracts/data.bin differ\n",
+            (
+                "diff --git a/tests/acceptance/evil.bin b/tests/acceptance/evil.bin\n"
+                "new file mode 100644\n"
+                "index 0000000..1234567\n"
+                "GIT binary patch\n"
+                "literal 4\n"
+                "LcmZQzU|<5P002M$\n"
+            ),
+            (
+                "diff --git a/lab/sym_bin b/lab/sym_bin\n"
+                "new file mode 120000\n"
+                "index 0000000..1234567\n"
+                "GIT binary patch\n"
+                "literal 5\n"
+                "McmZQzU|<5P002M$\n"
+            ),
+            "GIT binary patch\nliteral 4\nLcmZQzU|<5P002M$\n",
+        ]
+    ):
+        p_bin = tmp_path / f"evil_bin_{idx_bin}.patch"
+        p_bin.write_text(bin_patch, encoding="utf-8")
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_bin),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    p_bin_ok = tmp_path / "good_bin.patch"
+    p_bin_ok.write_text(
+        "diff --git a/lab/fixture.bin b/lab/fixture.bin\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "GIT binary patch\n"
+        "literal 4\n"
+        "LcmZQzU|<5P002M$\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_bin_ok),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+
+    guard = PolicyGuard()
+    with pytest.raises(PolicyImmutabilityError, match="null byte"):
+        guard.check_added_lines(
+            [],
+            touched_paths=["lab/ok_sym"],
+            repo_path=lab_repo,
+            symlink_added_targets=[("lab/ok_sym", "safe\x00dir")],
+        )
+
     head_after = subprocess.run(
         ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
         check=True,

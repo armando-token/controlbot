@@ -313,6 +313,74 @@ def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> 
     return parsed
 
 
+def _parse_binary_differ_line(line: str) -> tuple[str | None, str | None]:
+    """Parse `Binary files <left> and <right> differ` or `Files <left> and <right> differ`."""
+    prefix = "Binary files " if line.startswith("Binary files ") else "Files "
+    if not line.endswith(" differ"):
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable binary diff header {line!r}."
+        )
+    body = line[len(prefix) : -len(" differ")].strip()
+    if not body:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty binary diff header {line!r}."
+        )
+
+    left_raw: str
+    right_raw: str
+    if '"' in body:
+        idx = 0
+        if body[idx] == '"':
+            left_raw, idx = _consume_quoted_git_token(body, idx)
+        else:
+            sep_idx = body.find(" and ")
+            if sep_idx == -1:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable binary diff header {line!r}."
+                )
+            left_raw = body[:sep_idx].strip()
+            idx = sep_idx
+        if not body[idx:].startswith(" and "):
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable binary diff header {line!r}."
+            )
+        idx += len(" and ")
+        rest = body[idx:].lstrip()
+        if rest.startswith('"'):
+            right_raw, end_idx = _consume_quoted_git_token(rest, 0)
+            if rest[end_idx:].strip():
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable binary diff header {line!r}."
+                )
+        else:
+            right_raw = rest
+    else:
+        parts = body.split(" and ")
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            left_raw, right_raw = parts[0].strip(), parts[1].strip()
+        else:
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable binary diff header {line!r}."
+            )
+
+    if left_raw.startswith("a/") and right_raw.startswith("b/"):
+        left: str | None = left_raw[2:]
+        right: str | None = right_raw[2:]
+    elif left_raw == "/dev/null" and right_raw.startswith("b/"):
+        left, right = None, right_raw[2:]
+    elif right_raw == "/dev/null" and left_raw.startswith("a/"):
+        left, right = left_raw[2:], None
+    else:
+        left = None if left_raw == "/dev/null" else left_raw
+        right = None if right_raw == "/dev/null" else right_raw
+
+    if (left is not None and not left) or (right is not None and not right):
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in binary diff header {line!r}."
+        )
+    return left, right
+
+
 def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
     """Parse git/unified diff path headers, added lines, 120000 targets, and renames."""
     touched: list[str] = []
@@ -325,6 +393,7 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
             touched.append(path_str)
 
     in_hunk = False
+    in_binary_patch = False
     old_rem = 0
     new_rem = 0
     current_is_symlink = False
@@ -366,6 +435,7 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
         if line.startswith("diff --git "):
             _flush_section()
             in_hunk = False
+            in_binary_patch = False
             old_rem = 0
             new_rem = 0
             current_is_symlink = False
@@ -385,6 +455,7 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
             continue
 
         if line.startswith("@@"):
+            in_binary_patch = False
             m = _HUNK_HEADER_RE.match(line)
             if m is None:
                 raise PolicyImmutabilityError(
@@ -426,6 +497,35 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
                 )
             if old_rem <= 0 and new_rem <= 0:
                 in_hunk = False
+            continue
+
+        if (line.startswith("Binary files ") or line.startswith("Files ")) and line.endswith(
+            " differ"
+        ):
+            in_binary_patch = False
+            bin_left, bin_right = _parse_binary_differ_line(line)
+            if bin_left is not None:
+                _add_touched(bin_left)
+                current_section_paths.append(bin_left)
+            if bin_right is not None:
+                _add_touched(bin_right)
+                current_section_paths.append(bin_right)
+            continue
+
+        if line.strip() == "GIT binary patch":
+            if not current_section_paths:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: GIT binary patch missing target path header."
+                )
+            if current_is_symlink:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: binary patch targeting 120000 symlink "
+                    f"{current_section_paths[-1]!r} is not permitted."
+                )
+            in_binary_patch = True
+            continue
+
+        if in_binary_patch:
             continue
 
         if line.startswith(
@@ -986,6 +1086,11 @@ class PolicyGuard:
         added_symlinks_exact: dict[str, str] = {}
         added_symlinks_folded: dict[str, str] = {}
         for link_rel, target_str in symlink_added_targets:
+            if "\x00" in link_rel or "\x00" in target_str:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: null byte in symlink patch entry.",
+                    offending_paths=tuple(touched_paths) or (link_rel,),
+                )
             norm_link = posixpath.normpath(link_rel.strip().replace("\\", "/"))
             if (
                 not norm_link
