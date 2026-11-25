@@ -1,7 +1,7 @@
 # Third-Party Notices & Provenance Inventory
 
-**Generated**: `2026-11-25` (M1 Lock Baseline)
-**Source Lockfile**: `uv.lock` (Python `3.12.15`, `requires-python = ">=3.12,<3.13"`)
+**Generated**: `2026-11-25` (M6 Final Lock Baseline)
+**Source Lockfile**: `uv.lock` (Python `3.12.15`, `requires-python = ">=3.12,<3.13"`, `41` resolved packages = `grokbotclon` + `40` third-party packages)
 
 ---
 
@@ -10,7 +10,7 @@
 Grokbot-clon distinguishes strictly between **studied behavioral patterns** and **incorporated dependencies**:
 1. **Patrón estudiado (Zero Code Vendored)**:
    - The 13 surveyed external projects documented in `docs/research/` (`Rakazo`, `Hermes Agent`, `OpenClaw`, `OpenMausBot`, `NanoClaw`, `IronClaw`, `OpenHands`, `Playwright MCP`, `agent-browser`, `Browser Use`, `Cua`, `Munim Computer Use`, `CUA-JEV`) are **reference designs only**.
-   - **Zero** source files, tests, or fragments from those repositories are copied or vendored into `src/`.
+   - **Zero** source files, tests, or fragments from those repositories are copied or vendored into `src/`, `src/factory/`, `deploy/`, `lab/`, or `benchmarks/`.
    - **Explicit Quarantine**: `milind-soni/OpenMausBot/enterprise/` (source-available `OpenMausBot Enterprise License` requiring paid/partner keys) is quarantined and completely unused.
 2. **Dependencia incorporada**:
    - All runtime and development Python packages incorporated into Grokbot-clon are pinned in `pyproject.toml` and `uv.lock` below, using permissive OSI-approved licenses (`MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `Apache-2.0`, `PSF-2.0`, `MPL-2.0`).
@@ -27,6 +27,7 @@ Grokbot-clon distinguishes strictly between **studied behavioral patterns** and 
 | `httpx` | `0.28.1` | Runtime | `BSD-3-Clause` | `https://github.com/encode/httpx` |
 | `jinja2` | `3.1.6` | Runtime | `BSD-3-Clause` | `https://github.com/pallets/jinja` |
 | `playwright` | `1.64.0` | Runtime | `Apache-2.0` | `https://github.com/microsoft/playwright-python` |
+| `pyyaml` | `6.0.4` | Runtime | `MIT` | `https://github.com/yaml/pyyaml` |
 | `pytest` | `8.4.2` | Dev | `MIT` | `https://github.com/pytest-dev/pytest` |
 | `pytest-asyncio` | `0.26.0` | Dev | `Apache-2.0` | `https://github.com/pytest-dev/pytest-asyncio` |
 | `ruff` | `0.17.6` | Dev | `MIT` | `https://github.com/astral-sh/ruff` |
@@ -36,7 +37,7 @@ Grokbot-clon distinguishes strictly between **studied behavioral patterns** and 
 
 ## 3. Transitive Python Dependencies in `uv.lock`
 
-Verified from `uv.lock` and installed `.venv` `.dist-info` metadata:
+Verified from `uv.lock` and installed `.venv` `.dist-info` metadata (`29` transitive packages):
 
 | Package | Locked Version | Verified License (from `.dist-info` / PyPI) |
 |---|---|---|
@@ -63,7 +64,6 @@ Verified from `uv.lock` and installed `.venv` `.dist-info` metadata:
 | `pyee` | `14.0.0` | `MIT` |
 | `pygments` | `2.21.0` | `BSD-2-Clause` |
 | `python-dotenv` | `1.2.4` | `BSD-3-Clause` |
-| `pyyaml` | `6.0.4` | `MIT` |
 | `starlette` | `1.10.0` | `BSD-3-Clause` |
 | `typing-extensions` | `4.16.0` | `PSF-2.0` |
 | `typing-inspection` | `0.4.5` | `MIT` |
@@ -75,7 +75,7 @@ Verified from `uv.lock` and installed `.venv` `.dist-info` metadata:
 
 ## 4. Playwright Browser Binaries & FFmpeg Notices
 
-Playwright (`playwright==1.64.0`, `Apache-2.0`) manages external browser binaries in the OS Playwright cache (`~/Library/Caches/ms-playwright` on macOS, `~/.cache/ms-playwright` on Linux):
+Playwright (`playwright==1.64.0`, `Apache-2.0`) manages external browser binaries in the OS Playwright cache (`~/Library/Caches/ms-playwright` on macOS, `~/.cache/ms-playwright` on Linux, or `/opt/grokbot/ms-playwright` in offline Linux deployments):
 
 - **Chromium (`chromium-1248`, `chromium_headless_shell-1248`)**:
   - Governed primarily by `BSD-3-Clause` (`https://chromium.googlesource.com/chromium/src/+/refs/heads/main/LICENSE`) along with embedded third-party component notices (`MIT`, `ISC`, etc.).
