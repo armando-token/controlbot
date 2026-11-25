@@ -17,6 +17,7 @@ from src.engine.coordinator import Coordinator
 from src.engine.tool_registry import ToolExecutionContext, ToolRegistry
 from src.model.emulator import EmulatedModelClient
 from src.storage import (
+    CURRENT_SCHEMA_VERSION,
     BudgetExceededError,
     MigrationError,
     StorageRepo,
@@ -66,8 +67,8 @@ def test_init_db_pragmas_and_idempotency(tmp_path: Path) -> None:
     clock = FakeClock()
     repo = StorageRepo(db_path, clock=clock)
 
-    v1 = repo.init_db()
-    assert v1 == 1
+    v = repo.init_db()
+    assert v == CURRENT_SCHEMA_VERSION
     pragmas = repo.get_pragma_settings()
     assert pragmas["journal_mode"] == "wal"
     assert pragmas["foreign_keys"] == 1
@@ -75,15 +76,15 @@ def test_init_db_pragmas_and_idempotency(tmp_path: Path) -> None:
 
     # Re-opening and re-running init_db() is idempotent
     repo2 = StorageRepo(db_path, clock=clock)
-    assert repo2.init_db() == 1
+    assert repo2.init_db() == CURRENT_SCHEMA_VERSION
 
 
 @pytest.mark.n1
 def test_schema_migrations_idempotent_and_future_version_fails(tmp_path: Path) -> None:
     db_path = tmp_path / "migrations.db"
     repo = StorageRepo(db_path)
-    assert repo.init_db() == 1
-    assert repo.init_db() == 1
+    assert repo.init_db() == CURRENT_SCHEMA_VERSION
+    assert repo.init_db() == CURRENT_SCHEMA_VERSION
 
     # Simulate incompatible future schema version
     conn = open_connection(db_path)
@@ -99,6 +100,36 @@ def test_schema_migrations_idempotent_and_future_version_fails(tmp_path: Path) -
 
     with pytest.raises(MigrationError, match="newer than supported"):
         repo.init_db()
+
+    # Migrating an existing v1 database to v2 adds human_wait_accounted_until cleanly
+    from src.storage.migrations import MIGRATIONS
+
+    v1_db = tmp_path / "v1_legacy.db"
+    v1_conn = open_connection(v1_db)
+    try:
+        v1_conn.execute("BEGIN IMMEDIATE;")
+        for stmt in MIGRATIONS[0].statements:
+            v1_conn.execute(stmt)
+        v1_conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            (1, MIGRATIONS[0].name, "2026-11-25T10:00:00+00:00"),
+        )
+        v1_conn.execute("COMMIT;")
+    finally:
+        v1_conn.close()
+
+    upgraded_repo = StorageRepo(v1_db)
+    assert upgraded_repo.init_db() == CURRENT_SCHEMA_VERSION
+    assert upgraded_repo.init_db() == CURRENT_SCHEMA_VERSION
+    check_conn = open_connection(v1_db)
+    try:
+        cols = {
+            str(r["name"])
+            for r in check_conn.execute("PRAGMA table_info(task_budgets);").fetchall()
+        }
+        assert "human_wait_accounted_until" in cols
+    finally:
+        check_conn.close()
 
 
 @pytest.mark.n1

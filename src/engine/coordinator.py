@@ -815,11 +815,25 @@ class Coordinator:
             if waiting_kids and pending_human_input is not None:
                 resumed_kids: list[Run] = []
                 for w_child in waiting_kids:
-                    with contextlib.suppress(
-                        TerminalStateError, PlanValidationError, BudgetExceededError
-                    ):
+                    try:
                         resumed_kids.append(
                             self._repo.resume_from_input(w_child.run_id, pending_human_input)
+                        )
+                    except (TerminalStateError, PlanValidationError):
+                        continue
+                    except BudgetExceededError as exc:
+                        return self._settle_terminal(
+                            task_spec=task_spec,
+                            run_id=run_id,
+                            target_status=TaskStatus.FAILED,
+                            reason="human_wait_timeout_exceeded",
+                            answer=(
+                                "Human wait timeout exceeded resuming child "
+                                f"{w_child.run_id}: {exc}"
+                            ),
+                            observations=tuple(observations),
+                            contradictions=tuple(contradictions),
+                            partial_info={"reason": "human_wait_timeout_exceeded"},
                         )
                 if resumed_kids:
                     resumed_results = await asyncio.gather(

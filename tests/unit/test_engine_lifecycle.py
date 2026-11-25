@@ -1334,3 +1334,195 @@ def test_t5_23_wait_timeout_on_parent_resume_fails_waiting_children_and_clears_a
         assert snap_recovered.budget_usage.active_children == 0
 
     asyncio.run(_run())
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_24_delegated_parent_and_children_do_not_double_count_human_wait_seconds(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from src.engine.tool_registry import AuthToolError
+    from src.model.emulator import EmulatedTurn
+    from src.model.protocol import (
+        ModelDecision,
+        ModelDelegationRequest,
+        ModelToolCall,
+        ModelUsage,
+    )
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    def _build_coordinator(
+        db_name: str,
+        *,
+        auth_state: dict[str, Any],
+        clock: FakeClock,
+    ) -> tuple[StorageRepo, Coordinator]:
+        repo = StorageRepo(tmp_path / db_name, clock=clock)
+        repo.init_db()
+        reg = ToolRegistry(clock=clock)
+
+        def _auth_gated_read(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+            del ctx
+            branch = str(args.get("branch", "area-1"))
+            remaining_failures = int(auth_state.get(branch, 0))
+            if remaining_failures > 0:
+                auth_state[branch] = remaining_failures - 1
+                raise AuthToolError(f"Session expired for {branch}")
+            return {"ok": True, "branch": branch}
+
+        reg.register(
+            ToolSpec(
+                tool_id="read_scada",
+                version="1.0.0",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                allowed_origins=("https://scada.local",),
+                effect_class=EffectClass.READ,
+                timeout_s=5.0,
+                verifier_name="v",
+            ),
+            _auth_gated_read,
+        )
+
+        def _turn_factory(
+            prompt_ctx: Any, tools: Any, budget_rem: Any
+        ) -> EmulatedTurn:
+            del tools, budget_rem
+            if prompt_ctx.depth == 0:
+                if any(isinstance(h, dict) and "delegation" in h for h in prompt_ctx.history):
+                    return EmulatedTurn(
+                        decision=ModelDecision(
+                            decision_type="final",
+                            final_answer="Parent complete after both children.",
+                            usage=usage,
+                        )
+                    )
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="delegate",
+                        delegations=(
+                            ModelDelegationRequest(
+                                child_label="branch-1",
+                                query="Read area-1",
+                                allowed_tools=("read_scada",),
+                                allowed_origins=("https://scada.local",),
+                                allowed_areas=("area-1",),
+                            ),
+                            ModelDelegationRequest(
+                                child_label="branch-2",
+                                query="Read area-2",
+                                allowed_tools=("read_scada",),
+                                allowed_origins=("https://scada.local",),
+                                allowed_areas=("area-2",),
+                            ),
+                        ),
+                        usage=usage,
+                    )
+                )
+            branch = (
+                str(prompt_ctx.allowed_areas[0])
+                if prompt_ctx.allowed_areas
+                else "area-1"
+            )
+            if prompt_ctx.history and prompt_ctx.history[-1].get("outcome") == "succeeded":
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="final",
+                        final_answer=f"{branch} complete.",
+                        usage=usage,
+                    )
+                )
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="read_scada",
+                        args={"branch": branch},
+                        target_origin="https://scada.local",
+                    ),
+                    usage=usage,
+                )
+            )
+
+        coord = Coordinator(repo, EmulatedModelClient(turn_factory=_turn_factory), reg, clock=clock)
+        return repo, coord
+
+    async def _run() -> None:
+        # 1. 2-child overlapping pause of 120.0s under 300.0s timeout counts 120.0s (not 360.0s)
+        clock1 = FakeClock()
+        auth1 = {"area-1": 1, "area-2": 1}
+        repo1, coord1 = _build_coordinator("t5_24_overlap.db", auth_state=auth1, clock=clock1)
+        run1 = coord1.submit_task(
+            _make_task("t5-24-overlap", budget=BudgetConfig(human_wait_timeout_seconds=300.0))
+        )
+        paused1 = await coord1.run_until_settled(run1.run_id)
+        assert paused1.status == TaskStatus.WAITING_FOR_INPUT
+        snap1_paused = repo1.get_run_snapshot(run1.run_id)
+        assert len(snap1_paused.child_runs) == 2
+        assert all(c.status == TaskStatus.WAITING_FOR_INPUT for c in snap1_paused.child_runs)
+
+        clock1.advance(120.0)
+        coord1.resume_task(run1.run_id, {"reauthenticated": True})
+        res1 = await coord1.run_until_settled(run1.run_id)
+        assert res1.status == TaskStatus.SUCCEEDED
+        snap1 = repo1.get_run_snapshot(run1.run_id)
+        assert len(snap1.child_runs) == 2
+        assert all(c.status == TaskStatus.SUCCEEDED for c in snap1.child_runs)
+        assert snap1.budget_usage.active_children == 0
+        assert snap1.budget_usage.human_wait_seconds_elapsed == pytest.approx(120.0, abs=0.01)
+        assert res1.execution_metrics.human_wait_seconds == pytest.approx(120.0, abs=0.01)
+
+        # 2. Sequential non-overlapping pauses (120.0s + 190.0s = 310.0s > 300.0s) fail cleanly
+        clock2 = FakeClock()
+        auth2 = {"area-1": 2, "area-2": 1}
+        repo2, coord2 = _build_coordinator("t5_24_seq.db", auth_state=auth2, clock=clock2)
+        run2 = coord2.submit_task(
+            _make_task("t5-24-seq", budget=BudgetConfig(human_wait_timeout_seconds=300.0))
+        )
+        paused2a = await coord2.run_until_settled(run2.run_id)
+        assert paused2a.status == TaskStatus.WAITING_FOR_INPUT
+
+        clock2.advance(120.0)
+        coord2.resume_task(run2.run_id, {"reauthenticated": True})
+        paused2b = await coord2.run_until_settled(run2.run_id)
+        assert paused2b.status == TaskStatus.WAITING_FOR_INPUT
+
+        clock2.advance(190.0)
+        with pytest.raises(BudgetExceededError, match="Human wait timeout exceeded"):
+            coord2.resume_task(run2.run_id, {"reauthenticated": True})
+        snap2 = repo2.get_run_snapshot(run2.run_id)
+        assert snap2.run.status == TaskStatus.FAILED
+        assert snap2.run.transition_reason == "human_wait_timeout_exceeded"
+        child2_statuses = {c.transition_reason: c.status for c in snap2.child_runs}
+        assert child2_statuses["parent_human_wait_timeout_exceeded"] == TaskStatus.FAILED
+        assert child2_statuses["completed_succeeded"] == TaskStatus.SUCCEEDED
+        assert snap2.budget_usage.active_children == 0
+        assert snap2.budget_usage.human_wait_seconds_elapsed == pytest.approx(310.0, abs=0.01)
+
+        # 3. Child resume exceeding timeout inside Coordinator._run_loop_body settles parent FAILED
+        clock3 = FakeClock()
+        auth3 = {"area-1": 1, "area-2": 1}
+        repo3, coord3 = _build_coordinator("t5_24_child_to.db", auth_state=auth3, clock=clock3)
+        run3 = coord3.submit_task(
+            _make_task("t5-24-child-to", budget=BudgetConfig(human_wait_timeout_seconds=300.0))
+        )
+        paused3 = await coord3.run_until_settled(run3.run_id)
+        assert paused3.status == TaskStatus.WAITING_FOR_INPUT
+
+        clock3.advance(299.0)
+        coord3.resume_task(run3.run_id, {"reauthenticated": True})
+        # Extra 2s elapses before coordinator resumes waiting children (299 + 2 = 301 > 300)
+        clock3.advance(2.0)
+        res3 = await coord3.run_until_settled(run3.run_id)
+        assert res3.status == TaskStatus.FAILED
+        snap3 = repo3.get_run_snapshot(run3.run_id)
+        assert snap3.run.status == TaskStatus.FAILED
+        assert snap3.run.transition_reason == "human_wait_timeout_exceeded"
+        assert all(c.status == TaskStatus.FAILED for c in snap3.child_runs)
+        assert snap3.budget_usage.active_children == 0
+        assert snap3.budget_usage.human_wait_seconds_elapsed == pytest.approx(301.0, abs=0.01)
+
+    asyncio.run(_run())

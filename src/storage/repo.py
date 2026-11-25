@@ -509,6 +509,38 @@ class StorageRepo:
         return row
 
     @staticmethod
+    def _compute_human_wait_deltas(
+        *,
+        waiting_since_raw: Any,
+        accounted_until_raw: Any,
+        now: datetime,
+    ) -> tuple[float, float, str | None]:
+        """Return (run_wait_delta, non_overlapping_budget_delta, new_accounted_until_iso)."""
+        accounted_until = (
+            _parse_dt(str(accounted_until_raw))
+            if accounted_until_raw is not None
+            else None
+        )
+        if waiting_since_raw is None:
+            return (
+                0.0,
+                0.0,
+                _format_dt(accounted_until) if accounted_until is not None else None,
+            )
+        waiting_since = _parse_dt(str(waiting_since_raw))
+        wait_delta = max(0.0, (now - waiting_since).total_seconds())
+        effective_start = (
+            max(waiting_since, accounted_until)
+            if accounted_until is not None
+            else waiting_since
+        )
+        budget_wait_delta = max(0.0, (now - effective_start).total_seconds())
+        new_accounted_until = (
+            max(accounted_until, now) if accounted_until is not None else now
+        )
+        return wait_delta, budget_wait_delta, _format_dt(new_accounted_until)
+
+    @staticmethod
     def _validate_child_scope_narrowing(
         parent_scope: TaskScope, child_scope: TaskScope
     ) -> list[str]:
@@ -858,17 +890,23 @@ class StorageRepo:
             current_run.status == TaskStatus.WAITING_FOR_INPUT
             and row["waiting_since"] is not None
         ):
-            wait_delta = max(
-                0.0, (now - _parse_dt(str(row["waiting_since"]))).total_seconds()
+            budget_row = self._load_budget_row(conn, current_run.task_id)
+            wait_delta, budget_wait_delta, new_accounted_until = (
+                self._compute_human_wait_deltas(
+                    waiting_since_raw=row["waiting_since"],
+                    accounted_until_raw=budget_row["human_wait_accounted_until"],
+                    now=now,
+                )
             )
             conn.execute(
                 """
                 UPDATE task_budgets
                 SET human_wait_seconds_elapsed = human_wait_seconds_elapsed + ?,
+                    human_wait_accounted_until = ?,
                     updated_at = ?
                 WHERE task_id = ?
                 """,
-                (wait_delta, now_iso, current_run.task_id),
+                (budget_wait_delta, new_accounted_until, now_iso, current_run.task_id),
             )
             new_waiting_since = None
             new_deadline_dt = new_deadline_dt + timedelta(seconds=wait_delta)
@@ -1137,12 +1175,16 @@ class StorageRepo:
                     "expected 'waiting_for_input'."
                 )
             else:
-                wait_delta = 0.0
-                if row["waiting_since"] is not None:
-                    wait_delta = max(
-                        0.0, (now - _parse_dt(str(row["waiting_since"]))).total_seconds()
+                wait_delta, budget_wait_delta, new_accounted_until = (
+                    self._compute_human_wait_deltas(
+                        waiting_since_raw=row["waiting_since"],
+                        accounted_until_raw=budget_row["human_wait_accounted_until"],
+                        now=now,
                     )
-                new_human_wait = float(budget_row["human_wait_seconds_elapsed"]) + wait_delta
+                )
+                new_human_wait = (
+                    float(budget_row["human_wait_seconds_elapsed"]) + budget_wait_delta
+                )
 
                 if new_human_wait > budget_cfg.human_wait_timeout_seconds:
                     new_version = current_run.version + 1
@@ -1150,6 +1192,7 @@ class StorageRepo:
                         """
                         UPDATE task_budgets
                         SET human_wait_seconds_elapsed = ?,
+                            human_wait_accounted_until = ?,
                             active_children = CASE
                                 WHEN ? = 0 THEN 0
                                 ELSE MAX(0, active_children - 1)
@@ -1157,7 +1200,13 @@ class StorageRepo:
                             updated_at = ?
                         WHERE task_id = ?
                         """,
-                        (new_human_wait, current_run.depth, now_iso, current_run.task_id),
+                        (
+                            new_human_wait,
+                            new_accounted_until,
+                            current_run.depth,
+                            now_iso,
+                            current_run.task_id,
+                        ),
                     )
                     conn.execute(
                         """
@@ -1276,10 +1325,12 @@ class StorageRepo:
                     conn.execute(
                         """
                         UPDATE task_budgets
-                        SET human_wait_seconds_elapsed = ?, updated_at = ?
+                        SET human_wait_seconds_elapsed = ?,
+                            human_wait_accounted_until = ?,
+                            updated_at = ?
                         WHERE task_id = ?
                         """,
-                        (new_human_wait, now_iso, current_run.task_id),
+                        (new_human_wait, new_accounted_until, now_iso, current_run.task_id),
                     )
                     conn.execute(
                         """

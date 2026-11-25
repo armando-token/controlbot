@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from src.storage.errors import MigrationError
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -271,11 +271,20 @@ _V1_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_sigs_run ON step_signatures(run_id, sig_id)",
 )
 
+_V2_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE task_budgets ADD COLUMN human_wait_accounted_until TEXT",
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
         name="initial_wal_schema",
         statements=_V1_STATEMENTS,
+    ),
+    Migration(
+        version=2,
+        name="human_wait_high_watermark",
+        statements=_V2_STATEMENTS,
     ),
 )
 
