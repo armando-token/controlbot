@@ -1,0 +1,251 @@
+{
+  "schema_version": "1.0.0",
+  "facility_id": "facility-b",
+  "facility_name": "Facility B - East Cooling Plant",
+  "time_window": {
+    "max_staleness_seconds": 3600.0,
+    "lookback_seconds": 7200.0,
+    "timezone": "UTC"
+  },
+  "areas": {
+    "area-2": {
+      "display_name": "Area 2 - East Cooling"
+    },
+    "area-3": {
+      "display_name": "Area 3 - Auxiliary"
+    }
+  },
+  "assets": [
+    {
+      "asset_id": "bomba-77-b2",
+      "area": "area-2",
+      "canonical_label": "bomba 77",
+      "aliases": [
+        "bomba 77",
+        "pump 77",
+        "Pump 77",
+        "P-77B",
+        "bomba-77-b2"
+      ],
+      "allowed_units": {
+        "alarm": [
+          "alarm_code",
+          "state"
+        ],
+        "reading": [
+          "mm/s",
+          "bar",
+          "C"
+        ],
+        "vibration": [
+          "mm/s"
+        ],
+        "pressure": [
+          "bar"
+        ],
+        "temperature": [
+          "C"
+        ],
+        "work_order": [
+          "event"
+        ]
+      },
+      "source_ids": {
+        "scada": "SC-77",
+        "maintenance": "CMMS-77",
+        "effect_sim": "EFF-77"
+      }
+    }
+  ],
+  "apps": {
+    "scada": {
+      "app_id": "scada",
+      "adapter_type": "scada_web",
+      "adapter_version": "1.0.0",
+      "origin": "http://127.0.0.1:8201",
+      "read_only": true,
+      "permissions": [
+        "scada:read"
+      ],
+      "routes": {
+        "health": "/health",
+        "login": "/login",
+        "logout": "/logout",
+        "alarms": "/alarms",
+        "readings": "/readings",
+        "api_alarms": "/api/alarms",
+        "api_readings": "/api/readings"
+      },
+      "selectors": {
+        "login": {
+          "username_label": "Username",
+          "password_label": "Password",
+          "submit_name": "Sign In",
+          "authenticated_selector": "[data-testid='current-user']"
+        },
+        "alarms_table": {
+          "table_role_name": "Alarmas SCADA Planta B",
+          "row_selector": "tbody tr",
+          "column_aliases": {
+            "id": [
+              "Registro",
+              "ID",
+              "Alarm ID"
+            ],
+            "asset_id": [
+              "Tag SCADA",
+              "Asset ID",
+              "Activo ID"
+            ],
+            "asset_label": [
+              "Equipo",
+              "Asset",
+              "Activo"
+            ],
+            "value": [
+              "Valor",
+              "Value",
+              "Alarm"
+            ],
+            "unit": [
+              "Unidad",
+              "Unit"
+            ],
+            "time": [
+              "Hora",
+              "Time"
+            ],
+            "quality": [
+              "Calidad",
+              "Quality"
+            ],
+            "area": [
+              "Área",
+              "Area"
+            ]
+          }
+        },
+        "readings_table": {
+          "table_role_name": "Lecturas SCADA Planta B",
+          "row_selector": "tbody tr",
+          "column_aliases": {
+            "id": [
+              "Registro",
+              "ID",
+              "Reading ID"
+            ],
+            "asset_id": [
+              "Tag SCADA",
+              "Asset ID",
+              "Activo ID"
+            ],
+            "asset_label": [
+              "Equipo",
+              "Asset",
+              "Activo"
+            ],
+            "value": [
+              "Valor",
+              "Value"
+            ],
+            "unit": [
+              "Unidad",
+              "Unit"
+            ],
+            "time": [
+              "Hora",
+              "Time"
+            ],
+            "quality": [
+              "Calidad",
+              "Quality"
+            ],
+            "area": [
+              "Área",
+              "Area"
+            ]
+          }
+        }
+      }
+    },
+    "maintenance": {
+      "app_id": "maintenance",
+      "adapter_type": "maintenance_web",
+      "adapter_version": "1.0.0",
+      "origin": "http://127.0.0.1:8202",
+      "read_only": true,
+      "permissions": [
+        "maint:read"
+      ],
+      "routes": {
+        "health": "/health",
+        "login": "/login",
+        "logout": "/logout",
+        "work_orders": "/work-orders",
+        "api_work_orders": "/api/work_orders"
+      },
+      "selectors": {
+        "login": {
+          "username_label": "Username",
+          "password_label": "Password",
+          "submit_name": "Sign In",
+          "authenticated_selector": "[data-testid='current-user']"
+        },
+        "work_orders_table": {
+          "table_role_name": "Órdenes de Mantenimiento Planta B",
+          "row_selector": "tbody tr",
+          "column_aliases": {
+            "id": [
+              "Orden",
+              "ID",
+              "Work Order ID"
+            ],
+            "asset_id": [
+              "Código CMMS",
+              "Asset ID",
+              "Activo ID"
+            ],
+            "asset_label": [
+              "Equipo",
+              "Asset",
+              "Activo"
+            ],
+            "intervention": [
+              "Intervención",
+              "Intervention"
+            ],
+            "recorded_at": [
+              "Hora de registro",
+              "Recorded At"
+            ],
+            "area": [
+              "Área",
+              "Area"
+            ],
+            "quality": [
+              "Calidad",
+              "Quality"
+            ]
+          }
+        }
+      }
+    },
+    "effect_sim": {
+      "app_id": "effect_sim",
+      "adapter_type": "effect_sim_api",
+      "adapter_version": "1.0.0",
+      "origin": "http://127.0.0.1:8203",
+      "read_only": false,
+      "permissions": [
+        "effect:read",
+        "effect:write"
+      ],
+      "routes": {
+        "health": "/health",
+        "apply": "/api/effects/apply",
+        "state": "/api/effects/state"
+      },
+      "selectors": {}
+    }
+  }
+}

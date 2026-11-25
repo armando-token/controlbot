@@ -66,6 +66,7 @@ def _infer_asset_query(query: str, config: FacilityConfig) -> str:
         candidates.append(asset.asset_id)
         candidates.append(asset.canonical_label)
         candidates.extend(asset.aliases)
+        candidates.extend(asset.source_ids.values())
     for cand in sorted(set(candidates), key=len, reverse=True):
         if cand.lower() in lower_q:
             return cand

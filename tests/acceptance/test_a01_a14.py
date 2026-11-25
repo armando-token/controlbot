@@ -10,6 +10,8 @@ import signal
 import stat
 import subprocess
 import sys
+import time
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
+from benchmarks.runner import run_benchmarks
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from lab.effect_sim import create_effect_sim_app
@@ -52,6 +55,7 @@ from src.storage.errors import TerminalStateError
 from src.storage.repo import StorageRepo
 
 _FACILITY_A_PATH = Path("lab/configs/facility_a.json")
+_FACILITY_B_PATH = Path("lab/configs/facility_b.json")
 
 
 def _create_mock_openai_server(
@@ -841,6 +845,79 @@ async def test_a12_reordered_columns_and_alias_with_zero_adapter_edits(tmp_path:
 
 @pytest.mark.acceptance
 @pytest.mark.n2
+async def test_a12_facility_b_area2_config_only_portability(tmp_path: Path) -> None:
+    started = time.perf_counter()
+    ref_time = utc_now()
+    scada_app = create_scada_app(fixture_mode="facility_b")
+    maint_app = create_maintenance_app(fixture_mode="facility_b")
+    scada_app.state.scada_state.set_reference_time(ref_time)
+    maint_app.state.maintenance_state.set_reference_time(ref_time)
+
+    creds = MappingCredentialProvider(
+        {
+            ("operator_b", "p2", "scada"): ("operator_b", "scada-pass-b"),
+            ("operator_b", "p2", "maintenance"): ("maint_b", "maint-pass-b"),
+        }
+    )
+
+    async with (
+        run_asgi_server(scada_app) as scada_origin,
+        run_asgi_server(maint_app) as maint_origin,
+    ):
+        cfg = load_facility_config(
+            _FACILITY_B_PATH,
+            {"scada": scada_origin, "maintenance": maint_origin},
+        )
+        runtime = build_runtime(
+            db_path=tmp_path / f"a12_b_{uuid.uuid4().hex[:6]}.sqlite3",
+            profile_root=tmp_path / "profiles_b",
+            facility_config=cfg,
+            credential_provider=creds,
+            reference_time_fn=lambda: ref_time,
+            auto_run=False,
+        )
+        async with runtime:
+            run = runtime.coordinator.submit_task(
+                TaskSpec(
+                    task_id="task-a12-facility-b",
+                    user_id="operator_b",
+                    profile_id="p2",
+                    scope=TaskScope(
+                        facility_id="facility-b",
+                        allowed_origins=(scada_origin, maint_origin),
+                        allowed_areas=("area-2",),
+                        read_only=True,
+                    ),
+                    query="Check P-77B alarms and latest work order",
+                )
+            )
+            res = await runtime.coordinator.run_until_settled(run.run_id)
+
+    elapsed_s = time.perf_counter() - started
+    assert elapsed_s > 0.0
+    assert res.status == TaskStatus.SUCCEEDED
+    assert "ALM-7701" in res.answer
+    assert "WO-7705" in res.answer
+    assert len(res.contradictions) == 0
+    assert {o.source for o in res.verified_observations} == {"scada", "maintenance"}
+    assert all(o.area == "area-2" for o in res.verified_observations)
+    assert any(o.asset_id == "SC-77" for o in res.verified_observations if o.source == "scada")
+    assert any(
+        o.asset_id == "CMMS-77" for o in res.verified_observations if o.source == "maintenance"
+    )
+    # Verify src/engine/ has zero facility-specific coupling (engine_loc_delta == 0)
+    engine_files = list(Path("src/engine").glob("*.py"))
+    assert engine_files
+    for engine_file in engine_files:
+        text = engine_file.read_text(encoding="utf-8").lower()
+        assert "bomba" not in text
+        assert "sc-77" not in text
+        assert "cmms-77" not in text
+        assert "facility-b" not in text
+
+
+@pytest.mark.acceptance
+@pytest.mark.n2
 async def test_a13_contradictory_evidence_preserved_as_partial(tmp_path: Path) -> None:
     ref_time = utc_now()
     scada_app = create_scada_app(fixture_mode="default")
@@ -949,3 +1026,24 @@ async def test_a14_sigkill_preserves_budget_and_reconciles_reservation(tmp_path:
     assert data["pre_signatures_count"] >= 1
     assert data["status"] == TaskStatus.SUCCEEDED.value
     assert data["within_limits"] is True
+
+
+@pytest.mark.acceptance
+@pytest.mark.n2
+async def test_m5_comparative_benchmark_paired_emulated() -> None:
+    report = await run_benchmarks(mode="emulated", repeats=1)
+    assert report.engine_summary.num_scenarios >= 12
+    assert report.engine_summary.total_trials == 13
+    assert report.engine_summary.correct_answers == 13
+    assert report.engine_summary.accuracy_rate == 1.0
+    assert report.engine_summary.promotion_eligible is True
+    assert report.engine_summary.duplicate_effects == 0
+    assert report.engine_summary.isolation_violations == 0
+    assert report.engine_summary.wrong_asset_attributions == 0
+    assert report.baseline_summary.promotion_eligible is False
+    assert report.baseline_summary.duplicate_effects >= 1
+    assert report.baseline_summary.isolation_violations >= 1
+    assert report.provenance.a11_status == "PENDING_N3_LINUX_ENV"
+    assert report.a12_adaptation is not None
+    assert report.a12_adaptation.engine_loc_delta == 0
+    assert report.a12_adaptation.verified_succeeded is True

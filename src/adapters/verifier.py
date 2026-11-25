@@ -29,6 +29,33 @@ def _flat_allowed_units(mapping: AssetMapping) -> set[str]:
     return units
 
 
+def _resolve_asset_mapping(obs: Observation, config: FacilityConfig) -> AssetMapping | None:
+    """Resolve an Observation's (source, asset_id) to its canonical AssetMapping.
+
+    Precedence:
+    1. Exact per-source mapping: ``asset.source_ids.get(obs.source) == obs.asset_id``.
+    2. Canonical asset_id match: ``asset.asset_id == obs.asset_id``.
+    3. Fallback across ``asset.source_ids.values()`` ONLY when ``obs.source`` has no
+       explicit mapping in ``asset.source_ids`` (preventing wrong-source ID aliasing).
+    """
+    for asset in config.assets:
+        if asset.source_ids.get(obs.source) == obs.asset_id:
+            return asset
+    for asset in config.assets:
+        if asset.asset_id == obs.asset_id:
+            return asset
+    for asset in config.assets:
+        if obs.source not in asset.source_ids and obs.asset_id in asset.source_ids.values():
+            return asset
+    return None
+
+
+def _canonical_asset_id(obs: Observation, config: FacilityConfig) -> str:
+    """Return canonical asset_id if resolved for obs.source, else raw obs.asset_id."""
+    mapped = _resolve_asset_mapping(obs, config)
+    return mapped.asset_id if mapped is not None else obs.asset_id
+
+
 def _matches_asset_query(obs: Observation, query: str, config: FacilityConfig) -> bool:
     needle = query.strip().lower()
     if not needle:
@@ -86,14 +113,13 @@ class Verifier:
 
         effective_units: set[str] | None = set(allowed_units) if allowed_units is not None else None
         if effective_units is None and config is not None:
-            for asset in config.assets:
-                if asset.asset_id == obs.asset_id or obs.asset_id in asset.source_ids.values():
-                    record_type = str(obs.metadata.get("record_type", ""))
-                    if record_type in asset.allowed_units:
-                        effective_units = set(asset.allowed_units[record_type])
-                    else:
-                        effective_units = _flat_allowed_units(asset)
-                    break
+            mapped_asset = _resolve_asset_mapping(obs, config)
+            if mapped_asset is not None:
+                record_type = str(obs.metadata.get("record_type", ""))
+                if record_type in mapped_asset.allowed_units:
+                    effective_units = set(mapped_asset.allowed_units[record_type])
+                else:
+                    effective_units = _flat_allowed_units(mapped_asset)
 
         if effective_units:
             if obs.unit is None and obs.metadata.get("record_type") == "reading":
@@ -127,7 +153,7 @@ class Verifier:
         candidates: dict[tuple[str, str | None], None] = {}
         for obs in observations:
             if _matches_asset_query(obs, target_asset_query, config):
-                candidates[(obs.asset_id, obs.area)] = None
+                candidates[(_canonical_asset_id(obs, config), obs.area)] = None
 
         for mapping in resolve_asset_candidates(config, target_asset_query):
             candidates[(mapping.asset_id, mapping.area)] = None
@@ -160,7 +186,7 @@ class Verifier:
             for src_id in asset.source_ids.values():
                 asset_by_id.setdefault(src_id, asset)
         for obs in observations:
-            mapped = asset_by_id.get(obs.asset_id)
+            mapped = _resolve_asset_mapping(obs, config) or asset_by_id.get(obs.asset_id)
             if mapped is not None:
                 valid_labels = {
                     mapped.canonical_label.lower(),
@@ -209,7 +235,8 @@ class Verifier:
             for source_name in source_names:
                 unique_in_source: dict[tuple[str, str | None], Observation] = {}
                 for obs in per_source[source_name]:
-                    unique_in_source.setdefault((obs.asset_id, obs.area), obs)
+                    canon_id = _canonical_asset_id(obs, config)
+                    unique_in_source.setdefault((canon_id, obs.area), obs)
                 if len(unique_in_source) >= 2:
                     reps = list(unique_in_source.values())
                     claims = tuple(
@@ -240,8 +267,11 @@ class Verifier:
             unique_source_claims: dict[tuple[str, str, str | None], Observation] = {}
             for source_name in source_names:
                 for obs in per_source[source_name]:
-                    unique_source_claims.setdefault((obs.source, obs.asset_id, obs.area), obs)
-            distinct_ids = {(o.asset_id, o.area) for o in unique_source_claims.values()}
+                    canon_id = _canonical_asset_id(obs, config)
+                    unique_source_claims.setdefault((obs.source, canon_id, obs.area), obs)
+            distinct_ids = {
+                (_canonical_asset_id(o, config), o.area) for o in unique_source_claims.values()
+            }
             if len(distinct_ids) >= 2:
                 reps = list(unique_source_claims.values())
                 claims = tuple(

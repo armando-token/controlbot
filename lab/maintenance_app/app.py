@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -25,6 +26,7 @@ VALID_MAINTENANCE_MODES: frozenset[str] = frozenset(
         "down",
         "contradictory",
         "reordered",
+        "facility_b",
     }
 )
 
@@ -57,6 +59,18 @@ _HEADER_LABELS: dict[str, str] = {
     "area": "Area",
     "quality": "Quality",
 }
+
+FACILITY_B_MAINT_HEADER_LABELS: dict[str, str] = {
+    "id": "Orden",
+    "asset_id": "Código CMMS",
+    "asset_label": "Equipo",
+    "intervention": "Intervención",
+    "recorded_at": "Hora de registro",
+    "area": "Área",
+    "quality": "Calidad",
+}
+
+FACILITY_B_WORK_ORDERS_TABLE_LABEL = "Órdenes de Mantenimiento Planta B"
 
 
 @dataclass(frozen=True)
@@ -102,6 +116,9 @@ class MaintenanceState:
     reference_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     users: dict[str, MaintenanceUser] = field(default_factory=lambda: dict(DEFAULT_MAINT_USERS))
     sessions: dict[str, MaintenanceSessionRecord] = field(default_factory=dict)
+    header_labels: dict[str, str] = field(default_factory=lambda: dict(_HEADER_LABELS))
+    work_orders_table_label: str = "Maintenance Work Orders"
+    custom_work_orders: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.fixture_mode not in VALID_MAINTENANCE_MODES:
@@ -131,8 +148,31 @@ class MaintenanceState:
             self.sessions[token].expired = True
 
     def get_work_orders(self) -> list[dict[str, Any]]:
+        if self.custom_work_orders is not None:
+            return [dict(row) for row in self.custom_work_orders]
         ref = self.reference_time
         mode = self.fixture_mode
+        if mode == "facility_b":
+            return [
+                {
+                    "id": "WO-7701",
+                    "asset_id": "CMMS-77",
+                    "asset_label": "bomba 77",
+                    "intervention": "Inspected east cooling impeller and bearing housing",
+                    "recorded_at": _iso_utc(ref - timedelta(minutes=55)),
+                    "area": "area-2",
+                    "quality": "good",
+                },
+                {
+                    "id": "WO-7705",
+                    "asset_id": "CMMS-77",
+                    "asset_label": "bomba 77",
+                    "intervention": "Replaced mechanical seal and calibrated pressure transmitter",
+                    "recorded_at": _iso_utc(ref - timedelta(minutes=10)),
+                    "area": "area-2",
+                    "quality": "good",
+                },
+            ]
         if mode in ("ambiguity", "ambiguous"):
             return [
                 {
@@ -261,9 +301,12 @@ def _render_work_orders_html(
     areas: tuple[str, ...],
     rows: list[dict[str, Any]],
     column_order: tuple[str, ...],
+    table_label: str = "Maintenance Work Orders",
+    header_labels: Mapping[str, str] | None = None,
 ) -> str:
+    labels_map = header_labels if header_labels is not None else _HEADER_LABELS
     headers_html = "".join(
-        f"<th scope=\"col\">{html.escape(_HEADER_LABELS.get(col, col))}</th>"
+        f"<th scope=\"col\">{html.escape(labels_map.get(col, col))}</th>"
         for col in column_order
     )
     body_rows: list[str] = []
@@ -280,14 +323,15 @@ def _render_work_orders_html(
         )
     user_json = json.dumps(username)
     areas_json = json.dumps(list(areas))
+    escaped_label = html.escape(table_label)
     return (
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<title>Maintenance Work Orders</title></head><body>"
+        f"<title>{escaped_label}</title></head><body>"
         "<main>"
-        "<h1 data-testid=\"page-title\">Maintenance Work Orders</h1>"
+        f"<h1 data-testid=\"page-title\">{escaped_label}</h1>"
         f"<div data-testid=\"current-user\">{html.escape(username)}</div>"
         f"<div data-testid=\"user-areas\">{html.escape(','.join(areas))}</div>"
-        "<table aria-label=\"Maintenance Work Orders\">"
+        f"<table aria-label=\"{escaped_label}\">"
         f"<thead><tr>{headers_html}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
         "</table>"
@@ -308,17 +352,58 @@ def create_maintenance_app(
     *,
     state: MaintenanceState | None = None,
     column_order: tuple[str, ...] | None = None,
+    header_labels: Mapping[str, str] | None = None,
+    work_orders_table_label: str | None = None,
+    custom_work_orders: list[dict[str, Any]] | None = None,
+    users: Mapping[str, MaintenanceUser] | None = None,
 ) -> FastAPI:
     """Create an independent synthetic Maintenance web application."""
     if state is None:
         effective_cols = column_order or (
-            REORDERED_MAINT_COLUMNS if fixture_mode == "reordered" else DEFAULT_MAINT_COLUMNS
+            REORDERED_MAINT_COLUMNS
+            if fixture_mode in ("reordered", "facility_b")
+            else DEFAULT_MAINT_COLUMNS
         )
-        maint_state = MaintenanceState(fixture_mode=fixture_mode, column_order=effective_cols)
+        effective_headers = (
+            dict(header_labels)
+            if header_labels is not None
+            else (
+                dict(FACILITY_B_MAINT_HEADER_LABELS)
+                if fixture_mode == "facility_b"
+                else dict(_HEADER_LABELS)
+            )
+        )
+        effective_table_label = (
+            work_orders_table_label
+            if work_orders_table_label is not None
+            else (
+                FACILITY_B_WORK_ORDERS_TABLE_LABEL
+                if fixture_mode == "facility_b"
+                else "Maintenance Work Orders"
+            )
+        )
+        maint_state = MaintenanceState(
+            fixture_mode=fixture_mode,
+            column_order=effective_cols,
+            users=dict(users) if users is not None else dict(DEFAULT_MAINT_USERS),
+            header_labels=effective_headers,
+            work_orders_table_label=effective_table_label,
+            custom_work_orders=(
+                [dict(r) for r in custom_work_orders] if custom_work_orders is not None else None
+            ),
+        )
     else:
         maint_state = state
         if column_order is not None:
             maint_state.set_column_order(column_order)
+        if header_labels is not None:
+            maint_state.header_labels = dict(header_labels)
+        if work_orders_table_label is not None:
+            maint_state.work_orders_table_label = work_orders_table_label
+        if custom_work_orders is not None:
+            maint_state.custom_work_orders = [dict(r) for r in custom_work_orders]
+        if users is not None:
+            maint_state.users = dict(users)
 
     app = FastAPI(title="Synthetic Maintenance Lab", version="1.0.0")
     app.state.maintenance_state = maint_state
@@ -498,6 +583,8 @@ def create_maintenance_app(
             areas=sess.areas,
             rows=rows,
             column_order=maint_state.column_order,
+            table_label=maint_state.work_orders_table_label,
+            header_labels=maint_state.header_labels,
         )
         return HTMLResponse(page_html, status_code=status.HTTP_200_OK)
 

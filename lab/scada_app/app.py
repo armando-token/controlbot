@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -25,6 +26,7 @@ VALID_SCADA_MODES: frozenset[str] = frozenset(
         "down",
         "contradictory",
         "reordered",
+        "facility_b",
     }
 )
 
@@ -60,6 +62,20 @@ _HEADER_LABELS: dict[str, str] = {
     "quality": "Quality",
     "area": "Area",
 }
+
+FACILITY_B_SCADA_HEADER_LABELS: dict[str, str] = {
+    "id": "Registro",
+    "asset_id": "Tag SCADA",
+    "asset_label": "Equipo",
+    "value": "Valor",
+    "unit": "Unidad",
+    "time": "Hora",
+    "quality": "Calidad",
+    "area": "Área",
+}
+
+FACILITY_B_ALARMS_TABLE_LABEL = "Alarmas SCADA Planta B"
+FACILITY_B_READINGS_TABLE_LABEL = "Lecturas SCADA Planta B"
 
 
 @dataclass(frozen=True)
@@ -105,6 +121,11 @@ class ScadaState:
     reference_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     users: dict[str, ScadaUser] = field(default_factory=lambda: dict(DEFAULT_SCADA_USERS))
     sessions: dict[str, ScadaSessionRecord] = field(default_factory=dict)
+    header_labels: dict[str, str] = field(default_factory=lambda: dict(_HEADER_LABELS))
+    alarms_table_label: str = "SCADA Alarms"
+    readings_table_label: str = "SCADA Readings"
+    custom_alarms: list[dict[str, Any]] | None = None
+    custom_readings: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.fixture_mode not in VALID_SCADA_MODES:
@@ -134,8 +155,35 @@ class ScadaState:
             self.sessions[token].expired = True
 
     def get_alarms(self) -> list[dict[str, Any]]:
+        if self.custom_alarms is not None:
+            return [dict(row) for row in self.custom_alarms]
         ref = self.reference_time
         mode = self.fixture_mode
+        if mode == "facility_b":
+            return [
+                {
+                    "id": "ALM-7701",
+                    "asset_id": "SC-77",
+                    "asset_label": "bomba 77",
+                    "value": "SEAL_TEMP_HIGH",
+                    "unit": "alarm_code",
+                    "time": _iso_utc(ref - timedelta(minutes=40)),
+                    "quality": "good",
+                    "area": "area-2",
+                    "severity": "warning",
+                },
+                {
+                    "id": "ALM-7702",
+                    "asset_id": "SC-77",
+                    "asset_label": "bomba 77",
+                    "value": "PRESSURE_DROP",
+                    "unit": "alarm_code",
+                    "time": _iso_utc(ref - timedelta(minutes=15)),
+                    "quality": "good",
+                    "area": "area-2",
+                    "severity": "warning",
+                },
+            ]
         if mode in ("ambiguity", "ambiguous"):
             return [
                 {
@@ -212,8 +260,35 @@ class ScadaState:
         ]
 
     def get_readings(self) -> list[dict[str, Any]]:
+        if self.custom_readings is not None:
+            return [dict(row) for row in self.custom_readings]
         ref = self.reference_time
         mode = self.fixture_mode
+        if mode == "facility_b":
+            return [
+                {
+                    "id": "RDG-7701",
+                    "asset_id": "SC-77",
+                    "asset_label": "bomba 77",
+                    "value": 6.8,
+                    "unit": "mm/s",
+                    "time": _iso_utc(ref - timedelta(minutes=12)),
+                    "quality": "good",
+                    "area": "area-2",
+                    "severity": "info",
+                },
+                {
+                    "id": "RDG-7702",
+                    "asset_id": "SC-77",
+                    "asset_label": "bomba 77",
+                    "value": 5.1,
+                    "unit": "bar",
+                    "time": _iso_utc(ref - timedelta(minutes=4)),
+                    "quality": "good",
+                    "area": "area-2",
+                    "severity": "info",
+                },
+            ]
         if mode in ("ambiguity", "ambiguous"):
             return [
                 {
@@ -335,9 +410,11 @@ def _render_table_html(
     areas: tuple[str, ...],
     rows: list[dict[str, Any]],
     column_order: tuple[str, ...],
+    header_labels: Mapping[str, str] | None = None,
 ) -> str:
+    labels_map = header_labels if header_labels is not None else _HEADER_LABELS
     headers_html = "".join(
-        f"<th scope=\"col\">{html.escape(_HEADER_LABELS.get(col, col))}</th>"
+        f"<th scope=\"col\">{html.escape(labels_map.get(col, col))}</th>"
         for col in column_order
     )
     body_rows: list[str] = []
@@ -382,17 +459,71 @@ def create_scada_app(
     *,
     state: ScadaState | None = None,
     column_order: tuple[str, ...] | None = None,
+    header_labels: Mapping[str, str] | None = None,
+    alarms_table_label: str | None = None,
+    readings_table_label: str | None = None,
+    custom_alarms: list[dict[str, Any]] | None = None,
+    custom_readings: list[dict[str, Any]] | None = None,
+    users: Mapping[str, ScadaUser] | None = None,
 ) -> FastAPI:
     """Create an independent synthetic SCADA web application."""
     if state is None:
         effective_cols = column_order or (
-            REORDERED_SCADA_COLUMNS if fixture_mode == "reordered" else DEFAULT_SCADA_COLUMNS
+            REORDERED_SCADA_COLUMNS
+            if fixture_mode in ("reordered", "facility_b")
+            else DEFAULT_SCADA_COLUMNS
         )
-        scada_state = ScadaState(fixture_mode=fixture_mode, column_order=effective_cols)
+        effective_headers = (
+            dict(header_labels)
+            if header_labels is not None
+            else (
+                dict(FACILITY_B_SCADA_HEADER_LABELS)
+                if fixture_mode == "facility_b"
+                else dict(_HEADER_LABELS)
+            )
+        )
+        effective_alarms_label = (
+            alarms_table_label
+            if alarms_table_label is not None
+            else (FACILITY_B_ALARMS_TABLE_LABEL if fixture_mode == "facility_b" else "SCADA Alarms")
+        )
+        effective_readings_label = (
+            readings_table_label
+            if readings_table_label is not None
+            else (
+                FACILITY_B_READINGS_TABLE_LABEL
+                if fixture_mode == "facility_b"
+                else "SCADA Readings"
+            )
+        )
+        scada_state = ScadaState(
+            fixture_mode=fixture_mode,
+            column_order=effective_cols,
+            users=dict(users) if users is not None else dict(DEFAULT_SCADA_USERS),
+            header_labels=effective_headers,
+            alarms_table_label=effective_alarms_label,
+            readings_table_label=effective_readings_label,
+            custom_alarms=[dict(r) for r in custom_alarms] if custom_alarms is not None else None,
+            custom_readings=(
+                [dict(r) for r in custom_readings] if custom_readings is not None else None
+            ),
+        )
     else:
         scada_state = state
         if column_order is not None:
             scada_state.set_column_order(column_order)
+        if header_labels is not None:
+            scada_state.header_labels = dict(header_labels)
+        if alarms_table_label is not None:
+            scada_state.alarms_table_label = alarms_table_label
+        if readings_table_label is not None:
+            scada_state.readings_table_label = readings_table_label
+        if custom_alarms is not None:
+            scada_state.custom_alarms = [dict(r) for r in custom_alarms]
+        if custom_readings is not None:
+            scada_state.custom_readings = [dict(r) for r in custom_readings]
+        if users is not None:
+            scada_state.users = dict(users)
 
     app = FastAPI(title="Synthetic SCADA Lab", version="1.0.0")
     app.state.scada_state = scada_state
@@ -566,12 +697,13 @@ def create_scada_app(
                 status_code=status.HTTP_403_FORBIDDEN,
             )
         page_html = _render_table_html(
-            title="SCADA Alarms",
-            table_label="SCADA Alarms",
+            title=scada_state.alarms_table_label,
+            table_label=scada_state.alarms_table_label,
             username=sess.username,
             areas=sess.areas,
             rows=rows,
             column_order=scada_state.column_order,
+            header_labels=scada_state.header_labels,
         )
         return HTMLResponse(page_html, status_code=status.HTTP_200_OK)
 
@@ -604,12 +736,13 @@ def create_scada_app(
                 status_code=status.HTTP_403_FORBIDDEN,
             )
         page_html = _render_table_html(
-            title="SCADA Readings",
-            table_label="SCADA Readings",
+            title=scada_state.readings_table_label,
+            table_label=scada_state.readings_table_label,
             username=sess.username,
             areas=sess.areas,
             rows=rows,
             column_order=scada_state.column_order,
+            header_labels=scada_state.header_labels,
         )
         return HTMLResponse(page_html, status_code=status.HTTP_200_OK)
 
