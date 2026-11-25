@@ -94,7 +94,7 @@ def _extract_path_candidates_from_line(line: str) -> list[str]:
         if val and val not in seen:
             seen.add(val)
             candidates.append(val)
-    for m in re.finditer(r"""[A-Za-z0-9_./~-]{2,512}""", line):
+    for m in re.finditer(r"""[\w./~-]{2,512}""", line):
         val = m.group(0).strip()
         if ("/" in val or "." in val) and val not in seen:
             seen.add(val)
@@ -114,6 +114,15 @@ _C_ESCAPE_MAP: dict[str, int] = {
     "v": 11,
 }
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_BINARY_META_LINE_RE = re.compile(r"^(?:literal|delta)\s+\d+$")
+_BINARY_DATA_LINE_RE = re.compile(r"^[A-Za-z][0-9A-Za-z!#$%&()*+\-;<=>?@^_`{|}~]{5,}$")
+_SPACE_TIMESTAMP_RE = re.compile(
+    r"\s+(?:"
+    r"\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s*[+-]\d{2}:?\d{2}|Z)?)?"
+    r"|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}"
+    r")(?:\s.*)?$"
+)
 
 
 def _consume_quoted_git_token(text: str, start: int = 0) -> tuple[str, int]:
@@ -278,9 +287,15 @@ def _parse_diff_git_line(line: str) -> tuple[str, str]:
     return left, right
 
 
-def _parse_minus_plus_header_details(
+def _strip_git_header_prefix(path_str: str, git_prefix: str) -> tuple[str, bool]:
+    if path_str.startswith(git_prefix):
+        return path_str[len(git_prefix) :], True
+    return path_str, False
+
+
+def _parse_minus_plus_header_candidates(
     line: str, header_prefix: str, git_prefix: str
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, tuple[str, ...], bool]:
     rest = line[len(header_prefix) :]
     if rest.startswith('"'):
         raw, end_idx = _consume_quoted_git_token(rest, 0)
@@ -289,23 +304,56 @@ def _parse_minus_plus_header_details(
             raise PolicyImmutabilityError(
                 f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff header {line!r}."
             )
-    else:
-        raw = rest.split("\t", 1)[0].strip()
+        if raw == "/dev/null":
+            return None, (), False
+        if not raw:
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff header {line!r}."
+            )
+        stripped, had_git_prefix = _strip_git_header_prefix(raw, git_prefix)
+        if not stripped:
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: empty path after prefix in diff header {line!r}."
+            )
+        return stripped, (), had_git_prefix
 
-    if raw == "/dev/null":
-        return None, False
+    raw = rest.split("\t", 1)[0].strip()
     if not raw:
         raise PolicyImmutabilityError(
             f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff header {line!r}."
         )
-    had_git_prefix = raw.startswith(git_prefix)
-    if had_git_prefix:
-        raw = raw[len(git_prefix) :]
-    if not raw:
+    ts_stripped = _SPACE_TIMESTAMP_RE.sub("", raw).strip()
+    if raw == "/dev/null" or ts_stripped == "/dev/null":
+        return None, (), False
+
+    primary_raw = ts_stripped or raw
+    primary, had_git_prefix = _strip_git_header_prefix(primary_raw, git_prefix)
+    if not primary:
         raise PolicyImmutabilityError(
             f"{POLICY_IMMUTABILITY_VIOLATION}: empty path after prefix in diff header {line!r}."
         )
-    return raw, had_git_prefix
+
+    extras: list[str] = []
+    if any(ch.isspace() for ch in raw):
+        first_ws_raw = raw.split()[0]
+        first_ws, _ = _strip_git_header_prefix(first_ws_raw, git_prefix)
+        if first_ws and first_ws != primary and first_ws not in extras:
+            extras.append(first_ws)
+        if ts_stripped != raw:
+            full_raw, _ = _strip_git_header_prefix(raw, git_prefix)
+            if full_raw and full_raw != primary and full_raw not in extras:
+                extras.append(full_raw)
+
+    return primary, tuple(extras), had_git_prefix
+
+
+def _parse_minus_plus_header_details(
+    line: str, header_prefix: str, git_prefix: str
+) -> tuple[str | None, bool]:
+    primary, _, had_git_prefix = _parse_minus_plus_header_candidates(
+        line, header_prefix, git_prefix
+    )
+    return primary, had_git_prefix
 
 
 def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> str | None:
@@ -400,12 +448,17 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
     current_non_symlink_mode = False
     current_symlink_target_added = False
     current_section_paths: list[str] = []
+    current_plus_paths: list[str] = []
     current_rename_from: str | None = None
     current_rename_to: str | None = None
     current_has_diff_git = False
     current_had_standard_ab = False
     current_right_prefix: str | None = None
     current_plus_had_b_prefix: bool | None = None
+    current_saw_minus = False
+    current_saw_plus = False
+    current_saw_hunk = False
+    current_saw_binary = False
 
     def _flush_section() -> None:
         if (
@@ -431,20 +484,37 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
                     if stripped_pair not in renamed_pairs:
                         renamed_pairs.append(stripped_pair)
 
+    def _reset_section_state() -> None:
+        nonlocal in_hunk, in_binary_patch, old_rem, new_rem
+        nonlocal current_is_symlink, current_non_symlink_mode, current_symlink_target_added
+        nonlocal current_section_paths, current_plus_paths
+        nonlocal current_rename_from, current_rename_to, current_has_diff_git
+        nonlocal current_had_standard_ab, current_right_prefix, current_plus_had_b_prefix
+        nonlocal current_saw_minus, current_saw_plus, current_saw_hunk, current_saw_binary
+        _flush_section()
+        in_hunk = False
+        in_binary_patch = False
+        old_rem = 0
+        new_rem = 0
+        current_is_symlink = False
+        current_non_symlink_mode = False
+        current_symlink_target_added = False
+        current_section_paths = []
+        current_plus_paths = []
+        current_rename_from = None
+        current_rename_to = None
+        current_has_diff_git = False
+        current_had_standard_ab = False
+        current_right_prefix = None
+        current_plus_had_b_prefix = None
+        current_saw_minus = False
+        current_saw_plus = False
+        current_saw_hunk = False
+        current_saw_binary = False
+
     for line in patch_text.splitlines():
         if line.startswith("diff --git "):
-            _flush_section()
-            in_hunk = False
-            in_binary_patch = False
-            old_rem = 0
-            new_rem = 0
-            current_is_symlink = False
-            current_non_symlink_mode = False
-            current_symlink_target_added = False
-            current_section_paths = []
-            current_rename_from = None
-            current_rename_to = None
-            current_plus_had_b_prefix = None
+            _reset_section_state()
             left, right, current_had_standard_ab, current_right_prefix = (
                 _parse_diff_git_line_details(line)
             )
@@ -456,6 +526,7 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
 
         if line.startswith("@@"):
             in_binary_patch = False
+            current_saw_hunk = True
             m = _HUNK_HEADER_RE.match(line)
             if m is None:
                 raise PolicyImmutabilityError(
@@ -471,17 +542,22 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
                 added = line[1:]
                 added_lines.append(added)
                 if current_is_symlink:
-                    link_rel = current_section_paths[-1] if current_section_paths else ""
-                    symlink_added_targets.append((link_rel, added))
+                    link_targets = (
+                        list(dict.fromkeys(current_plus_paths))
+                        if current_plus_paths
+                        else ([current_section_paths[-1]] if current_section_paths else [""])
+                    )
                     already_b_stripped = (
                         current_plus_had_b_prefix
                         if current_plus_had_b_prefix is not None
                         else current_had_standard_ab
                     )
-                    if not already_b_stripped and "/" in link_rel:
-                        stripped_link = link_rel.split("/", 1)[1]
-                        if stripped_link:
-                            symlink_added_targets.append((stripped_link, added))
+                    for link_rel in link_targets:
+                        symlink_added_targets.append((link_rel, added))
+                        if not already_b_stripped and "/" in link_rel:
+                            stripped_link = link_rel.split("/", 1)[1]
+                            if stripped_link:
+                                symlink_added_targets.append((stripped_link, added))
                     current_symlink_target_added = True
                 new_rem -= 1
             elif line.startswith("-"):
@@ -502,7 +578,15 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
         if (line.startswith("Binary files ") or line.startswith("Files ")) and line.endswith(
             " differ"
         ):
+            if (
+                current_saw_minus
+                or current_saw_plus
+                or current_saw_hunk
+                or current_saw_binary
+            ):
+                _reset_section_state()
             in_binary_patch = False
+            current_saw_binary = True
             bin_left, bin_right = _parse_binary_differ_line(line)
             if bin_left is not None:
                 _add_touched(bin_left)
@@ -513,7 +597,7 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
             continue
 
         if line.strip() == "GIT binary patch":
-            if not current_section_paths:
+            if current_saw_hunk or current_saw_binary or not current_section_paths:
                 raise PolicyImmutabilityError(
                     f"{POLICY_IMMUTABILITY_VIOLATION}: GIT binary patch missing target path header."
                 )
@@ -522,11 +606,18 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
                     f"{POLICY_IMMUTABILITY_VIOLATION}: binary patch targeting 120000 symlink "
                     f"{current_section_paths[-1]!r} is not permitted."
                 )
+            current_saw_binary = True
             in_binary_patch = True
             continue
 
         if in_binary_patch:
-            continue
+            if (
+                not line.strip()
+                or _BINARY_META_LINE_RE.match(line)
+                or _BINARY_DATA_LINE_RE.match(line)
+            ):
+                continue
+            in_binary_patch = False
 
         if line.startswith(
             (
@@ -536,36 +627,82 @@ def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
                 "new mode 120000",
             )
         ):
+            if (
+                current_saw_minus
+                or current_saw_plus
+                or current_saw_hunk
+                or current_saw_binary
+            ):
+                _reset_section_state()
             current_is_symlink = True
             current_non_symlink_mode = False
             continue
-        if line.startswith(("new mode ", "new file mode ")):
-            current_is_symlink = False
-            current_non_symlink_mode = True
+        if line.startswith(("new mode ", "new file mode ", "deleted file mode ", "old mode ")):
+            if (
+                current_saw_minus
+                or current_saw_plus
+                or current_saw_hunk
+                or current_saw_binary
+            ):
+                _reset_section_state()
+            if line.startswith(("new mode ", "new file mode ")):
+                current_is_symlink = False
+                current_non_symlink_mode = True
             continue
         if line.startswith("index ") and line.rstrip().endswith(" 120000"):
+            if (
+                current_saw_minus
+                or current_saw_plus
+                or current_saw_hunk
+                or current_saw_binary
+            ):
+                _reset_section_state()
             current_is_symlink = True
             current_non_symlink_mode = False
             continue
 
         if line.startswith("--- "):
-            p = _parse_minus_plus_header(line, "--- ", "a/")
+            if (
+                current_saw_minus
+                or current_saw_plus
+                or current_saw_hunk
+                or current_saw_binary
+            ):
+                _reset_section_state()
+            current_saw_minus = True
+            p, p_extras, _ = _parse_minus_plus_header_candidates(line, "--- ", "a/")
             if p is not None:
                 _add_touched(p)
                 current_section_paths.append(p)
+            for cand in p_extras:
+                _add_touched(cand)
+                current_section_paths.append(cand)
             continue
 
         if line.startswith("+++ "):
-            p, had_b = _parse_minus_plus_header_details(line, "+++ ", "b/")
+            current_saw_plus = True
+            p, p_extras, had_b = _parse_minus_plus_header_candidates(line, "+++ ", "b/")
             if p is not None:
                 _add_touched(p)
                 current_section_paths.append(p)
+                current_plus_paths.append(p)
                 current_plus_had_b_prefix = had_b
+            for cand in p_extras:
+                _add_touched(cand)
+                current_section_paths.append(cand)
+                current_plus_paths.append(cand)
             continue
 
         matched_meta = False
         for meta_hdr in ("rename from ", "rename to ", "copy from ", "copy to "):
             if line.startswith(meta_hdr):
+                if (
+                    current_saw_minus
+                    or current_saw_plus
+                    or current_saw_hunk
+                    or current_saw_binary
+                ):
+                    _reset_section_state()
                 raw_meta = line[len(meta_hdr) :].strip()
                 if not raw_meta:
                     raise PolicyImmutabilityError(
@@ -1285,6 +1422,21 @@ class PolicyGuard:
             with contextlib.suppress(OSError, RuntimeError):
                 search_bases.append(base.resolve())
 
+        forb_names_by_folded: dict[str, str] = {
+            _norm_fold(name): name for name, _ in basename_patterns if name
+        }
+        for name in forb_names:
+            if name:
+                forb_names_by_folded.setdefault(_norm_fold(name), name)
+        basename_folded_patterns: list[tuple[str, re.Pattern[str]]] = [
+            (
+                orig_name,
+                re.compile(rf"(?<!\w)(?<![.-]){re.escape(folded_name)}(?!\w)(?!\.)"),
+            )
+            for folded_name, orig_name in forb_names_by_folded.items()
+            if folded_name
+        ]
+
         for added in added_lines:
             for pat in _POLICY_BYPASS_PATTERNS:
                 if pat.search(added):
@@ -1314,8 +1466,30 @@ class PolicyGuard:
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden filename ({name})."
                     )
+            for orig_name, fpat in basename_folded_patterns:
+                if fpat.search(added_folded):
+                    raise IsolationBoundaryError(
+                        f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
+                        f"forbidden filename ({orig_name})."
+                    )
+            extracted_tokens = _extract_path_candidates_from_line(added)
+            if forb_names_by_folded:
+                for cand_tok in extracted_tokens:
+                    for sub_tok in (cand_tok, *re.split(r"[:?#@=,;]+", cand_tok)):
+                        norm_sub = sub_tok.strip().replace("\\", "/")
+                        if not norm_sub:
+                            continue
+                        base_sub = posixpath.basename(norm_sub.rstrip("/"))
+                        for tok_form in (norm_sub, base_sub):
+                            folded_form = _norm_fold(tok_form) if tok_form else ""
+                            if folded_form and folded_form in forb_names_by_folded:
+                                raise IsolationBoundaryError(
+                                    f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff "
+                                    f"referencing forbidden filename "
+                                    f"({forb_names_by_folded[folded_form]})."
+                                )
             if search_bases and (forb_res or forb_names):
-                for cand_tok in _extract_path_candidates_from_line(added):
+                for cand_tok in extracted_tokens:
                     cand_paths = [Path(cand_tok)] if cand_tok.startswith("/") else [
                         base / cand_tok for base in search_bases
                     ]

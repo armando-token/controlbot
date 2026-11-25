@@ -2173,3 +2173,315 @@ def test_evaluate_patch_and_audit_branch_reject_custom_p1_prefixes_symlink_renam
         text=True,
     ).stdout.strip()
     assert head_after == base_head
+
+
+@pytest.mark.n1
+def test_evaluate_patch_closes_binary_leak_cross_section_symlink_space_timestamp_and_short_casefold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lab_repo = tmp_path / "lab_repo_r6"
+    _init_git_repo(lab_repo)
+    (lab_repo / "tests" / "acceptance").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "tests" / "acceptance" / "test_a01.py").write_text(
+        "assert False\n", encoding="utf-8"
+    )
+    (lab_repo / "src" / "contracts").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "src" / "contracts" / "models.py").write_text("X = 1\n", encoding="utf-8")
+    (lab_repo / "src" / "factory").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "src" / "factory" / "policy.py").write_text("POLICY = 1\n", encoding="utf-8")
+    (lab_repo / "src" / "factory" / "errors.py").write_text("ERR = 1\n", encoding="utf-8")
+    (lab_repo / "src" / "engine").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "src" / "engine" / "coordinator.py").write_text("COORD = 1\n", encoding="utf-8")
+    (lab_repo / "src" / "engine" / "budget.py").write_text("BUDGET = 1\n", encoding="utf-8")
+    (lab_repo / "src" / "engine" / "loop_detector.py").write_text("LOOP = 1\n", encoding="utf-8")
+    (lab_repo / "src" / "engine" / "tool_registry.py").write_text("TOOL = 1\n", encoding="utf-8")
+    (lab_repo / "MEGAPLAN_IMPLEMENTACION_GROKBOT_LINUX_TEAMWORK.md").write_text(
+        "# Spec\n", encoding="utf-8"
+    )
+    (lab_repo / "ok.py").write_text("X = 1\n", encoding="utf-8")
+    (lab_repo / "lab").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "lab" / "ok.py").write_text("OK = 1\n", encoding="utf-8")
+    (lab_repo / "lab" / "my file.py").write_text("SPACE = 1\n", encoding="utf-8")
+    (lab_repo / "lab" / "fixture.bin").write_bytes(b"\x00\x01\x02\x03")
+
+    subprocess.run(["git", "-C", str(lab_repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "add r6 fixtures"],
+        check=True,
+        capture_output=True,
+    )
+    base_head = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    db_path = tmp_path / "factory_r6.db"
+
+    def _run_cli(argv: list[str]) -> tuple[int, dict[str, Any]]:
+        rc = factory_cli_main(argv)
+        out = capsys.readouterr().out
+        return rc, json.loads(out)
+
+    # Generate real git binary patch on lab/fixture.bin
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "checkout", "-b", "bin_gen"],
+        check=True,
+        capture_output=True,
+    )
+    (lab_repo / "lab" / "fixture.bin").write_bytes(b"\xff\xfe\xfd\xfc")
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "add", "lab/fixture.bin"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "bin update"],
+        check=True,
+        capture_output=True,
+    )
+    bin_base_patch = subprocess.run(
+        ["git", "-C", str(lab_repo), "diff", "--binary", "main..bin_gen"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "checkout", "-f", "main"],
+        check=True,
+        capture_output=True,
+    )
+
+    # 1. H1: GIT binary patch followed by plain ---/+++ diff over all 9 immutable targets
+    immutable_targets = [
+        ("tests/acceptance/test_a01.py", "assert False", "assert True  # H1_PWN"),
+        ("src/contracts/models.py", "X = 1", "X = 999"),
+        ("src/factory/policy.py", "POLICY = 1", "POLICY = None"),
+        ("src/engine/coordinator.py", "COORD = 1", "COORD = 999"),
+        ("src/engine/budget.py", "BUDGET = 1", "BUDGET = 999"),
+        ("src/engine/loop_detector.py", "LOOP = 1", "LOOP = 999"),
+        ("src/engine/tool_registry.py", "TOOL = 1", "TOOL = 999"),
+        ("src/factory/errors.py", "ERR = 1", "ERR = 999"),
+        ("MEGAPLAN_IMPLEMENTACION_GROKBOT_LINUX_TEAMWORK.md", "# Spec", "# H1_PWN"),
+    ]
+    for idx, (target_rel, old_line, new_line) in enumerate(immutable_targets):
+        p_h1 = tmp_path / f"h1_{idx}.patch"
+        p_h1.write_text(
+            f"{bin_base_patch}\n"
+            f"--- a/{target_rel}\n"
+            f"+++ b/{target_rel}\n"
+            "@@ -1 +1 @@\n"
+            f"-{old_line}\n"
+            f"+{new_line}\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_h1),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        assert target_rel in payload["touched_paths"]
+
+    # H1 variant: GIT binary patch followed by legitimate plain diff -> ALLOWED
+    p_h1_ok = tmp_path / "h1_ok.patch"
+    p_h1_ok.write_text(
+        f"{bin_base_patch}\n"
+        "--- a/lab/ok.py\n"
+        "+++ b/lab/ok.py\n"
+        "@@ -1 +1 @@\n"
+        "-OK = 1\n"
+        "+OK = 2\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_h1_ok),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+
+    # 2. E1: 120000 symlink section followed by plain --- a/ok.py adding +tests -> ALLOWED
+    p_e1 = tmp_path / "e1.patch"
+    p_e1.write_text(
+        "diff --git a/lab/sym_a b/lab/sym_a\n"
+        "new file mode 120000\n"
+        "--- /dev/null\n"
+        "+++ b/lab/sym_a\n"
+        "@@ -0,0 +1 @@\n"
+        "+ok_target\n"
+        "--- a/ok.py\n"
+        "+++ b/ok.py\n"
+        "@@ -1 +1,2 @@\n"
+        " X = 1\n"
+        "+tests\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "apply", "--check", str(p_e1)],
+        check=True,
+        capture_output=True,
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_e1),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+    assert payload["policy_passed"] is True
+
+    # 3. H5: Space-separated timestamps on ---/+++ headers fail closed; space filenames stay ALLOWED
+    h5_patches = [
+        (
+            "--- x/src/engine/budget.py 2026-11-25 10:00:00\n"
+            "+++ y/src/engine/budget.py 2026-11-25 10:00:01\n"
+            "@@ -1 +1 @@\n"
+            "-BUDGET = 1\n"
+            "+BUDGET = 999\n"
+        ),
+        (
+            "--- a/MEGAPLAN_IMPLEMENTACION_GROKBOT_LINUX_TEAMWORK.md 2026-11-25 10:00:00\n"
+            "+++ b/MEGAPLAN_IMPLEMENTACION_GROKBOT_LINUX_TEAMWORK.md 2026-11-25 10:00:01\n"
+            "@@ -1 +1 @@\n"
+            "-# Spec\n"
+            "+# PWN\n"
+        ),
+        (
+            "--- x/src/engine/coordinator.py Wed Nov 25 10:00:00 2026\n"
+            "+++ y/src/engine/coordinator.py Wed Nov 25 10:00:01 2026\n"
+            "@@ -1 +1 @@\n"
+            "-COORD = 1\n"
+            "+COORD = 999\n"
+        ),
+    ]
+    for idx, h5_text in enumerate(h5_patches):
+        p_h5 = tmp_path / f"h5_{idx}.patch"
+        p_h5.write_text(h5_text, encoding="utf-8")
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_h5),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    p_space_ok = tmp_path / "h5_space_ok.patch"
+    p_space_ok.write_text(
+        "--- a/lab/my file.py 2026-11-25 10:00:00\n"
+        "+++ b/lab/my file.py 2026-11-25 10:00:01\n"
+        "@@ -1 +1 @@\n"
+        "-SPACE = 1\n"
+        "+SPACE = 2\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_space_ok),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+
+    # 4. E2: Short (<12) forbidden basenames (ß.db -> SS.DB, straße.db -> STRASSE.DB, smart.db OK)
+    monkeypatch.setenv(
+        "GROKBOT_FORBIDDEN_PATHS",
+        f"{tmp_path / 'ß.db'},{tmp_path / 'straße.db'},{tmp_path / 'art.db'}",
+    )
+    for idx, forbidden_ref in enumerate(["SS.DB", "STRASSE.DB", "dir/SS.DB", "sub/STRASSE.DB"]):
+        p_e2 = tmp_path / f"e2_{idx}.patch"
+        p_e2.write_text(
+            "diff --git a/lab/ok.py b/lab/ok.py\n"
+            "--- a/lab/ok.py\n"
+            "+++ b/lab/ok.py\n"
+            "@@ -1 +1,2 @@\n"
+            " OK = 1\n"
+            f'+DB = "{forbidden_ref}"\n',
+            encoding="utf-8",
+        )
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_e2),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["violation"] == "ISOLATION_BOUNDARY_VIOLATION"
+
+    p_e2_smart = tmp_path / "e2_smart.patch"
+    p_e2_smart.write_text(
+        "diff --git a/lab/ok.py b/lab/ok.py\n"
+        "--- a/lab/ok.py\n"
+        "+++ b/lab/ok.py\n"
+        "@@ -1 +1,2 @@\n"
+        " OK = 1\n"
+        '+DB = "smart.db"\n',
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_e2_smart),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+
+    head_after = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after == base_head
