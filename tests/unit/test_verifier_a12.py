@@ -381,6 +381,46 @@ def test_t5_04_verifier_enforces_min_sources() -> None:
     assert res_partial.partial_info["min_sources"] == 2
     assert res_partial.partial_info["available_sources"] == ["scada"]
 
+    # Zero authorized evidence with source_errors={} must settle as FAILED (not PARTIAL)
+    # even when allow_partial_on_source_failure=True, under both min_sources=1 and min_sources=2.
+    bad_alarm = _make_obs(
+        source="scada",
+        asset_id="bomba-34-a1",
+        observed_label="bomba 34",
+        area="area-1",
+        record_type="alarm",
+        record_id="ALM-BAD-1",
+        value="BAD_VAL",
+        unit="alarm_code",
+    ).model_copy(update={"quality": DataQuality.BAD})
+    for min_srcs in (1, 2):
+        task_zero = task_partial.model_copy(
+            update={
+                "evidence_requirements": EvidenceRequirements(
+                    min_sources=min_srcs,
+                    allow_partial_on_source_failure=True,
+                )
+            }
+        )
+        res_empty = verifier.verify_and_synthesize(
+            task=task_zero,
+            config=cfg,
+            observations=[],
+            source_errors={},
+            target_asset_query="bomba 34",
+            target_area="area-1",
+        )
+        assert res_empty.status == TaskStatus.FAILED
+        res_all_bad = verifier.verify_and_synthesize(
+            task=task_zero,
+            config=cfg,
+            observations=[bad_alarm],
+            source_errors={},
+            target_asset_query="bomba 34",
+            target_area="area-1",
+        )
+        assert res_all_bad.status == TaskStatus.FAILED
+
 
 @pytest.mark.tier5
 @pytest.mark.n1

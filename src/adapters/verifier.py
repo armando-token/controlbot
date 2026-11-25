@@ -666,9 +666,9 @@ class Verifier:
                 "min_sources": task.evidence_requirements.min_sources,
             }
 
-        has_partial_source_failure = (bool(errors_dict) or insufficient_sources) and (
-            task.evidence_requirements.allow_partial_on_source_failure
-        )
+        has_partial_source_failure = (
+            bool(errors_dict) or (insufficient_sources and bool(authorized_obs))
+        ) and task.evidence_requirements.allow_partial_on_source_failure
         if (
             errors_dict or insufficient_sources
         ) and not task.evidence_requirements.allow_partial_on_source_failure:

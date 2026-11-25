@@ -619,3 +619,68 @@ async def test_t5_13_past_deadline_effect_sync_timeout_and_nonfinite_schema() ->
     for bad_num in (float("nan"), float("inf"), float("-inf")):
         assert validate_json_schema({"x": bad_num}, num_schema)
         assert validate_json_schema({"x": bad_num}, min_only_schema)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_13b_sync_callable_returning_awaitable_respects_combined_timeout() -> None:
+    import time
+
+    now = datetime(2026, 11, 25, 10, 0, 0, tzinfo=UTC)
+    registry = ToolRegistry(clock=lambda: now)
+    spec = ToolSpec(
+        tool_id="read.callable_awaitable",
+        version="1.0.0",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "sync_s": {"type": "number"},
+                "async_s": {"type": "number"},
+            },
+        },
+        output_schema={"type": "object"},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.READ,
+        timeout_s=0.08,
+        verifier_name="v",
+    )
+
+    class _SyncReturnsAwaitable:
+        def __call__(self, args: dict[str, Any], _ctx: ToolExecutionContext) -> Any:
+            time.sleep(float(args.get("sync_s", 0.0)))
+            async_s = float(args.get("async_s", 0.0))
+
+            async def _inner() -> dict[str, Any]:
+                await asyncio.sleep(async_s)
+                return {"ok": True}
+
+            return _inner()
+
+    registry.register(spec, _SyncReturnsAwaitable())
+    ctx = _ctx(
+        scope=TaskScope(
+            facility_id="plant-a",
+            allowed_origins=("https://scada.local",),
+            allowed_tools=("read.callable_awaitable",),
+            read_only=True,
+        ),
+        granted_permissions=(),
+    ).model_copy(update={"now": now, "deadline_at": now + timedelta(seconds=30)})
+
+    # Combined sync (0.05s) + async (0.06s) = 0.11s > timeout_s (0.08s),
+    # whereas each half alone is < 0.08s: single combined timeout must trigger.
+    res_timeout = await registry.invoke(
+        "read.callable_awaitable",
+        {"sync_s": 0.05, "async_s": 0.06},
+        ctx,
+    )
+    assert res_timeout.outcome == ReceiptOutcome.FAILED_TRANSIENT
+    assert res_timeout.verifier_reason == "timeout"
+
+    # Fast combined path (0.01s + 0.01s < 0.08s) succeeds normally.
+    res_ok = await registry.invoke(
+        "read.callable_awaitable",
+        {"sync_s": 0.01, "async_s": 0.01},
+        ctx,
+    )
+    assert res_ok.outcome == ReceiptOutcome.SUCCEEDED

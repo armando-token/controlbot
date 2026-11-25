@@ -534,7 +534,19 @@ class ToolRegistry:
                     timeout=effective_timeout,
                 )
                 if inspect.isawaitable(call_res):
-                    raw_result = await asyncio.wait_for(call_res, timeout=effective_timeout)
+                    remaining_after_call = effective_timeout - (
+                        time.perf_counter() - started
+                    )
+                    if remaining_after_call <= 0:
+                        if inspect.iscoroutine(call_res):
+                            call_res.close()
+                        raise TimeoutError(
+                            "Tool execution timed out before awaiting returned awaitable."
+                        )
+                    raw_result = await asyncio.wait_for(
+                        call_res,
+                        timeout=remaining_after_call,
+                    )
                 else:
                     raw_result = call_res
         except TimeoutError as exc:

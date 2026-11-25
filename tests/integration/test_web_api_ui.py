@@ -619,3 +619,50 @@ async def test_t5_21_web_app_bad_creds_json_non_utf8_form_and_quoted_redirects(
         )
         assert res_cancel.status_code == 303
         assert res_cancel.headers["location"] == "/tasks/run%2B1+2"
+
+
+@pytest.mark.tier5
+@pytest.mark.n2
+async def test_t5_02b_empty_comma_allowed_origins_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GROKBOT_DB_PATH", str(tmp_path / "empty_origins.sqlite3"))
+    monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles_empty_origins"))
+    monkeypatch.delenv("GROKBOT_INSTALLATION_CONFIG", raising=False)
+    monkeypatch.delenv("GROKBOT_SCADA_URL", raising=False)
+    monkeypatch.delenv("GROKBOT_MAINTENANCE_URL", raising=False)
+    monkeypatch.delenv("GROKBOT_EFFECT_SIM_URL", raising=False)
+    monkeypatch.setenv("GROKBOT_ALLOWED_ORIGINS", " , ")
+
+    web_app = create_app()
+    async with (
+        web_app.router.lifespan_context(web_app),
+        run_asgi_server(web_app) as origin,
+        httpx.AsyncClient(base_url=origin, trust_env=False) as client,
+    ):
+        api_resp = await client.post(
+            "/api/tasks",
+            json={
+                "user_id": "operator_ro",
+                "profile_id": "p1",
+                "facility_id": "facility-a",
+                "allowed_origins": ["http://127.0.0.1:8101"],
+                "query": "Check bomba 34",
+            },
+        )
+        assert api_resp.status_code == 422
+        assert "no valid origins" in str(api_resp.json()["detail"]).lower()
+
+        ui_resp = await client.post(
+            "/ui/tasks",
+            data={
+                "query": "Check bomba 34",
+                "facility_id": "facility-a",
+                "allowed_origins": "http://127.0.0.1:8101",
+            },
+            follow_redirects=False,
+        )
+        assert ui_resp.status_code == 303
+        assert ui_resp.headers["location"].startswith("/?error=")
+        assert (await client.get("/api/tasks")).json()["tasks"] == []

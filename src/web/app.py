@@ -221,9 +221,13 @@ def _validate_task_origins(
         )
     elif raw_allowed:
         strict_configured_check = True
+        parsed_allowed: set[str] = set()
         for raw_origin in raw_allowed.split(","):
             if raw_origin.strip():
-                configured_origins.add(validate_http_origin(raw_origin.strip()))
+                parsed_allowed.add(validate_http_origin(raw_origin.strip()))
+        if not parsed_allowed:
+            raise ValueError("GROKBOT_ALLOWED_ORIGINS is set but contains no valid origins.")
+        configured_origins.update(parsed_allowed)
         if overrides:
             configured_origins.update(overrides.values())
     else:
@@ -236,16 +240,17 @@ def _validate_task_origins(
 
     if task_spec.scope.allowed_origins:
         if strict_configured_check:
-            if configured_origins:
-                disallowed = [
-                    origin
-                    for origin in task_spec.scope.allowed_origins
-                    if origin not in configured_origins
-                ]
-                if disallowed:
-                    raise ValueError(
-                        f"Unconfigured or disallowed allowed_origins: {disallowed}"
-                    )
+            if not configured_origins:
+                raise ValueError("Configured origin allowlist is empty.")
+            disallowed = [
+                origin
+                for origin in task_spec.scope.allowed_origins
+                if origin not in configured_origins
+            ]
+            if disallowed:
+                raise ValueError(
+                    f"Unconfigured or disallowed allowed_origins: {disallowed}"
+                )
         else:
             all_apps_overridden = active_runtime is not None and all(
                 app_id in overrides
