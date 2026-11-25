@@ -120,3 +120,19 @@ def test_benchmark_module_subprocess_smoke(tmp_path: Path) -> None:
     payload = json.loads(proc.stdout)
     assert payload["provenance"]["model_type"] == "emulated"
     assert payload["provenance"]["a11_status"] == "PENDING_N3_LINUX_ENV"
+
+
+@pytest.mark.n2
+async def test_benchmarks_a08_a09_fail_fast_on_unreachable_local_http() -> None:
+    report = await run_benchmarks(
+        mode="local_http",
+        repeats=1,
+        scenarios=("A08", "A09"),
+        llm_origin="http://127.0.0.1:9",
+    )
+    engine_trials = [t for t in report.trials if t.system == "grokbot_engine"]
+    assert len(engine_trials) == 2
+    for trial in engine_trials:
+        assert trial.correct is False
+        assert trial.status == "failed"
+        assert "timeout" not in trial.status.lower()

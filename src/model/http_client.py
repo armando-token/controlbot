@@ -409,9 +409,23 @@ class LocalHttpModelClient:
                         "tool_calls[0].function.arguments must decode to dict."
                     )
 
-                explicit_origin = parsed_args.pop("__target_origin__", None) or tc.get(
-                    "target_origin"
-                )
+                explicit_origin: Any = parsed_args.pop("__target_origin__", None)
+                if explicit_origin is None:
+                    explicit_origin = parsed_args.get("target_origin")
+                if explicit_origin is None:
+                    explicit_origin = parsed_args.get("origin")
+                if explicit_origin is None:
+                    explicit_origin = tc.get("target_origin") or fn.get("target_origin")
+                if explicit_origin is None:
+                    for url_key in ("url", "target_url"):
+                        candidate_url = parsed_args.get(url_key)
+                        if isinstance(candidate_url, str) and candidate_url.startswith(
+                            ("http://", "https://")
+                        ):
+                            parsed_url = urlparse(candidate_url)
+                            if parsed_url.scheme and parsed_url.netloc:
+                                explicit_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                                break
                 spec = tool_map.get(tool_id)
                 resolved_origin: str | None = None
                 if explicit_origin is not None:
@@ -468,15 +482,44 @@ class LocalHttpModelClient:
                     f"Model proposed unknown tool_id {tc_tool_id!r} outside allowed tool list."
                 )
             spec = tool_map.get(tc_tool_id)
-            if raw_tc.get("target_origin") is None and spec is not None and spec.allowed_origins:
-                raw_tc = {**raw_tc, "target_origin": spec.allowed_origins[0]}
-                parsed_obj = {**parsed_obj, "tool_call": raw_tc}
+            raw_tc_args = raw_tc.get("args")
+            if raw_tc.get("target_origin") is None:
+                inferred_origin: Any = None
+                if isinstance(raw_tc_args, dict):
+                    inferred_origin = raw_tc_args.get("__target_origin__")
+                    if inferred_origin is None:
+                        inferred_origin = raw_tc_args.get("target_origin")
+                    if inferred_origin is None:
+                        inferred_origin = raw_tc_args.get("origin")
+                    if inferred_origin is None:
+                        for url_key in ("url", "target_url"):
+                            candidate_url = raw_tc_args.get(url_key)
+                            if isinstance(candidate_url, str) and candidate_url.startswith(
+                                ("http://", "https://")
+                            ):
+                                parsed_url = urlparse(candidate_url)
+                                if parsed_url.scheme and parsed_url.netloc:
+                                    inferred_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                                    break
+                if inferred_origin is not None:
+                    try:
+                        validated_origin = validate_http_origin(str(inferred_origin))
+                    except ValueError as exc:
+                        raise ModelProtocolError(f"Invalid target_origin: {exc}") from exc
+                    raw_tc = {**raw_tc, "target_origin": validated_origin}
+                    parsed_obj = {**parsed_obj, "tool_call": raw_tc}
+                elif spec is not None and spec.allowed_origins:
+                    raw_tc = {**raw_tc, "target_origin": spec.allowed_origins[0]}
+                    parsed_obj = {**parsed_obj, "tool_call": raw_tc}
             if (
                 raw_tc.get("completion_verifier") is None
                 and spec is not None
             ):
                 raw_tc = {**raw_tc, "completion_verifier": spec.verifier_name}
                 parsed_obj = {**parsed_obj, "tool_call": raw_tc}
+
+        if decision_type == "final" and parsed_obj.get("partial_info") == {}:
+            parsed_obj = {**parsed_obj, "partial_info": None}
 
         try:
             return ModelDecision.model_validate({**parsed_obj, "usage": usage.model_dump()})

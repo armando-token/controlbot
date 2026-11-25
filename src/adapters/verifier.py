@@ -69,6 +69,18 @@ def _resolve_asset_mapping_any_source(
     return None
 
 
+def _resolve_asset_mapping_by_label(
+    obs: Observation, config: FacilityConfig
+) -> AssetMapping | None:
+    """Resolve a unique AssetMapping by observed_label when asset_id is unconfigured."""
+    candidates = resolve_asset_candidates(config, obs.observed_label, area=obs.area)
+    if not candidates:
+        candidates = resolve_asset_candidates(config, obs.observed_label)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def _matches_asset_query(obs: Observation, query: str, config: FacilityConfig) -> bool:
     needle = query.strip().lower()
     if not needle:
@@ -126,7 +138,9 @@ class Verifier:
 
         effective_units: set[str] | None = set(allowed_units) if allowed_units is not None else None
         if effective_units is None and config is not None:
-            mapped_asset = _resolve_asset_mapping_any_source(obs, config)
+            mapped_asset = _resolve_asset_mapping_any_source(
+                obs, config
+            ) or _resolve_asset_mapping_by_label(obs, config)
             if mapped_asset is not None:
                 record_type = str(obs.metadata.get("record_type", ""))
                 if record_type in mapped_asset.allowed_units:
@@ -328,6 +342,71 @@ class Verifier:
                     )
 
             # 2b. Cross-source conflicts across ALL observations from distinct sources
+            if len(per_source) == 1:
+                sole_source = source_names[0]
+                sole_obs_list = per_source[sole_source]
+                for obs in sole_obs_list:
+                    if _resolve_asset_mapping_any_source(obs, config) is not None:
+                        continue
+                    label_mapped = _resolve_asset_mapping_by_label(obs, config)
+                    if label_mapped is None:
+                        continue
+                    expected_id = label_mapped.source_ids.get(obs.source) or label_mapped.asset_id
+                    if obs.asset_id not in (label_mapped.asset_id, expected_id):
+                        contradictions.append(
+                            ContradictionRecord(
+                                summary=(
+                                    f"Source {obs.source!r} reported unconfigured asset_id "
+                                    f"{obs.asset_id!r} for {label_mapped.canonical_label!r} "
+                                    f"(expected {expected_id!r} or {label_mapped.asset_id!r})."
+                                ),
+                                claims=(
+                                    ContradictionClaim(
+                                        source="facility_config",
+                                        asset_id=label_mapped.asset_id,
+                                        field="source_asset_id",
+                                        value=expected_id,
+                                        observed_at=obs.observed_at,
+                                    ),
+                                    ContradictionClaim(
+                                        source=obs.source,
+                                        asset_id=obs.asset_id,
+                                        field="asset_id",
+                                        value=obs.asset_id,
+                                        observed_at=obs.observed_at,
+                                    ),
+                                ),
+                                unresolved=True,
+                            )
+                        )
+                    if obs.area is not None and obs.area != label_mapped.area:
+                        contradictions.append(
+                            ContradictionRecord(
+                                summary=(
+                                    f"Source {obs.source!r} reported asset_id {obs.asset_id!r} "
+                                    f"in area {obs.area!r}, conflicting with configured area "
+                                    f"{label_mapped.area!r}."
+                                ),
+                                claims=(
+                                    ContradictionClaim(
+                                        source="facility_config",
+                                        asset_id=label_mapped.asset_id,
+                                        field="area",
+                                        value=label_mapped.area,
+                                        observed_at=obs.observed_at,
+                                    ),
+                                    ContradictionClaim(
+                                        source=obs.source,
+                                        asset_id=obs.asset_id,
+                                        field="area",
+                                        value=obs.area,
+                                        observed_at=obs.observed_at,
+                                    ),
+                                ),
+                                unresolved=True,
+                            )
+                        )
+                continue
             if len(per_source) < 2:
                 continue
             unique_source_claims: dict[tuple[str, str, str | None], Observation] = {}

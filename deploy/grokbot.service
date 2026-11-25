@@ -1,0 +1,32 @@
+# Target Linux systemd unit template for Grokbot-clon offline pilot
+# Status: PENDING_N3_LINUX_ENV (authored on macOS; requires Linux systemd host for runtime verification)
+
+[Unit]
+Description=Grokbot-clon Local Industrial Operator Console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grokbot
+Group=grokbot
+WorkingDirectory=/opt/grokbot/app
+EnvironmentFile=/etc/grokbot/grokbot.env
+ExecStart=/opt/grokbot/.venv/bin/uvicorn src.web.app:create_app --factory --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+
+# Strict least-privilege & filesystem isolation
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/grokbot
+UMask=0077
+
+# Loopback-only pilot default (for internal LAN pilot, override with explicit RFC1918 subnet + allow_private_lan_origins=true)
+IPAddressAllow=127.0.0.1/8 ::1/128
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

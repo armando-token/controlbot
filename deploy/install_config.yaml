@@ -1,0 +1,45 @@
+schema_version: "1.0.0"
+environment: "lab_offline"
+host_os_target: "linux"
+bind_address: "127.0.0.1"
+web_port: 8000
+facility_config_path: "lab/configs/facility_a.json"
+allow_private_lan_origins: false
+allowed_origins:
+  - "http://127.0.0.1:8101"
+  - "http://127.0.0.1:8102"
+  - "http://127.0.0.1:8103"
+storage:
+  sqlite_wal_path: "/var/lib/grokbot/grokbot.sqlite3"
+  profile_root: "/var/lib/grokbot/profiles"
+  busy_timeout_ms: 5000
+local_model:
+  enabled: true
+  backend_mode: "local_http"
+  origin: "http://127.0.0.1:8080"
+  endpoint_path: "/v1/chat/completions"
+  model_id: "qwen2.5-7b-instruct"
+  quantization: "Q4_K_M"
+  prompt_template: "chatml-json-tools-v1"
+  weights_sha256: null
+  allow_private_lan: false
+permissions:
+  read_only_default: true
+  granted_permissions:
+    - "scada:read"
+    - "maint:read"
+  factory_isolated: true
+  allow_external_egress: false
+budgets:
+  max_active_children: 2
+  max_depth: 1
+  max_tool_calls: 16
+  max_model_calls: 8
+  max_wall_seconds: 120.0
+  max_total_tokens: 24000
+  max_transient_retries: 1
+  human_wait_timeout_seconds: 300.0
+offline_ops:
+  egress_blocked: true
+  pre_cached_wheels_dir: "/opt/grokbot/wheelhouse"
+  playwright_browsers_path: "/opt/grokbot/ms-playwright"

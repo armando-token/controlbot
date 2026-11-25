@@ -1010,7 +1010,7 @@ class Coordinator:
                         },
                     )
                 is_partial = bool(
-                    decision.partial_info is not None
+                    decision.partial_info
                     and decision.partial_info.get("is_partial", True)
                 )
                 candidate_status = TaskStatus.PARTIAL if is_partial else TaskStatus.SUCCEEDED

@@ -1,0 +1,51 @@
+# Target rootless offline Linux container recipe for Grokbot-clon
+# Status: PENDING_N3_LINUX_ENV (not built/executed on macOS due to absence of docker/podman/lima)
+
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_OFFLINE=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/grokbot/ms-playwright
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini \
+    ca-certificates \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 grokbot \
+    && useradd --uid 10001 --gid 10001 --home-dir /var/lib/grokbot --create-home grokbot \
+    && mkdir -p /opt/grokbot/app /opt/grokbot/wheelhouse /opt/grokbot/ms-playwright /var/lib/grokbot/profiles \
+    && chown -R grokbot:grokbot /opt/grokbot /var/lib/grokbot
+
+WORKDIR /opt/grokbot/app
+
+COPY pyproject.toml uv.lock ./
+COPY src/ ./src/
+COPY lab/ ./lab/
+COPY deploy/ ./deploy/
+COPY wheelhouse/ /opt/grokbot/wheelhouse/
+COPY ms-playwright/ /opt/grokbot/ms-playwright/
+
+RUN pip install --no-cache-dir --no-index --find-links /opt/grokbot/wheelhouse uv \
+    && uv sync --frozen --offline --no-dev --find-links /opt/grokbot/wheelhouse \
+    && chown -R grokbot:grokbot /opt/grokbot /var/lib/grokbot
+
+USER grokbot
+
+EXPOSE 8000
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD [".venv/bin/uvicorn", "src.web.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "8000"]

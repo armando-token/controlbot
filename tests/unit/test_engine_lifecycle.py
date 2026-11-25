@@ -302,3 +302,62 @@ async def test_depth1_delegation_active_cap_and_scope_narrowing(tmp_path: Path) 
     repo.transition_run_status(root2.run_id, TaskStatus.FAILED, "stop")
     with pytest.raises(TerminalStateError):
         repo.create_child_run(root2.run_id, "c-after-terminal")
+
+
+@pytest.mark.n1
+async def test_final_decision_with_empty_or_false_partial_info_settles_succeeded(
+    tmp_path: Path,
+) -> None:
+    from collections.abc import Sequence
+
+    from src.model.protocol import BudgetRemaining, ModelDecision, ModelUsage, PromptContext
+
+    class _PartialInfoClient:
+        def __init__(self, partial_info: dict[str, Any] | None) -> None:
+            self._partial_info = partial_info
+
+        async def decide(
+            self,
+            prompt_ctx: PromptContext,
+            tools: Sequence[ToolSpec],
+            budget_remaining: BudgetRemaining,
+        ) -> ModelDecision:
+            del prompt_ctx, tools, budget_remaining
+            return ModelDecision(
+                decision_type="final",
+                final_answer="Complete answer.",
+                partial_info=self._partial_info,
+                usage=ModelUsage(
+                    prompt_tokens=10,
+                    completion_tokens=10,
+                    total_tokens=20,
+                    usage_mode="actual",
+                ),
+            )
+
+    for idx, pinfo in enumerate([{}, {"is_partial": False, "note": "complete"}]):
+        clock = FakeClock()
+        repo = StorageRepo(tmp_path / f"empty_partial_{idx}.db", clock=clock)
+        repo.init_db()
+        reg = ToolRegistry(clock=clock)
+        _register_scada_tool(reg)
+        coord = Coordinator(repo, _PartialInfoClient(pinfo), reg, clock=clock)
+        run = coord.submit_task(_make_task(f"task-empty-partial-{idx}"))
+        res = await coord.run_until_settled(run.run_id)
+        assert res.status == TaskStatus.SUCCEEDED
+
+    # Non-empty partial_info without is_partial=False continues to settle PARTIAL
+    clock_p = FakeClock()
+    repo_p = StorageRepo(tmp_path / "real_partial.db", clock=clock_p)
+    repo_p.init_db()
+    reg_p = ToolRegistry(clock=clock_p)
+    _register_scada_tool(reg_p)
+    coord_p = Coordinator(
+        repo_p,
+        _PartialInfoClient({"missing_sources": ["maintenance"]}),
+        reg_p,
+        clock=clock_p,
+    )
+    run_p = coord_p.submit_task(_make_task("task-real-partial"))
+    res_p = await coord_p.run_until_settled(run_p.run_id)
+    assert res_p.status == TaskStatus.PARTIAL

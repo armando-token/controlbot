@@ -1109,7 +1109,57 @@ async def _engine_a08(
             )
         )
         worker_task = asyncio.create_task(coord1.run_until_settled(run.run_id))
-        await asyncio.wait_for(applied_evt.wait(), timeout=10.0)
+        applied_task = asyncio.create_task(applied_evt.wait())
+        done, _ = await asyncio.wait(
+            {worker_task, applied_task},
+            timeout=10.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not applied_evt.is_set():
+            applied_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await applied_task
+            if worker_task in done:
+                res = await worker_task
+                m = res.execution_metrics
+                return ScenarioTrialResult(
+                    scenario_id=scenario.scenario_id,
+                    scenario_name=scenario.name,
+                    system="grokbot_engine",
+                    repeat_index=repeat_index,
+                    evidence_tier=scenario.evidence_tier,
+                    status=res.status.value,
+                    correct=False,
+                    duration_ms=0.0,
+                    tool_calls=m.tool_calls,
+                    model_calls=m.model_calls,
+                    total_tokens=m.total_tokens,
+                    usage_mode="estimated" if m.usage_estimated else "actual",
+                    detail=_trial_detail(
+                        False,
+                        "Effect apply did not execute before run settled.",
+                        status=res.status.value,
+                        answer=res.answer,
+                    ),
+                )
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+            return ScenarioTrialResult(
+                scenario_id=scenario.scenario_id,
+                scenario_name=scenario.name,
+                system="grokbot_engine",
+                repeat_index=repeat_index,
+                evidence_tier=scenario.evidence_tier,
+                status="timeout",
+                correct=False,
+                duration_ms=0.0,
+                detail=_trial_detail(
+                    False,
+                    "Timed out waiting for effect apply before crash simulation.",
+                    status="timeout",
+                ),
+            )
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
@@ -1204,7 +1254,59 @@ async def _engine_a09(
         )
     )
     run_task = asyncio.create_task(coord.run_until_settled(run.run_id))
-    await asyncio.wait_for(started_evt.wait(), timeout=5.0)
+    started_task = asyncio.create_task(started_evt.wait())
+    done, _ = await asyncio.wait(
+        {run_task, started_task},
+        timeout=5.0,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if not started_evt.is_set():
+        started_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await started_task
+        if run_task in done:
+            res = await run_task
+            m = res.execution_metrics
+            return ScenarioTrialResult(
+                scenario_id=scenario.scenario_id,
+                scenario_name=scenario.name,
+                system="grokbot_engine",
+                repeat_index=repeat_index,
+                evidence_tier=scenario.evidence_tier,
+                status=res.status.value,
+                correct=False,
+                correct_abstention=False,
+                duration_ms=0.0,
+                tool_calls=m.tool_calls,
+                model_calls=m.model_calls,
+                total_tokens=m.total_tokens,
+                usage_mode="estimated" if m.usage_estimated else "actual",
+                detail=_trial_detail(
+                    False,
+                    "Run settled before slow tool started.",
+                    status=res.status.value,
+                    answer=res.answer,
+                ),
+            )
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+        return ScenarioTrialResult(
+            scenario_id=scenario.scenario_id,
+            scenario_name=scenario.name,
+            system="grokbot_engine",
+            repeat_index=repeat_index,
+            evidence_tier=scenario.evidence_tier,
+            status="timeout",
+            correct=False,
+            correct_abstention=False,
+            duration_ms=0.0,
+            detail=_trial_detail(
+                False,
+                "Timed out waiting for slow tool start.",
+                status="timeout",
+            ),
+        )
     cancelled = coord.cancel_task(run.run_id, reason="operator_abort")
     release_evt.set()
     res = await asyncio.wait_for(run_task, timeout=5.0)

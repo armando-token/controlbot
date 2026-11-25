@@ -18,7 +18,7 @@ from src.adapters import MappingCredentialProvider, load_facility_config
 from src.adapters.sessions import OriginNotAllowedError
 from src.contracts.budgets import BudgetConfig
 from src.contracts.common import utc_now
-from src.contracts.enums import BackendMode, TaskStatus
+from src.contracts.enums import BackendMode, EffectClass, TaskStatus
 from src.contracts.models import TaskScope, TaskSpec, ToolSpec
 from src.engine.coordinator import Coordinator
 from src.engine.tool_registry import ToolRegistry
@@ -670,3 +670,190 @@ async def test_local_http_empty_tools_rejects_tool_calls_in_both_branches() -> N
         for _ in range(2):
             with pytest.raises(ModelProtocolError, match="outside allowed tool list"):
                 await client.decide(_dummy_prompt(), (), _dummy_budget())
+
+
+@pytest.mark.n2
+async def test_local_http_propagates_target_origin_and_normalizes_empty_partial_info() -> None:
+    tool_spec = ToolSpec(
+        tool_id="scada.read_alarms",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=("http://127.0.0.1:8101",),
+        effect_class=EffectClass.READ,
+        verifier_name="v_scada",
+    )
+    responses: list[dict[str, Any]] = [
+        {
+            "model": "qwen2.5-7b-instruct",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "scada.read_alarms",
+                                    "arguments": json.dumps(
+                                        {"asset": "bomba 34", "origin": "http://127.0.0.1:9999"}
+                                    ),
+                                }
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        {
+            "model": "qwen2.5-7b-instruct",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "decision_type": "tool_call",
+                                "tool_call": {
+                                    "tool_id": "scada.read_alarms",
+                                    "args": {"url": "https://evil.example/alarms"},
+                                },
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "model": "qwen2.5-7b-instruct",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "decision_type": "final",
+                                "final_answer": "Done.",
+                                "partial_info": {},
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+    ]
+
+    def _handler(
+        body: dict[str, Any],
+        idx: int,
+    ) -> tuple[int, dict[str, Any], dict[str, str] | None]:
+        del body
+        return 200, responses[idx], None
+
+    mock_app, _ = create_mock_openai_server(_handler)
+    async with run_asgi_server(mock_app) as llm_origin:
+        client = LocalHttpModelClient(
+            LocalModelConfig(origin=llm_origin, model_id="qwen2.5-7b-instruct")
+        )
+        d1 = await client.decide(_dummy_prompt(), (tool_spec,), _dummy_budget())
+        assert d1.tool_call is not None
+        assert d1.tool_call.target_origin == "http://127.0.0.1:9999"
+
+        d2 = await client.decide(_dummy_prompt(), (tool_spec,), _dummy_budget())
+        assert d2.tool_call is not None
+        assert d2.tool_call.target_origin == "https://evil.example"
+
+        d3 = await client.decide(_dummy_prompt(), (tool_spec,), _dummy_budget())
+        assert d3.decision_type == "final"
+        assert d3.partial_info is None
+
+
+@pytest.mark.n2
+async def test_web_create_app_runtime_env_and_422_origin_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    import httpx
+    from src.web.app import create_app
+
+    scada_app = create_scada_app(fixture_mode="default")
+    maint_app = create_maintenance_app(fixture_mode="default")
+    ref_time = utc_now()
+    scada_app.state.scada_state.set_reference_time(ref_time)
+    maint_app.state.maintenance_state.set_reference_time(ref_time)
+
+    db_path = tmp_path / "env_web.sqlite3"
+    profiles_dir = tmp_path / "profiles"
+
+    async with (
+        run_asgi_server(scada_app) as scada_origin,
+        run_asgi_server(maint_app) as maint_origin,
+    ):
+        monkeypatch.setenv("GROKBOT_DB_PATH", str(db_path))
+        monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(profiles_dir))
+        monkeypatch.setenv("GROKBOT_SCADA_URL", scada_origin)
+        monkeypatch.setenv("GROKBOT_MAINTENANCE_URL", maint_origin)
+
+        web_app = create_app()
+        assert getattr(web_app.state, "runtime", None) is not None
+
+        async with (
+            web_app.router.lifespan_context(web_app),
+            run_asgi_server(web_app) as web_origin,
+            httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+        ):
+            # External unconfigured origin -> 422 before persisting any row
+            bad = await client.post(
+                "/api/tasks",
+                json={
+                    "user_id": "operator_ro",
+                    "profile_id": "p1",
+                    "facility_id": "facility-a",
+                    "allowed_origins": ["https://evil.example"],
+                    "query": "Check bomba 34",
+                },
+            )
+            assert bad.status_code == 422
+            # Invalid installation_config_path -> 422 before persisting any row
+            bad_cfg = await client.post(
+                "/api/tasks",
+                json={
+                    "user_id": "operator_ro",
+                    "profile_id": "p1",
+                    "facility_id": "facility-a",
+                    "installation_config_path": str(tmp_path / "missing_install.yaml"),
+                    "query": "Check bomba 34",
+                },
+            )
+            assert bad_cfg.status_code == 422
+            conn = sqlite3.connect(db_path)
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM tasks;").fetchone()[0]
+                assert count == 0
+            finally:
+                conn.close()
+
+            # Valid configured origins -> 201 and settles via real RuntimeCoordinatorAdapter
+            good = await client.post(
+                "/api/tasks",
+                json={
+                    "user_id": "operator_ro",
+                    "profile_id": "p1",
+                    "facility_id": "facility-a",
+                    "allowed_origins": [scada_origin, maint_origin],
+                    "allowed_areas": ["area-1"],
+                    "query": "Check bomba 34",
+                },
+            )
+            assert good.status_code == 201
+            run_id = good.json()["run_id"]
+            settled = await web_app.state.runtime.web_coordinator.wait_for_run(run_id, timeout=20.0)
+            assert settled is not None
+            assert settled.status == TaskStatus.SUCCEEDED

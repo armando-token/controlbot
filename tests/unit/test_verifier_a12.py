@@ -274,3 +274,44 @@ def test_infer_asset_query_resolves_source_ids() -> None:
     assert _infer_asset_query("Inspect SC-77 alarms", cfg) == "SC-77"
     assert _infer_asset_query("Check CMMS-77 maintenance", cfg) == "CMMS-77"
     assert _infer_asset_query("Check P-77B status", cfg) == "P-77B"
+
+
+@pytest.mark.n1
+def test_solo_unconfigured_asset_id_triggers_contradiction_and_unit_check() -> None:
+    cfg = load_facility_config(_FACILITY_B_PATH)
+    verifier = Verifier()
+    solo_bogus = _make_obs(
+        source="maintenance",
+        asset_id="BOGUS-99",
+        observed_label="bomba 77",
+        area="area-2",
+        record_type="reading",
+        record_id="RDG-9901",
+        value=42.0,
+        unit="psi",
+    )
+    contradictions = verifier.detect_contradictions([solo_bogus], cfg)
+    assert len(contradictions) == 1
+    assert contradictions[0].unresolved is True
+    assert "BOGUS-99" in contradictions[0].summary
+
+    task = TaskSpec(
+        task_id="t-solo-bogus",
+        user_id="operator_b",
+        profile_id="p1",
+        scope=TaskScope(facility_id="facility-b", allowed_areas=("area-2",), read_only=True),
+        query="Check bomba 77",
+    )
+    verified = verifier.verify_observation(solo_bogus, task.evidence_requirements, config=cfg)
+    assert verified.authorized_evidence is False
+    assert "unit_mismatch:psi" in verified.metadata.get("rejection_reasons", [])
+
+    res = verifier.verify_and_synthesize(
+        task=task,
+        config=cfg,
+        observations=[solo_bogus],
+        target_asset_query="bomba 77",
+        target_area="area-2",
+    )
+    assert res.status == TaskStatus.PARTIAL
+    assert len(res.contradictions) == 1

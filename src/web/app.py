@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, quote_plus
+from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -17,13 +19,18 @@ from jinja2 import Environment, FileSystemLoader
 from pydantic import ValidationError
 
 from src.adapters.sessions import (
+    OriginNotAllowedError,
     SessionBusyError,
     SessionLockState,
     SessionManager,
     SessionNotFoundError,
     TakeoverStateError,
 )
-from src.contracts.common import InvalidStateTransitionError, PlanValidationError
+from src.contracts.common import (
+    InvalidStateTransitionError,
+    PlanValidationError,
+    validate_http_origin,
+)
 from src.contracts.models import ActionReceipt, Run
 from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.storage.errors import ConflictError, NotFoundError
@@ -42,7 +49,111 @@ from src.web.schemas import (
 )
 from src.web.stub import InMemoryCoordinatorStub
 
+if TYPE_CHECKING:
+    from src.runtime import GrokbotRuntime
+
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_RUNTIME_ENV_KEYS: tuple[str, ...] = (
+    "GROKBOT_DB_PATH",
+    "GROKBOT_ALLOWED_ORIGINS",
+    "GROKBOT_SCADA_URL",
+    "GROKBOT_MAINTENANCE_URL",
+    "GROKBOT_EFFECT_SIM_URL",
+    "GROKBOT_LLM_BASE_URL",
+    "GROKBOT_INSTALLATION_CONFIG",
+    "GROKBOT_PROFILE_ROOT",
+    "GROKBOT_PROFILES_DIR",
+)
+
+
+def _has_runtime_env() -> bool:
+    return any(bool(os.environ.get(key, "").strip()) for key in _RUNTIME_ENV_KEYS)
+
+
+def _env_origin_overrides() -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    scada_url = os.environ.get("GROKBOT_SCADA_URL", "").strip()
+    maint_url = os.environ.get("GROKBOT_MAINTENANCE_URL", "").strip()
+    effect_url = os.environ.get("GROKBOT_EFFECT_SIM_URL", "").strip()
+    if scada_url:
+        overrides["scada"] = validate_http_origin(scada_url)
+    if maint_url:
+        overrides["maintenance"] = validate_http_origin(maint_url)
+    if effect_url:
+        overrides["effect_sim"] = validate_http_origin(effect_url)
+    return overrides
+
+
+def _build_default_credentials() -> dict[tuple[str, str, str], tuple[str, str]]:
+    creds: dict[tuple[str, str, str], tuple[str, str]] = {
+        ("operator_a", "*", "scada"): ("operator_a", "scada-pass-a"),
+        ("operator_a", "*", "maintenance"): ("maint_a", "maint-pass-a"),
+        ("operator_a1", "*", "scada"): ("operator_a1", "scada-pass-a1"),
+        ("operator_a1", "*", "maintenance"): ("maint_a1", "maint-pass-a1"),
+        ("operator_b", "*", "scada"): ("operator_b", "scada-pass-b"),
+        ("operator_b", "*", "maintenance"): ("maint_b", "maint-pass-b"),
+        ("operator_a2", "*", "scada"): ("operator_a2", "scada-pass-a2"),
+        ("operator_a2", "*", "maintenance"): ("maint_a2", "maint-pass-a2"),
+        ("operator_ro", "*", "scada"): ("operator_ro", "scada-pass-ro"),
+        ("operator_ro", "*", "maintenance"): ("maint_ro", "maint-pass-ro"),
+        ("*", "*", "scada"): ("operator_ro", "scada-pass-ro"),
+        ("*", "*", "maintenance"): ("maint_ro", "maint-pass-ro"),
+    }
+    raw_extra = os.environ.get("GROKBOT_CREDENTIALS_JSON", "").strip()
+    if raw_extra:
+        parsed = json.loads(raw_extra)
+        if isinstance(parsed, dict):
+            for key_str, val in parsed.items():
+                parts = [p.strip() for p in str(key_str).split(":")]
+                if len(parts) == 3 and isinstance(val, (list, tuple)) and len(val) == 2:
+                    creds[(parts[0], parts[1], parts[2])] = (str(val[0]), str(val[1]))
+        elif isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    creds[
+                        (
+                            str(item.get("user_id", "*")),
+                            str(item.get("profile_id", "*")),
+                            str(item["app_id"]),
+                        )
+                    ] = (str(item["username"]), str(item["password"]))
+    return creds
+
+
+def _load_configured_origins_from_path(
+    raw_path: str,
+    *,
+    origin_overrides: dict[str, str],
+) -> set[str]:
+    from deploy.config import load_deploy_config
+
+    from src.adapters.config import load_facility_config
+
+    path = Path(raw_path)
+    if not path.is_absolute() and not path.exists():
+        repo_candidate = _REPO_ROOT / path
+        if repo_candidate.exists():
+            path = repo_candidate
+    if not path.exists():
+        raise FileNotFoundError(f"Installation config not found: {raw_path}")
+
+    is_deploy_cfg = path.suffix.lower() in {".yaml", ".yml"}
+    if not is_deploy_cfg and path.suffix.lower() == ".json":
+        raw_obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw_obj, dict) and "apps" not in raw_obj and "allowed_origins" in raw_obj:
+            is_deploy_cfg = True
+
+    if is_deploy_cfg:
+        deploy_cfg = load_deploy_config(path, verify_facility=True, repo_root=_REPO_ROOT)
+        origins = set(deploy_cfg.allowed_origins)
+        origins.update(origin_overrides.values())
+        return origins
+
+    facility_cfg = load_facility_config(path, origin_overrides=origin_overrides or None)
+    if not facility_cfg.apps:
+        raise ValueError(f"Facility config {raw_path!r} defines zero configured app origins.")
+    return {app_cfg.origin for app_cfg in facility_cfg.apps.values()}
 
 
 def _scrub_and_verify(payload: Any, *, label: str = "payload") -> Any:
@@ -151,21 +262,132 @@ def create_app(
 ) -> FastAPI:
     """Create the FastAPI local operator API & HTML observability UI."""
     resolved_db = Path(db_path) if db_path is not None else None
-    coord: CoordinatorProtocol = (
-        coordinator if coordinator is not None else InMemoryCoordinatorStub()
-    )
+    active_runtime: GrokbotRuntime | None = None
     owns_session_manager = session_manager is None
     internal_sm: SessionManager | None = None
-    if session_manager is None:
-        profile_root = (
-            resolved_db.parent / "browser_profiles"
-            if resolved_db is not None
-            else Path.cwd() / ".grokbot_profiles"
+
+    if coordinator is not None:
+        coord: CoordinatorProtocol = coordinator
+        if session_manager is None:
+            profile_root = (
+                resolved_db.parent / "browser_profiles"
+                if resolved_db is not None
+                else Path.cwd() / ".grokbot_profiles"
+            )
+            internal_sm = SessionManager(profile_root=profile_root, headless=True)
+            sess_mgr: SessionManagerProtocol = internal_sm
+        else:
+            sess_mgr = session_manager
+    elif _has_runtime_env():
+        from deploy.config import load_deploy_config
+
+        from src.adapters._common import MappingCredentialProvider
+        from src.adapters.config import load_facility_config
+        from src.adapters.effects import EffectSimAdapter
+        from src.contracts.enums import BackendMode
+        from src.model.http_client import LocalModelConfig
+        from src.runtime import build_runtime
+
+        env_db = os.environ.get("GROKBOT_DB_PATH", "").strip()
+        if resolved_db is None:
+            resolved_db = Path(env_db) if env_db else (Path.cwd() / "grokbot.sqlite3")
+
+        env_profiles = (
+            os.environ.get("GROKBOT_PROFILE_ROOT", "").strip()
+            or os.environ.get("GROKBOT_PROFILES_DIR", "").strip()
         )
-        internal_sm = SessionManager(profile_root=profile_root, headless=True)
-        sess_mgr: SessionManagerProtocol = internal_sm
+        profile_root = (
+            Path(env_profiles) if env_profiles else (resolved_db.parent / "browser_profiles")
+        )
+
+        overrides = _env_origin_overrides()
+        raw_inst_cfg = os.environ.get("GROKBOT_INSTALLATION_CONFIG", "").strip()
+        if raw_inst_cfg:
+            inst_path = Path(raw_inst_cfg)
+            is_deploy_file = inst_path.suffix.lower() in {".yaml", ".yml"}
+            if not is_deploy_file and inst_path.suffix.lower() == ".json" and inst_path.exists():
+                raw_inst_obj = json.loads(inst_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(raw_inst_obj, dict)
+                    and "apps" not in raw_inst_obj
+                    and "facility_config_path" in raw_inst_obj
+                ):
+                    is_deploy_file = True
+            if is_deploy_file:
+                deploy_cfg = load_deploy_config(
+                    inst_path, verify_facility=False, repo_root=_REPO_ROOT
+                )
+                fac_path = Path(deploy_cfg.facility_config_path)
+                if not fac_path.is_absolute():
+                    fac_path = _REPO_ROOT / fac_path
+                facility_config = load_facility_config(
+                    fac_path, origin_overrides=overrides or None
+                )
+            else:
+                facility_config = load_facility_config(
+                    inst_path, origin_overrides=overrides or None
+                )
+        else:
+            default_fac = _REPO_ROOT / "lab" / "configs" / "facility_a.json"
+            facility_config = load_facility_config(
+                default_fac, origin_overrides=overrides or None
+            )
+
+        llm_base_url = os.environ.get("GROKBOT_LLM_BASE_URL", "").strip()
+        local_http_config: LocalModelConfig | None = None
+        backend_mode = BackendMode.EMULATED
+        if llm_base_url:
+            parsed_llm = urlparse(llm_base_url)
+            llm_origin = f"{parsed_llm.scheme}://{parsed_llm.netloc}"
+            llm_path = parsed_llm.path.rstrip("/")
+            endpoint_path = (
+                "/v1/chat/completions"
+                if llm_path in {"", "/v1"}
+                else f"{llm_path}/chat/completions"
+            )
+            allow_private_lan = os.environ.get("GROKBOT_ALLOW_PRIVATE_LAN", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            local_http_config = LocalModelConfig(
+                origin=llm_origin,
+                endpoint_path=endpoint_path,
+                model_id=os.environ.get("GROKBOT_LLM_MODEL_ID", "").strip()
+                or "mock-local-qwen2.5",
+                allow_private_lan=allow_private_lan,
+            )
+            backend_mode = BackendMode.LOCAL_HTTP
+
+        effect_adapter = EffectSimAdapter() if "effect_sim" in facility_config.apps else None
+        active_runtime = build_runtime(
+            db_path=resolved_db,
+            profile_root=profile_root,
+            facility_config=facility_config,
+            credential_provider=MappingCredentialProvider(_build_default_credentials()),
+            backend_mode=backend_mode,
+            local_http_config=local_http_config,
+            effect_adapter=effect_adapter,
+            auto_run=True,
+            headless=True,
+        )
+        coord = active_runtime.web_coordinator
+        sess_mgr = (
+            session_manager if session_manager is not None else active_runtime.session_manager
+        )
+        owns_session_manager = False
     else:
-        sess_mgr = session_manager
+        coord = InMemoryCoordinatorStub()
+        if session_manager is None:
+            profile_root = (
+                resolved_db.parent / "browser_profiles"
+                if resolved_db is not None
+                else Path.cwd() / ".grokbot_profiles"
+            )
+            internal_sm = SessionManager(profile_root=profile_root, headless=True)
+            sess_mgr = internal_sm
+        else:
+            sess_mgr = session_manager
 
     jinja_env = Environment(
         loader=FileSystemLoader(str(_TEMPLATES_DIR)),
@@ -175,6 +397,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if active_runtime is not None:
+            async with active_runtime:
+                yield
+            return
         try:
             yield
         finally:
@@ -185,6 +411,7 @@ def create_app(
     app.state.db_path = str(resolved_db) if resolved_db is not None else None
     app.state.coordinator = coord
     app.state.session_manager = sess_mgr
+    app.state.runtime = active_runtime
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -221,6 +448,43 @@ def create_app(
     @app.post("/api/tasks", status_code=status.HTTP_201_CREATED)
     async def api_submit_task(payload: TaskSubmitRequest) -> JSONResponse:
         task_spec = payload.to_task_spec()
+        try:
+            overrides = _env_origin_overrides()
+            configured_origins: set[str] = set()
+            if task_spec.installation_config_path is not None:
+                configured_origins = _load_configured_origins_from_path(
+                    task_spec.installation_config_path,
+                    origin_overrides=overrides,
+                )
+            else:
+                if active_runtime is not None:
+                    configured_origins.update(
+                        app_cfg.origin for app_cfg in active_runtime.facility_config.apps.values()
+                    )
+                raw_allowed = os.environ.get("GROKBOT_ALLOWED_ORIGINS", "").strip()
+                if raw_allowed:
+                    for raw_origin in raw_allowed.split(","):
+                        if raw_origin.strip():
+                            configured_origins.add(validate_http_origin(raw_origin.strip()))
+                if configured_origins and overrides:
+                    configured_origins.update(overrides.values())
+
+            if configured_origins and task_spec.scope.allowed_origins:
+                disallowed = [
+                    origin
+                    for origin in task_spec.scope.allowed_origins
+                    if origin not in configured_origins
+                ]
+                if disallowed:
+                    raise ValueError(
+                        f"Unconfigured or disallowed allowed_origins: {disallowed}"
+                    )
+        except (OSError, ValueError, ValidationError, OriginNotAllowedError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+
         try:
             run = await maybe_await(coord.submit_task(task_spec))
         except (InvalidStateTransitionError, ConflictError, PlanValidationError) as exc:
