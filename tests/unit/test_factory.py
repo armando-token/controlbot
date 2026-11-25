@@ -9,6 +9,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from src.factory import (
@@ -767,7 +768,7 @@ def test_evaluate_patch_hardening_noprefix_rename_traversal_symlink_and_short_fo
     ).stdout.strip()
     db_path = tmp_path / "factory_hardening.db"
 
-    def _run_eval(patch_file: Path) -> tuple[int, dict[str, object]]:
+    def _run_eval(patch_file: Path) -> tuple[int, dict[str, Any]]:
         rc = factory_cli_main(
             [
                 "evaluate-patch",
@@ -801,7 +802,7 @@ def test_evaluate_patch_hardening_noprefix_rename_traversal_symlink_and_short_fo
     rc, payload = _run_eval(p_noprefix)
     assert rc == 1
     assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
-    assert "tests/acceptance/test_a01.py" in payload["touched_paths"]  # type: ignore[operator]
+    assert "tests/acceptance/test_a01.py" in payload["touched_paths"]
 
     # 2. Pure rename without a/ b/
     p_rename = tmp_path / "rename.patch"
@@ -964,5 +965,231 @@ def test_evaluate_patch_hardening_noprefix_rename_traversal_symlink_and_short_fo
     try:
         rows = conn.execute("SELECT decision FROM factory_audit_log;").fetchall()
         assert len(rows) >= 10
+    finally:
+        conn.close()
+
+
+@pytest.mark.n1
+def test_evaluate_patch_rejects_parent_multihop_ancestor_120000_and_circular_symlinks(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lab_repo = tmp_path / "lab_repo"
+    _init_git_repo(lab_repo)
+    (lab_repo / "tests" / "acceptance").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "tests" / "acceptance" / "test_a01.py").write_text(
+        "assert False\n", encoding="utf-8"
+    )
+    (lab_repo / "src" / "contracts").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "src" / "contracts" / "models.py").write_text(
+        "ALLOW = False\n", encoding="utf-8"
+    )
+    (lab_repo / "lab" / "safe_dir").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "lab" / "safe_dir" / "ok.py").write_text("X = 1\n", encoding="utf-8")
+
+    if os.name == "posix":
+        (lab_repo / "lab" / "link_to_tests").symlink_to("../tests")
+        (lab_repo / "lab" / "link_to_src").symlink_to("../src")
+        (lab_repo / "lab" / "hop2_to_tests").symlink_to("link_to_tests")
+        (lab_repo / "lab" / "link_to_safe").symlink_to("safe_dir")
+        (lab_repo / "lab" / "loop_a").symlink_to("loop_b")
+        (lab_repo / "lab" / "loop_b").symlink_to("loop_a")
+
+    subprocess.run(["git", "-C", str(lab_repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "add symlink fixtures"],
+        check=True,
+        capture_output=True,
+    )
+    base_head = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    db_path = tmp_path / "factory_symlinks.db"
+
+    def _run_eval(patch_file: Path) -> tuple[int, dict[str, Any]]:
+        rc = factory_cli_main(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(patch_file),
+                "--json",
+            ]
+        )
+        out = capsys.readouterr().out
+        return rc, json.loads(out)
+
+    expected_rejections = 0
+
+    if os.name == "posix":
+        # 1. Parent-dir symlink: lab/link_to_tests -> ../tests + acceptance target
+        p_parent_tests = tmp_path / "parent_tests.patch"
+        p_parent_tests.write_text(
+            "diff --git a/lab/link_to_tests/acceptance/test_a01.py "
+            "b/lab/link_to_tests/acceptance/test_a01.py\n"
+            "--- a/lab/link_to_tests/acceptance/test_a01.py\n"
+            "+++ b/lab/link_to_tests/acceptance/test_a01.py\n"
+            "@@ -1 +1 @@\n"
+            "-assert False\n"
+            "+assert True  # PWNED\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_parent_tests)
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["policy_passed"] is False
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        expected_rejections += 1
+
+        # 2. Parent-dir symlink: lab/link_to_src -> ../src + contracts target
+        p_parent_src = tmp_path / "parent_src.patch"
+        p_parent_src.write_text(
+            "diff --git a/lab/link_to_src/contracts/models.py "
+            "b/lab/link_to_src/contracts/models.py\n"
+            "--- a/lab/link_to_src/contracts/models.py\n"
+            "+++ b/lab/link_to_src/contracts/models.py\n"
+            "@@ -1 +1 @@\n"
+            "-ALLOW = False\n"
+            "+ALLOW = True\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_parent_src)
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        expected_rejections += 1
+
+        # 3. Multi-hop symlink: lab/hop2_to_tests -> link_to_tests -> ../tests
+        p_multihop = tmp_path / "multihop_tests.patch"
+        p_multihop.write_text(
+            "diff --git a/lab/hop2_to_tests/acceptance/test_a01.py "
+            "b/lab/hop2_to_tests/acceptance/test_a01.py\n"
+            "--- a/lab/hop2_to_tests/acceptance/test_a01.py\n"
+            "+++ b/lab/hop2_to_tests/acceptance/test_a01.py\n"
+            "@@ -1 +1 @@\n"
+            "-assert False\n"
+            "+assert True  # PWNED\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_multihop)
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        expected_rejections += 1
+
+        # 4. Circular symlink (ELOOP): lab/loop_a -> loop_b -> loop_a fails closed with JSON
+        p_eloop = tmp_path / "eloop.patch"
+        p_eloop.write_text(
+            "diff --git a/lab/loop_a b/lab/loop_a\n"
+            "--- a/lab/loop_a\n"
+            "+++ b/lab/loop_a\n"
+            "@@ -1 +1 @@\n"
+            "-loop_b\n"
+            "+loop_b\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_eloop)
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["policy_passed"] is False
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        assert "unresolvable symlink" in str(payload["reason"])
+        expected_rejections += 1
+
+        # 5. Legitimate symlink inside non-immutable lab/safe_dir remains ALLOWED
+        p_safe_link = tmp_path / "safe_link.patch"
+        p_safe_link.write_text(
+            "diff --git a/lab/link_to_safe/ok.py b/lab/link_to_safe/ok.py\n"
+            "--- a/lab/link_to_safe/ok.py\n"
+            "+++ b/lab/link_to_safe/ok.py\n"
+            "@@ -1 +1 @@\n"
+            "-X = 1\n"
+            "+X = 2\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_safe_link)
+        assert rc == 0
+        assert payload["status"] == "ALLOWED"
+        assert payload["policy_passed"] is True
+
+    # 6. 2-hunk 120000 ancestor symlink (sym_tests -> tests) + immutable target write
+    p_120000_2hunk = tmp_path / "sym_120000_2hunk.patch"
+    p_120000_2hunk.write_text(
+        "diff --git a/sym_tests b/sym_tests\n"
+        "new file mode 120000\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/sym_tests\n"
+        "@@ -0,0 +1 @@\n"
+        "+tests\n"
+        "diff --git a/sym_tests/acceptance/test_a01.py b/sym_tests/acceptance/test_a01.py\n"
+        "--- a/sym_tests/acceptance/test_a01.py\n"
+        "+++ b/sym_tests/acceptance/test_a01.py\n"
+        "@@ -1 +1 @@\n"
+        "-assert False\n"
+        "+assert True  # PWNED\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_eval(p_120000_2hunk)
+    assert rc == 1
+    assert payload["status"] == "REJECTED"
+    assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+    expected_rejections += 1
+
+    # 7. Multi-hop & circular 120000 symlink chains inside patch fail closed with cycle protection
+    guard = PolicyGuard()
+    if os.name == "posix":
+        (lab_repo / "lab" / "safe_dir" / "inner_to_tests").symlink_to("../../tests")
+        with pytest.raises(PolicyImmutabilityError, match="POLICY_IMMUTABILITY_VIOLATION"):
+            guard.check_added_lines(
+                [],
+                touched_paths=[
+                    "lab/p_hop3",
+                    "lab/p_hop2",
+                    "lab/p_hop1",
+                    "lab/p_hop3/inner_to_tests/acceptance/test_a01.py",
+                ],
+                repo_path=lab_repo,
+                symlink_added_targets=[
+                    ("lab/p_hop3", "p_hop2"),
+                    ("lab/p_hop2", "p_hop1"),
+                    ("lab/p_hop1", "safe_dir"),
+                ],
+            )
+        (lab_repo / "lab" / "safe_dir" / "inner_to_tests").unlink()
+
+    with pytest.raises(PolicyImmutabilityError, match="circular symlink patch"):
+        guard.check_added_lines(
+            [],
+            touched_paths=["lab/cyc_a", "lab/cyc_b", "lab/cyc_a/file.py"],
+            repo_path=lab_repo,
+            symlink_added_targets=[
+                ("lab/cyc_a", "cyc_b"),
+                ("lab/cyc_b", "cyc_a"),
+            ],
+        )
+
+    # Repo HEAD remains untouched & factory_audit_log persisted all rejections
+    head_after = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after == base_head
+
+    conn = open_factory_connection(db_path)
+    try:
+        deny_rows = conn.execute(
+            "SELECT action, decision, detail_json FROM factory_audit_log WHERE decision = 'deny';"
+        ).fetchall()
+        assert len(deny_rows) == expected_rejections
+        assert all(row[0] == "patch_evaluation_rejected" for row in deny_rows)
     finally:
         conn.close()

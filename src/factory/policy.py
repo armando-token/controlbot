@@ -192,6 +192,18 @@ class PolicyGuard:
             return True
         return bool(_IMMUTABLE_NAME_RE.search(normalized))
 
+    def _is_immutable_ancestor(self, rel_path: str) -> bool:
+        norm = posixpath.normpath(rel_path.strip().replace("\\", "/"))
+        if norm in ("", ".") or norm.startswith("/") or ".." in norm.split("/"):
+            return True
+        for prefix in self._immutable_prefixes:
+            clean_prefix = posixpath.normpath(prefix.replace("\\", "/"))
+            if clean_prefix in ("", "."):
+                continue
+            if clean_prefix == norm or clean_prefix.startswith(f"{norm}/"):
+                return True
+        return False
+
     def check_candidate_paths(self, paths: Sequence[str]) -> None:
         offending = tuple(sorted({p for p in paths if self.is_immutable_path(p)}))
         if offending:
@@ -235,22 +247,44 @@ class PolicyGuard:
         set[str],
     ]:
         """Inspect symlinks in repo_path for touched paths and forbidden targets."""
-        resolved_repo = repo_path.resolve()
+        try:
+            resolved_repo = repo_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable repository path "
+                f"{repo_path!r} ({exc}).",
+                offending_paths=tuple(touched_paths),
+            ) from exc
         exact_tokens, basename_patterns, forbidden_resolved, forbidden_names = (
             self._build_forbidden_matchers([*self._raw_forbidden_paths, *extra_forbidden_paths])
         )
 
-        # 1. Inspect touched paths and all parent directory components in repo_path
+        # 1. Inspect touched paths, all parent directory components, and full resolved targets
         for rel_p in touched_paths:
             norm_p = posixpath.normpath(rel_p.strip().replace("\\", "/"))
             cur = resolved_repo
             for part in Path(norm_p).parts:
                 cur = cur / part
-                if cur.is_symlink():
+                try:
+                    is_sym = cur.is_symlink()
+                except OSError as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable symlink "
+                        f"{rel_p!r} ({exc}).",
+                        offending_paths=(rel_p,),
+                    ) from exc
+                if is_sym:
                     raw_target: str | None = None
                     with contextlib.suppress(OSError):
                         raw_target = os.readlink(cur)
-                    resolved_target = cur.resolve()
+                    try:
+                        resolved_target = cur.resolve()
+                    except (OSError, RuntimeError) as exc:
+                        raise PolicyImmutabilityError(
+                            f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable symlink "
+                            f"{rel_p!r} ({exc}).",
+                            offending_paths=(rel_p,),
+                        ) from exc
                     forb_hit = self._matches_forbidden_target(
                         resolved_target, raw_target, forbidden_resolved, forbidden_names
                     )
@@ -266,14 +300,45 @@ class PolicyGuard:
                             offending_paths=(rel_p,),
                         )
                     target_rel = resolved_target.relative_to(resolved_repo).as_posix()
-                    if self.is_immutable_path(target_rel):
+                    if self.is_immutable_path(target_rel) or self._is_immutable_ancestor(
+                        target_rel
+                    ):
                         raise PolicyImmutabilityError(
                             f"{POLICY_IMMUTABILITY_VIOLATION}: symlink {rel_p!r} resolves "
-                            f"to immutable path {target_rel!r}.",
+                            f"to immutable path or ancestor {target_rel!r}.",
                             offending_paths=(rel_p,),
                         )
                 elif not cur.exists():
                     break
+
+            try:
+                full_resolved = (resolved_repo / norm_p).resolve()
+            except (OSError, RuntimeError) as exc:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable symlink {rel_p!r} ({exc}).",
+                    offending_paths=(rel_p,),
+                ) from exc
+            full_forb_hit = self._matches_forbidden_target(
+                full_resolved, None, forbidden_resolved, forbidden_names
+            )
+            if full_forb_hit is not None:
+                raise IsolationBoundaryError(
+                    f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink {rel_p!r} "
+                    f"pointing to forbidden path ({full_forb_hit})."
+                )
+            if not full_resolved.is_relative_to(resolved_repo):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: symlink {rel_p!r} escapes "
+                    f"repository to {full_resolved}.",
+                    offending_paths=(rel_p,),
+                )
+            full_rel = full_resolved.relative_to(resolved_repo).as_posix()
+            if self.is_immutable_path(full_rel):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: path {rel_p!r} resolves "
+                    f"to immutable path {full_rel!r}.",
+                    offending_paths=(rel_p,),
+                )
 
         # 2. Discover symlinks inside repo_path pointing to forbidden targets
         extra_exact: list[str] = list(exact_tokens)
@@ -286,12 +351,15 @@ class PolicyGuard:
                 root_path = Path(root_str)
                 for entry_name in (*dirnames, *filenames):
                     entry = root_path / entry_name
-                    if not entry.is_symlink():
+                    is_sym = False
+                    with contextlib.suppress(OSError):
+                        is_sym = entry.is_symlink()
+                    if not is_sym:
                         continue
                     raw_target = None
                     with contextlib.suppress(OSError):
                         raw_target = os.readlink(entry)
-                    with contextlib.suppress(OSError):
+                    with contextlib.suppress(OSError, RuntimeError):
                         resolved_target = entry.resolve()
                         if (
                             self._matches_forbidden_target(
@@ -335,20 +403,39 @@ class PolicyGuard:
         symlink_added_targets: Sequence[tuple[str, str]] = (),
     ) -> None:
         """Inspect added diff lines for policy bypasses, isolation breaches, or symlinks."""
-        resolved_repo = repo_path.resolve() if repo_path is not None else None
+        resolved_repo: Path | None = None
+        if repo_path is not None:
+            try:
+                resolved_repo = repo_path.resolve()
+            except (OSError, RuntimeError) as exc:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable repository path "
+                    f"{repo_path!r} ({exc}).",
+                    offending_paths=tuple(touched_paths),
+                ) from exc
         forb_res = forbidden_resolved or set()
         forb_names = forbidden_names or set()
 
+        added_symlinks: dict[str, str] = {}
         for link_rel, target_str in symlink_added_targets:
-            cleaned_target = target_str.strip()
+            norm_link = posixpath.normpath(link_rel.strip().replace("\\", "/"))
+            if (
+                not norm_link
+                or norm_link == "."
+                or norm_link.startswith("/")
+                or ".." in norm_link.split("/")
+            ):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: invalid symlink path {link_rel!r}.",
+                    offending_paths=tuple(touched_paths) or (link_rel,),
+                )
+            cleaned_target = target_str.strip().replace("\\", "/")
             if not cleaned_target:
                 continue
-            if cleaned_target.startswith("/") or ".." in cleaned_target.replace("\\", "/").split(
-                "/"
-            ):
-                with contextlib.suppress(OSError):
+            if cleaned_target.startswith("/") or ".." in cleaned_target.split("/"):
+                with contextlib.suppress(OSError, RuntimeError):
                     t_res = (
-                        (resolved_repo / Path(link_rel).parent / cleaned_target).resolve()
+                        (resolved_repo / Path(norm_link).parent / cleaned_target).resolve()
                         if resolved_repo is not None and not cleaned_target.startswith("/")
                         else Path(cleaned_target).resolve()
                     )
@@ -365,9 +452,46 @@ class PolicyGuard:
                     f"{link_rel!r} -> {cleaned_target!r}.",
                     offending_paths=tuple(touched_paths) or (link_rel,),
                 )
+
+            link_parent_rel = posixpath.dirname(norm_link)
+            lexical_target_rel = posixpath.normpath(
+                posixpath.join(link_parent_rel, cleaned_target)
+                if link_parent_rel
+                else cleaned_target
+            )
+            if lexical_target_rel.startswith("/") or ".." in lexical_target_rel.split("/"):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: patch creates escaping symlink "
+                    f"{link_rel!r} -> {cleaned_target!r}.",
+                    offending_paths=tuple(touched_paths) or (link_rel,),
+                )
+            forb_lex_hit = self._matches_forbidden_target(
+                Path(lexical_target_rel), cleaned_target, forb_res, forb_names
+            )
+            if forb_lex_hit is not None:
+                raise IsolationBoundaryError(
+                    f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink patch "
+                    f"{link_rel!r} pointing to forbidden path ({forb_lex_hit})."
+                )
+            if self.is_immutable_path(lexical_target_rel) or self._is_immutable_ancestor(
+                lexical_target_rel
+            ):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
+                    f"targets immutable path or ancestor {lexical_target_rel!r}.",
+                    offending_paths=tuple(touched_paths) or (link_rel,),
+                )
+
             if resolved_repo is not None:
-                link_parent = (resolved_repo / link_rel).parent
-                resolved_target = (link_parent / cleaned_target).resolve()
+                link_parent = (resolved_repo / norm_link).parent
+                try:
+                    resolved_target = (link_parent / cleaned_target).resolve()
+                except (OSError, RuntimeError) as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable symlink patch "
+                        f"{link_rel!r} ({exc}).",
+                        offending_paths=tuple(touched_paths) or (link_rel,),
+                    ) from exc
                 forb_hit = self._matches_forbidden_target(
                     resolved_target, cleaned_target, forb_res, forb_names
                 )
@@ -383,18 +507,78 @@ class PolicyGuard:
                         offending_paths=tuple(touched_paths) or (link_rel,),
                     )
                 target_rel = resolved_target.relative_to(resolved_repo).as_posix()
-                if self.is_immutable_path(target_rel):
+                if self.is_immutable_path(target_rel) or self._is_immutable_ancestor(target_rel):
                     raise PolicyImmutabilityError(
                         f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
-                        f"targets immutable path {target_rel!r}.",
+                        f"targets immutable path or ancestor {target_rel!r}.",
                         offending_paths=tuple(touched_paths) or (link_rel,),
                     )
+
+            added_symlinks[norm_link] = lexical_target_rel
+
+        if added_symlinks and touched_paths:
+            resolved_touched: list[str] = []
+            max_hops = max(16, len(added_symlinks) * 2 + 4)
+            for orig_path in touched_paths:
+                cur_path = posixpath.normpath(orig_path.strip().replace("\\", "/"))
+                seen_paths: set[str] = {cur_path}
+                completed = False
+                for _ in range(max_hops):
+                    parts = cur_path.split("/")
+                    replaced = False
+                    for idx in range(1, len(parts) + 1):
+                        prefix = "/".join(parts[:idx])
+                        if prefix in added_symlinks:
+                            target_base = added_symlinks[prefix]
+                            remainder = "/".join(parts[idx:])
+                            next_path = posixpath.normpath(
+                                f"{target_base}/{remainder}" if remainder else target_base
+                            )
+                            if next_path in seen_paths:
+                                raise PolicyImmutabilityError(
+                                    f"{POLICY_IMMUTABILITY_VIOLATION}: circular symlink patch "
+                                    f"involving {orig_path!r}.",
+                                    offending_paths=tuple(touched_paths),
+                                )
+                            seen_paths.add(next_path)
+                            cur_path = next_path
+                            replaced = True
+                            break
+                    if not replaced:
+                        completed = True
+                        break
+                if not completed:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: excessive symlink indirection "
+                        f"in patch for {orig_path!r}.",
+                        offending_paths=tuple(touched_paths),
+                    )
+                resolved_touched.append(cur_path)
+
+            self.check_candidate_paths(resolved_touched)
+            for res_p in resolved_touched:
+                if self._is_immutable_ancestor(res_p):
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch path {res_p!r} "
+                        "resolves to immutable ancestor directory.",
+                        offending_paths=tuple(touched_paths),
+                    )
+                forb_res_hit = self._matches_forbidden_target(
+                    Path(res_p), res_p, forb_res, forb_names
+                )
+                if forb_res_hit is not None:
+                    raise IsolationBoundaryError(
+                        f"{ISOLATION_BOUNDARY_VIOLATION}: blocked patch path {res_p!r} "
+                        f"referencing forbidden path ({forb_res_hit})."
+                    )
+            if resolved_repo is not None:
+                self.check_repo_symlinks(resolved_repo, resolved_touched)
 
         search_bases: list[Path] = []
         if resolved_repo is not None:
             search_bases.append(resolved_repo)
         for base in extra_search_dirs:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, RuntimeError):
                 search_bases.append(base.resolve())
 
         for added in added_lines:
@@ -437,7 +621,7 @@ class PolicyGuard:
                         raw_target = None
                         with contextlib.suppress(OSError):
                             raw_target = os.readlink(cand_path)
-                        with contextlib.suppress(OSError):
+                        with contextlib.suppress(OSError, RuntimeError):
                             res_target = cand_path.resolve()
                             forb_hit = self._matches_forbidden_target(
                                 res_target, raw_target, forb_res, forb_names
