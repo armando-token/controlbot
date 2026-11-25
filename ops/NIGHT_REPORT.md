@@ -10,7 +10,7 @@
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas M7-T4 verificado**: `3ea788a5fefc76e83a6d970b4694298bbcf8e33b` (`fix(m7-t4): resolve T4-02 multi-resume disambiguation, T4-03 lab cookie restart & T4-10 deploy.n3_probe`)
+- **Commit de código y pruebas M7-T4 verificado**: `2e66e49c9ea4038d7ff6b8f376efd8aec4764a14` (`fix(m7-t4): remove unconditional pre-tool area pause in runtime turn factory (Option 2)`)
 - **Cadena de commits de hitos en `main`**:
   - `d95e98e` — `chore(m1): initialize repo, diagnostics, frozen contracts, research & ADRs`
   - `ccadffc` — `M1: remediate mypy e2e exclusion, redaction hardening, contract invariants, and doctor checks`
@@ -39,6 +39,8 @@
   - `08687e0` — `fix(m7-t3): close binary patch leak, cross-section symlink, space timestamp & short case-fold gaps`
   - `2cc9384` — `docs(night-report): update NIGHT_REPORT with M7-T3-R6 commit SHA 08687e0 and verification counts`
   - `3ea788a` — `fix(m7-t4): resolve T4-02 multi-resume disambiguation, T4-03 lab cookie restart & T4-10 deploy.n3_probe`
+  - `0a59301` — `docs(night-report): update NIGHT_REPORT with M7-T4 commit SHA 3ea788a and verification counts`
+  - `2e66e49` — `fix(m7-t4): remove unconditional pre-tool area pause in runtime turn factory (Option 2)`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -87,7 +89,7 @@
 
 ### 3.3 Resultados medidos (Benchmarks M6 & Fábrica M7)
 - **Benchmark comparativo emparejado (`13` escenarios N1/N2 ejecutables; `A11` = `PENDING_N3_LINUX_ENV`)**:
-   - **Modo `emulated`** (`make bench`, commit `3ea788a`):
+   - **Modo `emulated`** (`make bench`, commit `2e66e49`):
      - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=412.84ms`, `p95=430.19ms`.
      - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1233.97ms`, `p95=1472.31ms`, `tool_calls=37`, `model_calls=45`, `tokens=3730`, `RAM=80.05 MB`.
      - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.237s`, `verified_succeeded=True`.
@@ -117,7 +119,7 @@
 - **`uv run pytest tests/e2e -m tier2 -v`**: Exit `0` (**`99 passed`** en `F01`–`F18`).
 - **`uv run pytest tests/e2e -m tier3 -v`**: Exit `0` (**`22 passed`** en `T3-01`–`T3-22`).
 - **`uv run pytest tests/e2e -m tier4 -v`**: Exit `0` (**`10 passed`** en `T4-01`–`T4-10`; **`230/230`** E2E completo).
-- **`deploy/release_manifest.json`**: regenerado sobre `3ea788a` (`rel-0.1.0-3ea788a5-20261125T185827Z`, **`71`** artefactos, `n3_status=PENDING_N3_LINUX_ENV`).
+- **`deploy/release_manifest.json`**: regenerado sobre `2e66e49` (`rel-0.1.0-2e66e49c-20261125T191927Z`, **`71`** artefactos, `n3_status=PENDING_N3_LINUX_ENV`).
 - **Criterio Linux sin Internet (`A11`)**:
   - Verificado en N2: `validate_local_model_origin`, `ToolRegistry` y `DeployInstallConfig` bloquean orígenes externos (`https://api.openai.com`, `8.8.8.8`, redirecciones HTTP 3xx) antes de conectar; Playwright aborta subrecursos fuera de allowlist y la UI web no realiza peticiones CDN.
   - Pendiente N3 en Linux: aislamiento kernel `ip netns`/`nftables`/`iptables` e inferencia con pesos locales reales (`PENDING_N3_LINUX_ENV`; automatizado en `scripts/verify_n3_linux.sh` y documentado en `deploy/OFFLINE_RUNBOOK.md`).
