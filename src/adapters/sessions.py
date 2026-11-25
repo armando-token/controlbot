@@ -203,6 +203,40 @@ class SessionManager:
         assert self._playwright is not None
         return self._playwright
 
+    @staticmethod
+    def _validate_session_meta(
+        meta_path: Path,
+        profile_dir: Path,
+        user_id: str,
+        profile_id: str,
+        app_id: str,
+        normalized_origins: tuple[str, ...],
+    ) -> None:
+        try:
+            raw_meta = meta_path.read_text(encoding="utf-8")
+            meta = json.loads(raw_meta)
+        except (ValueError, OSError) as exc:
+            raise SessionOwnershipError(
+                f"Profile directory {profile_dir} has corrupt session_meta.json: {exc}"
+            ) from exc
+        if not isinstance(meta, dict):
+            raise SessionOwnershipError(
+                f"Profile directory {profile_dir} has invalid session_meta.json type "
+                f"({type(meta).__name__})."
+            )
+        origins_raw = meta.get("allowed_origins")
+        if (
+            meta.get("user_id") != user_id
+            or meta.get("profile_id") != profile_id
+            or meta.get("app_id") != app_id
+            or not isinstance(origins_raw, list)
+            or sorted(str(x) for x in origins_raw) != list(normalized_origins)
+        ):
+            raise SessionOwnershipError(
+                f"Profile directory {profile_dir} ownership mismatch: "
+                f"expected ({user_id}, {profile_id}, {app_id}, {list(normalized_origins)})."
+            )
+
     async def open_session(
         self,
         user_id: str,
@@ -241,17 +275,9 @@ class SessionManager:
                         f"Session {session_id!r} ownership/origin mismatch."
                     )
                 if meta_path.exists():
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    if (
-                        meta.get("user_id") != u
-                        or meta.get("profile_id") != p
-                        or meta.get("app_id") != a
-                        or sorted(meta.get("allowed_origins", [])) != list(normalized_origins)
-                    ):
-                        raise SessionOwnershipError(
-                            f"Profile directory {profile_dir} ownership mismatch: "
-                            f"expected ({u}, {p}, {a}, {list(normalized_origins)})."
-                        )
+                    self._validate_session_meta(
+                        meta_path, profile_dir, u, p, a, normalized_origins
+                    )
                 elif profile_dir.exists() and any(profile_dir.iterdir()):
                     raise SessionOwnershipError(
                         f"Profile directory {profile_dir} is non-empty but missing "
@@ -274,17 +300,9 @@ class SessionManager:
 
             now = utc_now()
             if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                if (
-                    meta.get("user_id") != u
-                    or meta.get("profile_id") != p
-                    or meta.get("app_id") != a
-                    or sorted(meta.get("allowed_origins", [])) != list(normalized_origins)
-                ):
-                    raise SessionOwnershipError(
-                        f"Profile directory {profile_dir} ownership mismatch: "
-                        f"expected ({u}, {p}, {a}, {list(normalized_origins)})."
-                    )
+                self._validate_session_meta(
+                    meta_path, profile_dir, u, p, a, normalized_origins
+                )
             else:
                 if any(profile_dir.iterdir()):
                     raise SessionOwnershipError(
@@ -390,8 +408,15 @@ class SessionManager:
         task_origins: Sequence[str] = (),
     ) -> int | None:
         """Navigate session page after enforcing origin allowlists and checking redirects."""
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise SessionNotFoundError(f"Unknown session_id: {session_id!r}")
+        if record.takeover_active:
+            raise SessionTakenOverError(
+                f"Session {session_id!r} is locked by human takeover "
+                f"(owner={record.takeover_owner!r})."
+            )
         self.assert_origin_allowed(session_id, url, task_origins=task_origins)
-        record = self._sessions[session_id]
         before_blocked = len(record.blocked_origins)
         try:
             response = await record.page.goto(url, wait_until="domcontentloaded")
@@ -441,9 +466,9 @@ class SessionManager:
             yield managed
         finally:
             async with self._lock:
-                if session_id in self._sessions:
-                    self._sessions[session_id].active_lease = False
-                    self._sessions[session_id].updated_at = utc_now()
+                if self._sessions.get(session_id) is record:
+                    record.active_lease = False
+                    record.updated_at = utc_now()
 
     async def set_takeover(
         self,

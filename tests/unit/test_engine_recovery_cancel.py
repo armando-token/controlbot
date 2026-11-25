@@ -1024,3 +1024,210 @@ async def test_assume_previous_worker_dead_reclaims_unexpired_model_reservation_
     assert post_usage.model_calls_reserved == 0
     assert post_usage.model_calls_used == 1
     assert post_usage.total_tokens_used == 500
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_10a_reconciled_unknown_effect_records_loop_signature(tmp_path: Path) -> None:
+    from src.contracts.budgets import BudgetConfig
+
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_10a.db", clock=clock)
+    repo.init_db()
+
+    eff_spec = ToolSpec(
+        tool_id="eff.slow",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.EFFECT,
+        timeout_s=10.0,
+        verifier_name="v",
+    )
+
+    async def timeout_after_apply(
+        args: dict[str, Any], ctx: ToolExecutionContext
+    ) -> dict[str, Any]:
+        del args, ctx
+        raise TimeoutError("simulated post-apply timeout")
+
+    reg = ToolRegistry(clock=clock)
+    reg.register(
+        eff_spec,
+        timeout_after_apply,
+        reconciler=lambda op, idem, ctx: (True, {"valve": "reset"}),
+        supports_idempotency=True,
+    )
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    model = EmulatedModelClient(
+        mode="custom",
+        default_turns=[
+            EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="eff.slow",
+                        args={"valve": "A"},
+                        target_origin="https://scada.local",
+                    ),
+                    usage=usage,
+                )
+            )
+        ],
+    )
+    coord = Coordinator(repo, model, reg, clock=clock)
+    task = _task(
+        "t5-10a",
+        read_only=False,
+        allowed_tools=("eff.slow",),
+        budget=BudgetConfig(max_tool_calls=10, max_model_calls=10),
+    )
+    run = coord.submit_task(task)
+    res = await coord.run_until_settled(run.run_id)
+    assert res.status == TaskStatus.FAILED
+    assert "loop_detected" in (repo.get_run(run.run_id).transition_reason or "")
+    assert len(repo.get_step_signatures(run.run_id)) >= 3
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_10b_noop_reconciliation_on_concurrent_cancel_does_not_attempt_pause(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_10b.db", clock=clock)
+    repo.init_db()
+
+    eff_spec = ToolSpec(
+        tool_id="eff.cancel_race",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.EFFECT,
+        timeout_s=10.0,
+        verifier_name="v",
+    )
+
+    async def timeout_after_apply(
+        args: dict[str, Any], ctx: ToolExecutionContext
+    ) -> dict[str, Any]:
+        del args, ctx
+        raise TimeoutError("simulated timeout")
+
+    def cancel_during_reconcile(
+        op: str, idem: str, ctx: ToolExecutionContext
+    ) -> tuple[bool, dict[str, Any] | None]:
+        del op, idem
+        repo.request_cancel(ctx.task_id, reason="external_cancel")
+        return False, {"ambiguous": True}
+
+    reg = ToolRegistry(clock=clock)
+    reg.register(
+        eff_spec,
+        timeout_after_apply,
+        reconciler=cancel_during_reconcile,
+        supports_idempotency=True,
+    )
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    model = EmulatedModelClient(
+        mode="custom",
+        default_turns=[
+            EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="eff.cancel_race",
+                        args={},
+                        target_origin="https://scada.local",
+                    ),
+                    usage=usage,
+                )
+            )
+        ],
+    )
+    coord = Coordinator(repo, model, reg, clock=clock)
+    run = coord.submit_task(
+        _task("t5-10b", read_only=False, allowed_tools=("eff.cancel_race",))
+    )
+    res = await coord.run_until_settled(run.run_id)
+    assert res.status == TaskStatus.CANCELLED
+    audits = repo.list_audit_logs(task_id="t5-10b")
+    assert not any(a.action == "illegal_transition_rejected" for a in audits)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_14_exhausted_read_recovery_populates_receipt_and_history(
+    tmp_path: Path,
+) -> None:
+    from src.contracts.budgets import BudgetConfig
+
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_14.db", clock=clock)
+    repo.init_db()
+
+    task = _task("t5-14", budget=BudgetConfig(max_transient_retries=0))
+    _, run = repo.create_task_and_run(task)
+    repo.transition_run_status(run.run_id, TaskStatus.RUNNING, "started")
+    step = repo.enqueue_step(
+        run.run_id,
+        "read_scada",
+        {"asset": "pump-34"},
+        "v",
+        EffectClass.READ,
+        target_origin="https://scada.local",
+    )
+    leased = repo.acquire_step_lease("dead-worker", 5.0, run_id=run.run_id, step_id=step.step_id)
+    assert leased is not None
+    repo.prepare_step_attempt(step.step_id, leased.lease_generation, step.operation_key)
+    repo.mark_step_executing(step.step_id, leased.lease_generation)
+
+    clock.advance(10.0)
+
+    seen_histories: list[tuple[dict[str, Any], ...]] = []
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    def _turn_factory(
+        prompt_ctx: Any, tools: Any, budget_rem: Any
+    ) -> EmulatedTurn:
+        del tools, budget_rem
+        seen_histories.append(prompt_ctx.history)
+        return EmulatedTurn(
+            decision=ModelDecision(
+                decision_type="final",
+                final_answer="Observed failed read in history.",
+                usage=usage,
+            )
+        )
+
+    reg = ToolRegistry(clock=clock)
+    reg.register(
+        ToolSpec(
+            tool_id="read_scada",
+            version="1.0.0",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            allowed_origins=("https://scada.local",),
+            effect_class=EffectClass.READ,
+            timeout_s=5.0,
+            verifier_name="v",
+        ),
+        lambda args, ctx: {"ok": True},
+    )
+    coord = Coordinator(repo, EmulatedModelClient(turn_factory=_turn_factory), reg, clock=clock)
+    summary = await coord.recover_inflight_runs()
+    assert summary.unknown_steps_reconciled >= 1
+
+    res = await coord.run_until_settled(run.run_id)
+    assert res.status == TaskStatus.SUCCEEDED
+    snap = repo.get_run_snapshot(run.run_id)
+    assert len(snap.receipts) == 1
+    assert snap.receipts[0].outcome == ReceiptOutcome.FAILED_TRANSIENT
+    assert seen_histories
+    assert len(seen_histories[0]) == 1
+    assert seen_histories[0][0]["tool_id"] == "read_scada"
+    assert seen_histories[0][0]["outcome"] == ReceiptOutcome.FAILED_TRANSIENT.value

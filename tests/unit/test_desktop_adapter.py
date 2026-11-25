@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -372,7 +373,7 @@ async def test_desktop_tool_specs_integrate_with_tool_registry() -> None:
         operation_key="op-1",
         scope=TaskScope(facility_id="facility-a", read_only=True),
         granted_permissions=("desktop:read", "desktop:write"),
-        deadline_at=utc_now(),
+        deadline_at=utc_now() + timedelta(seconds=30),
     )
     obs_res = await registry.invoke("desktop.observe_tree", {"app_name": "hmi_panel"}, ro_ctx)
     assert obs_res.outcome == ReceiptOutcome.SUCCEEDED

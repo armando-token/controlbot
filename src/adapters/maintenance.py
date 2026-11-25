@@ -69,7 +69,10 @@ def _parse_iso_utc(raw: str) -> datetime | None:
         return None
     if cleaned.endswith("Z"):
         cleaned = f"{cleaned[:-1]}+00:00"
-    return ensure_utc(datetime.fromisoformat(cleaned))
+    try:
+        return ensure_utc(datetime.fromisoformat(cleaned))
+    except ValueError:
+        return None
 
 
 class MaintenanceAdapter:

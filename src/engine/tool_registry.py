@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -156,7 +157,9 @@ def _matches_json_type(value: Any, expected: str) -> bool:
     if expected == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(
+            value
+        )
     if expected == "null":
         return value is None
     return True
@@ -193,10 +196,13 @@ def validate_json_schema(
             errors.append(f"{path}: string length {len(data)} > maxLength {schema['maxLength']}")
 
     if isinstance(data, (int, float)) and not isinstance(data, bool):
-        if "minimum" in schema and data < schema["minimum"]:
-            errors.append(f"{path}: value {data} < minimum {schema['minimum']}")
-        if "maximum" in schema and data > schema["maximum"]:
-            errors.append(f"{path}: value {data} > maximum {schema['maximum']}")
+        if not math.isfinite(data):
+            errors.append(f"{path}: non-finite number {data!r} is not valid JSON")
+        else:
+            if "minimum" in schema and data < schema["minimum"]:
+                errors.append(f"{path}: value {data} < minimum {schema['minimum']}")
+            if "maximum" in schema and data > schema["maximum"]:
+                errors.append(f"{path}: value {data} > maximum {schema['maximum']}")
 
     if isinstance(data, list):
         if "minItems" in schema and len(data) < int(schema["minItems"]):
@@ -501,15 +507,36 @@ class ToolRegistry:
             ensure_utc(ctx.now) if ctx.now is not None else ensure_utc(self._clock())
         )
         remaining_s = (ensure_utc(ctx.deadline_at) - current_time).total_seconds()
-        effective_timeout = min(float(spec.timeout_s), max(0.001, remaining_s))
+        if remaining_s <= 0:
+            return self._build_redacted_result(
+                tool_id=tool_id,
+                ctx=ctx,
+                raw_args=args,
+                outcome=ReceiptOutcome.FAILED_TRANSIENT,
+                duration_ms=0.0,
+                error_detail=(
+                    f"Task deadline already exceeded (remaining_s={remaining_s:.3f}s)."
+                ),
+                verifier_reason="deadline_exceeded",
+            )
+        effective_timeout = min(float(spec.timeout_s), remaining_s)
 
         started = time.perf_counter()
         try:
-            call_res = entry.handler(dict(args), ctx)
-            if inspect.isawaitable(call_res):
-                raw_result = await asyncio.wait_for(call_res, timeout=effective_timeout)
+            if inspect.iscoroutinefunction(entry.handler):
+                raw_result = await asyncio.wait_for(
+                    entry.handler(dict(args), ctx),
+                    timeout=effective_timeout,
+                )
             else:
-                raw_result = call_res
+                call_res = await asyncio.wait_for(
+                    asyncio.to_thread(entry.handler, dict(args), ctx),
+                    timeout=effective_timeout,
+                )
+                if inspect.isawaitable(call_res):
+                    raw_result = await asyncio.wait_for(call_res, timeout=effective_timeout)
+                else:
+                    raw_result = call_res
         except TimeoutError as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             outcome = (

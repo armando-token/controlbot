@@ -536,3 +536,86 @@ async def test_invalid_observations_returns_semantic_failure_and_metadata_scrubb
     assert meta["accessToken"] == REDACTED_PLACEHOLDER
     assert meta["note"] == f"Bearer {REDACTED_PLACEHOLDER}"
     assert not contains_unredacted_secret_strict(res_scrub.observations[0].model_dump())
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_13_past_deadline_effect_sync_timeout_and_nonfinite_schema() -> None:
+    import time
+
+    from src.engine.tool_registry import validate_json_schema
+
+    # (a) Past deadline_at on EFFECT rejects pre-invocation without calling handler
+    called: list[bool] = []
+    now = datetime(2026, 11, 25, 10, 0, 0, tzinfo=UTC)
+    registry = ToolRegistry(clock=lambda: now)
+    eff_spec = ToolSpec(
+        tool_id="eff.apply",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.EFFECT,
+        timeout_s=5.0,
+        verifier_name="v",
+    )
+
+    def _eff_handler(_args: dict[str, Any], _ctx: ToolExecutionContext) -> dict[str, Any]:
+        called.append(True)
+        return {"applied": True}
+
+    registry.register(eff_spec, _eff_handler)
+    past_ctx = _ctx(
+        scope=TaskScope(
+            facility_id="plant-a",
+            allowed_origins=("https://scada.local",),
+            allowed_tools=("eff.apply",),
+            read_only=False,
+        ),
+        granted_permissions=(),
+    ).model_copy(update={"now": now, "deadline_at": now - timedelta(seconds=10)})
+
+    res_past = await registry.invoke("eff.apply", {}, past_ctx)
+    assert called == []
+    assert res_past.outcome == ReceiptOutcome.FAILED_TRANSIENT
+    assert res_past.verifier_reason == "deadline_exceeded"
+
+    # (b) Sync handler exceeding timeout_s times out instead of blocking indefinitely
+    slow_spec = ToolSpec(
+        tool_id="read.slow_sync",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.READ,
+        timeout_s=0.02,
+        verifier_name="v",
+    )
+
+    def _slow_sync(_args: dict[str, Any], _ctx: ToolExecutionContext) -> dict[str, Any]:
+        time.sleep(0.15)
+        return {"ok": True}
+
+    registry.register(slow_spec, _slow_sync)
+    ok_ctx = _ctx(
+        scope=TaskScope(
+            facility_id="plant-a",
+            allowed_origins=("https://scada.local",),
+            allowed_tools=("read.slow_sync",),
+            read_only=True,
+        ),
+        granted_permissions=(),
+    ).model_copy(update={"now": now, "deadline_at": now + timedelta(seconds=30)})
+    res_slow = await registry.invoke("read.slow_sync", {}, ok_ctx)
+    assert res_slow.outcome == ReceiptOutcome.FAILED_TRANSIENT
+    assert res_slow.verifier_reason == "timeout"
+
+    # (c) NaN / Inf rejected in validate_json_schema
+    num_schema = {
+        "type": "object",
+        "properties": {"x": {"type": "number", "minimum": 0, "maximum": 10}},
+    }
+    min_only_schema = {"type": "object", "properties": {"x": {"minimum": 0}}}
+    for bad_num in (float("nan"), float("inf"), float("-inf")):
+        assert validate_json_schema({"x": bad_num}, num_schema)
+        assert validate_json_schema({"x": bad_num}, min_only_schema)

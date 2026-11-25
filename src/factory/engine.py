@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import shlex
 import subprocess
 import sys
@@ -52,6 +53,34 @@ def _sha256_or_missing(path: Path | None) -> str:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _ensure_no_symlink_components(repo_path: Path, rel_path: str) -> Path:
+    raw_norm = posixpath.normpath(rel_path.strip().replace("\\", "/"))
+    if (
+        not raw_norm
+        or raw_norm == "."
+        or raw_norm.startswith("/")
+        or ".." in raw_norm.split("/")
+    ):
+        raise IsolationBoundaryError(
+            f"ISOLATION_BOUNDARY_VIOLATION: blocked file path escaping repo: {rel_path}"
+        )
+    cur = repo_path
+    for part in Path(raw_norm).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise PolicyImmutabilityError(
+                f"POLICY_IMMUTABILITY_VIOLATION: blocked symlink path component "
+                f"{part!r} in {rel_path!r}.",
+                offending_paths=(rel_path,),
+            )
+    resolved = (repo_path / raw_norm).resolve()
+    if not resolved.is_relative_to(repo_path):
+        raise IsolationBoundaryError(
+            f"ISOLATION_BOUNDARY_VIOLATION: blocked file path escaping repo: {rel_path}"
+        )
+    return resolved
 
 
 def _run_git(repo_path: Path, args: Sequence[str]) -> str:
@@ -242,46 +271,63 @@ class FactoryEngine:
         baseline_metric = baseline_eval.metric
 
         candidate_commit: str | None = None
+        diff_text = ""
         try:
             _run_git(self._repo_path, ["checkout", "-B", candidate.branch_name, base_commit])
-
-            for rel_path, content in candidate.files_to_modify.items():
-                target = (self._repo_path / rel_path).resolve()
-                if not target.is_relative_to(self._repo_path):
-                    raise IsolationBoundaryError(
-                        f"ISOLATION_BOUNDARY_VIOLATION: blocked file path escaping repo: {rel_path}"
-                    )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
-
-            if candidate.repro_test_path and candidate.repro_test_content is not None:
-                test_target = (self._repo_path / candidate.repro_test_path).resolve()
-                if not test_target.is_relative_to(self._repo_path):
-                    raise IsolationBoundaryError(
-                        "ISOLATION_BOUNDARY_VIOLATION: blocked repro_test_path escaping repo: "
-                        f"{candidate.repro_test_path}"
-                    )
-                test_target.parent.mkdir(parents=True, exist_ok=True)
-                test_target.write_text(candidate.repro_test_content, encoding="utf-8")
 
             paths_to_stage = list(candidate.files_to_modify.keys())
             if candidate.repro_test_path and candidate.repro_test_content is not None:
                 paths_to_stage.append(candidate.repro_test_path)
-            if paths_to_stage:
-                _run_git(self._repo_path, ["add", "--", *paths_to_stage])
-            status_out = _run_git(self._repo_path, ["status", "--porcelain"])
-            if status_out:
-                _run_git(
-                    self._repo_path,
-                    ["commit", "-m", f"factory({candidate.candidate_id}): {candidate.hypothesis}"],
-                )
-            candidate_commit = _run_git(self._repo_path, ["rev-parse", "HEAD"])
-            diff_text = _run_git(
-                self._repo_path, ["diff", f"{base_commit}..{candidate_commit}"]
-            )[:16384]
 
-            # Independent PolicyGuard audit before any regression or promotion
             try:
+                if paths_to_stage:
+                    self._policy_guard.check_candidate_paths(paths_to_stage)
+                    self._policy_guard.check_repo_symlinks(self._repo_path, paths_to_stage)
+                resolved_writes: list[tuple[Path, str]] = []
+                for rel_path, content in candidate.files_to_modify.items():
+                    target = _ensure_no_symlink_components(self._repo_path, rel_path)
+                    resolved_writes.append((target, content))
+                if candidate.repro_test_path and candidate.repro_test_content is not None:
+                    test_target = _ensure_no_symlink_components(
+                        self._repo_path, candidate.repro_test_path
+                    )
+                    resolved_writes.append((test_target, candidate.repro_test_content))
+
+                for target, content in resolved_writes:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+
+                if paths_to_stage:
+                    _run_git(self._repo_path, ["add", "--", *paths_to_stage])
+                status_out = _run_git(self._repo_path, ["status", "--porcelain"])
+                if status_out:
+                    _run_git(
+                        self._repo_path,
+                        [
+                            "commit",
+                            "-m",
+                            f"factory({candidate.candidate_id}): {candidate.hypothesis}",
+                        ],
+                    )
+                dirty_tracked = _run_git(self._repo_path, ["diff", "--name-only"])
+                dirty_staged = (
+                    _run_git(
+                        self._repo_path, ["status", "--porcelain", "--", *paths_to_stage]
+                    )
+                    if paths_to_stage
+                    else ""
+                )
+                if dirty_tracked or dirty_staged:
+                    raise IsolationBoundaryError(
+                        "ISOLATION_BOUNDARY_VIOLATION: dirty worktree remained after "
+                        f"candidate commit: {dirty_tracked or dirty_staged}"
+                    )
+                candidate_commit = _run_git(self._repo_path, ["rev-parse", "HEAD"])
+                diff_text = _run_git(
+                    self._repo_path, ["diff", f"{base_commit}..{candidate_commit}"]
+                )[:16384]
+
+                # Independent PolicyGuard audit before any regression or promotion
                 self._policy_guard.inspect_git_diff(
                     self._repo_path, base_commit, candidate_commit
                 )
@@ -296,7 +342,7 @@ class FactoryEngine:
                     item_id=candidate.item_id,
                     branch_name=candidate.branch_name,
                     base_commit=base_commit,
-                    candidate_commit=candidate_commit,
+                    candidate_commit=candidate_commit or base_commit,
                     proposal_hash=candidate.proposal_hash,
                     baseline_metric=baseline_metric,
                     candidate_metric=None,

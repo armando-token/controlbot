@@ -41,6 +41,7 @@ markers = [
     "n2: local multi-process, SQLite WAL, Playwright, and synthetic lab integration tests",
     "n3: Linux local LLM and outbound-blocked network acceptance tests",
     "acceptance: Megaplan A01-A14 acceptance oracle tests",
+    "tier5: Tier 5 white-box adversarial hardening tests",
 ]
 
 [tool.ruff]

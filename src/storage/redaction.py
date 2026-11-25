@@ -20,8 +20,16 @@ from src.contracts.redaction import (
 
 _CAMEL_BOUNDARY_1 = re.compile(r"([a-z0-9])([A-Z])")
 _CAMEL_BOUNDARY_2 = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_REDACTED_AUTH_PUNCT_RE = re.compile(
+    r"(?i)\b(Bearer|Basic)\s+\[REDACTED\](?=[\s,;:'\"\)\}\]]|$)"
+)
 _QUERY_SECRET_RE = re.compile(
-    r"(?i)\b(password|passwd|secret|secret_key|secretKey|secret-key|"
+    r"(?i)\b("
+    r"[A-Za-z0-9_.-]*[_-](?:password|passwd|secret(?:[_-]?key)?|private[_-]?key|"
+    r"api[_-]?key|apikey|token|cookies?|credentials?)"
+    r"|(?-i:[a-z0-9][A-Za-z0-9]*(?:Password|Passwd|Secret(?:Key)?|PrivateKey|"
+    r"ApiKey|Token|Cookies?|Credentials?))"
+    r"|password|passwd|secret|secret_key|secretKey|secret-key|"
     r"api_key|api-key|apikey|x_api_key|x-api-key|xApiKey|token|"
     r"access_token|accessToken|refresh_token|refreshToken|auth_token|authToken|"
     r"session_token|sessionToken|csrf_token|csrfToken|id_token|idToken|"
@@ -100,8 +108,6 @@ def _is_non_empty_unredacted(value: Any) -> bool:
 
 def contains_unredacted_secret_strict(value: Any) -> bool:
     """Detect unredacted secrets including camelCase keys and inline secret=value strings."""
-    if contains_unredacted_secret(value):
-        return True
     if isinstance(value, Mapping):
         for k, v in value.items():
             if isinstance(k, (str, tuple, frozenset)) and contains_unredacted_secret_strict(k):
@@ -119,5 +125,8 @@ def contains_unredacted_secret_strict(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(contains_unredacted_secret_strict(item) for item in value)
     if isinstance(value, str):
-        return bool(_QUERY_SECRET_RE.search(value))
-    return False
+        normalized = _REDACTED_AUTH_PUNCT_RE.sub(r"\1 [REDACTED] ", value)
+        if contains_unredacted_secret(normalized):
+            return True
+        return bool(_QUERY_SECRET_RE.search(normalized))
+    return bool(contains_unredacted_secret(value))

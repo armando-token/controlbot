@@ -285,6 +285,8 @@ def aggregate_trials(
         blocking.append(f"isolation_violations={isolation_violations}")
     if duplicate_effects > 0:
         blocking.append(f"duplicate_effects={duplicate_effects}")
+    if state_loss_count > 0:
+        blocking.append(f"state_loss_count={state_loss_count}")
     if wrong_asset_attributions > 0:
         blocking.append(f"wrong_asset_attributions={wrong_asset_attributions}")
 
@@ -519,6 +521,7 @@ def evaluate_promotion_gate(
         ("disallowed_egress", "disallowed_egress_count"),
         ("session_isolation_violations", "isolation_violations"),
         ("effect_duplications", "duplicate_effects"),
+        ("state_losses", "state_loss_count", "state_loss"),
         ("wrong_asset_attributions",),
     )
 

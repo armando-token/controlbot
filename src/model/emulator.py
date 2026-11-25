@@ -12,6 +12,7 @@ from src.model.protocol import (
     BudgetRemaining,
     ModelDecision,
     ModelDelegationRequest,
+    ModelPermissionError,
     ModelToolCall,
     ModelUsage,
     PromptContext,
@@ -153,6 +154,16 @@ class EmulatedModelClient:
         decision = (
             turn.decision(prompt_ctx, tools) if callable(turn.decision) else turn.decision
         )
+        if (
+            tools
+            and decision.decision_type == "tool_call"
+            and decision.tool_call is not None
+            and decision.tool_call.tool_id not in {t.tool_id for t in tools}
+        ):
+            raise ModelPermissionError(
+                f"Permission denied: tool_id {decision.tool_call.tool_id!r} is not allowed "
+                "(outside allowed tool list)."
+            )
         if turn.omit_tokens:
             prompt_text = prompt_ctx.query
             completion_text = decision.final_answer or (

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -963,3 +964,70 @@ async def test_verifier_unquoted_ambiguity_area2_lab_and_redacted_tracing(
     assert not contains_unredacted_secret(trace_text)
     assert not contains_unredacted_secret(json.loads(trace_text))
     del TaskScope, TaskSpec
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_07_http_client_strips_internal_target_origin_in_json_content_mode() -> None:
+    from src.contracts.enums import EffectClass, ReceiptOutcome
+    from src.contracts.models import TaskScope, ToolSpec
+    from src.engine.tool_registry import ToolExecutionContext, ToolRegistry
+    from src.model.http_client import LocalHttpModelClient
+    from src.model.protocol import ModelUsage
+
+    spec = ToolSpec(
+        tool_id="scada.read_alarms",
+        version="1.0.0",
+        input_schema={
+            "type": "object",
+            "required": ["asset"],
+            "properties": {"asset": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        output_schema={"type": "object"},
+        allowed_origins=("http://127.0.0.1:8101",),
+        effect_class=EffectClass.READ,
+        verifier_name="v",
+    )
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    msg = {
+        "content": json.dumps(
+            {
+                "decision_type": "tool_call",
+                "tool_call": {
+                    "tool_id": "scada.read_alarms",
+                    "args": {
+                        "__target_origin__": "http://127.0.0.1:8101",
+                        "asset": "bomba 34",
+                    },
+                },
+            }
+        )
+    }
+    decision = LocalHttpModelClient._parse_decision(msg, tools=[spec], usage=usage)
+    assert decision.tool_call is not None
+    assert decision.tool_call.target_origin == "http://127.0.0.1:8101"
+    assert "__target_origin__" not in decision.tool_call.args
+    assert decision.tool_call.args == {"asset": "bomba 34"}
+
+    registry = ToolRegistry()
+    registry.register(spec, lambda args, _ctx: {"ok": True, "asset": args["asset"]})
+    ctx = ToolExecutionContext(
+        task_id="t5-07",
+        run_id="r5-07",
+        step_id="s5-07",
+        attempt=1,
+        operation_key="op5-07",
+        scope=TaskScope(
+            facility_id="facility-a",
+            allowed_origins=("http://127.0.0.1:8101",),
+            allowed_tools=("scada.read_alarms",),
+            read_only=True,
+        ),
+        target_origin=decision.tool_call.target_origin,
+        deadline_at=utc_now() + timedelta(seconds=30),
+    )
+    exec_res = await registry.invoke(
+        decision.tool_call.tool_id, decision.tool_call.args, ctx
+    )
+    assert exec_res.outcome == ReceiptOutcome.SUCCEEDED

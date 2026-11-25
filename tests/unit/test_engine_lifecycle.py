@@ -923,3 +923,308 @@ def test_resolve_area_from_human_input_choice_source_ids_and_scope_guard() -> No
     )
     assert res_single.status == TaskStatus.SUCCEEDED
     assert all(o.area == "area-2" for o in res_single.verified_observations)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_08_coordinator_does_not_misclassify_arbitrary_model_error_as_policy_denial(
+    tmp_path: Path,
+) -> None:
+    from collections.abc import Sequence
+
+    from src.model.emulator import EmulatedTurn
+    from src.model.protocol import (
+        BudgetRemaining,
+        ModelDecision,
+        ModelProtocolError,
+        ModelToolCall,
+        ModelUsage,
+        PromptContext,
+    )
+
+    class _BadDecisionModel:
+        async def decide(
+            self,
+            prompt_ctx: PromptContext,
+            tools: Sequence[ToolSpec],
+            budget_remaining: BudgetRemaining,
+        ) -> ModelDecision:
+            del prompt_ctx, tools, budget_remaining
+            raise ModelProtocolError(
+                "Invalid or missing decision_type: 'outside allowed tool list'."
+            )
+
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_08a.db", clock=clock)
+    repo.init_db()
+    reg = ToolRegistry(clock=clock)
+    _register_scada_tool(reg)
+    coord = Coordinator(repo, _BadDecisionModel(), reg, clock=clock)
+    run = coord.submit_task(_make_task("t5-08-proto"))
+    res = await coord.run_until_settled(run.run_id)
+    assert res.status == TaskStatus.FAILED
+    assert repo.get_run(run.run_id).transition_reason == "model_error"
+    audits = repo.list_audit_logs(task_id="t5-08-proto")
+    assert not any(a.action == "tool_permission_denied" for a in audits)
+
+    # Real disallowed tool call via EmulatedModelClient still raises ModelPermissionError & logs
+    repo2 = StorageRepo(tmp_path / "t5_08b.db", clock=clock)
+    repo2.init_db()
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    emu = EmulatedModelClient(
+        mode="custom",
+        default_turns=[
+            EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="effect.apply",
+                        args={},
+                        target_origin="https://scada.local",
+                    ),
+                    usage=usage,
+                )
+            )
+        ],
+    )
+    coord2 = Coordinator(repo2, emu, reg, clock=clock)
+    run2 = coord2.submit_task(_make_task("t5-08-perm"))
+    res2 = await coord2.run_until_settled(run2.run_id)
+    assert res2.status == TaskStatus.FAILED
+    assert repo2.get_run(run2.run_id).transition_reason == "read_only_policy_denied"
+    audits2 = repo2.list_audit_logs(task_id="t5-08-perm")
+    assert any(a.action == "tool_permission_denied" for a in audits2)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_09_resume_task_rejects_malformed_scope_override_types(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_09.db", clock=clock)
+    repo.init_db()
+    reg = ToolRegistry(clock=clock)
+    _register_scada_tool(reg)
+    coord = Coordinator(repo, EmulatedModelClient(mode="ambiguity"), reg, clock=clock)
+    run = coord.submit_task(_make_task("t5-09", read_only=True))
+    paused = await coord.run_until_settled(run.run_id)
+    assert paused.status == TaskStatus.WAITING_FOR_INPUT
+
+    bad_payloads: list[dict[str, Any]] = [
+        {"allowed_origins": "https://evil.com"},
+        {"allowed_tools": "effect.tool"},
+        {"read_only": 0},
+        {"allowed_origins": []},
+        {"allowed_tools": []},
+    ]
+    for bad_input in bad_payloads:
+        with pytest.raises(PlanValidationError):
+            coord.resume_task(run.run_id, bad_input)
+    audits = repo.list_audit_logs(task_id="t5-09")
+    assert sum(1 for a in audits if a.action == "resume_scope_widening_rejected") == len(
+        bad_payloads
+    )
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+async def test_t5_11_parent_does_not_succeed_with_waiting_child_run(
+    tmp_path: Path,
+) -> None:
+    from src.engine.tool_registry import AuthToolError
+    from src.model.emulator import EmulatedTurn
+    from src.model.protocol import (
+        ModelDecision,
+        ModelDelegationRequest,
+        ModelToolCall,
+        ModelUsage,
+    )
+
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_11.db", clock=clock)
+    repo.init_db()
+    reg = ToolRegistry(clock=clock)
+    auth_ok = {"ready": False}
+
+    def _auth_gated_read(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+        del args, ctx
+        if not auth_ok["ready"]:
+            raise AuthToolError("Session expired for scada")
+        return {"ok": True}
+
+    reg.register(
+        ToolSpec(
+            tool_id="read_scada",
+            version="1.0.0",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            allowed_origins=("https://scada.local",),
+            effect_class=EffectClass.READ,
+            timeout_s=5.0,
+            verifier_name="v",
+        ),
+        _auth_gated_read,
+    )
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    def _turn_factory(
+        prompt_ctx: Any, tools: Any, budget_rem: Any
+    ) -> EmulatedTurn:
+        del tools, budget_rem
+        if prompt_ctx.depth == 0:
+            if any(isinstance(h, dict) and "delegation" in h for h in prompt_ctx.history):
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="final",
+                        final_answer="Parent complete after child.",
+                        usage=usage,
+                    )
+                )
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="delegate",
+                    delegations=(
+                        ModelDelegationRequest(
+                            child_label="scada-child",
+                            query="Read scada",
+                            allowed_tools=("read_scada",),
+                            allowed_origins=("https://scada.local",),
+                        ),
+                    ),
+                    usage=usage,
+                )
+            )
+        if prompt_ctx.history and prompt_ctx.history[-1].get("outcome") == "succeeded":
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="final",
+                    final_answer="Child complete.",
+                    usage=usage,
+                )
+            )
+        return EmulatedTurn(
+            decision=ModelDecision(
+                decision_type="tool_call",
+                tool_call=ModelToolCall(
+                    tool_id="read_scada",
+                    args={},
+                    target_origin="https://scada.local",
+                ),
+                usage=usage,
+            )
+        )
+
+    coord = Coordinator(repo, EmulatedModelClient(turn_factory=_turn_factory), reg, clock=clock)
+    run = coord.submit_task(_make_task("t5-11"))
+    paused = await coord.run_until_settled(run.run_id)
+    assert paused.status == TaskStatus.WAITING_FOR_INPUT
+    assert paused.required_action is not None
+    assert "scada" in paused.required_action.lower()
+
+    auth_ok["ready"] = True
+    coord.resume_task(run.run_id, {"reauthenticated": True})
+    final = await coord.run_until_settled(run.run_id)
+    assert final.status == TaskStatus.SUCCEEDED
+    snap = repo.get_run_snapshot(run.run_id)
+    assert snap.budget_usage.active_children == 0
+    assert all(c.status == TaskStatus.SUCCEEDED for c in snap.child_runs)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_19_resolve_area_falls_back_from_whitespace_or_non_string_area_to_choice() -> None:
+    from src.adapters.config import load_facility_config
+    from src.runtime import _resolve_area_from_human_input
+
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    assert _resolve_area_from_human_input({"area": "   ", "choice": "area-1"}, cfg) == "area-1"
+    assert _resolve_area_from_human_input({"area": 123, "choice": "area-1"}, cfg) == "area-1"
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_20_verifier_preserves_partial_scada_tool_failure_and_query_area() -> None:
+    from src.adapters.config import load_facility_config
+    from src.contracts.common import utc_now
+    from src.contracts.enums import DataQuality
+    from src.contracts.models import EvidenceRequirements, ExecutionMetrics, Observation, Result
+    from src.runtime import build_industrial_result_verifier
+
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    now = utc_now()
+    verifier_fn = build_industrial_result_verifier(cfg, reference_time_fn=lambda: now)
+
+    obs_alarm = Observation(
+        source="scada",
+        session_id="u:p:scada",
+        asset_id="bomba-34-a1",
+        observed_label="bomba 34",
+        value="HIGH_VIBRATION",
+        unit="alarm_code",
+        source_time=now - timedelta(minutes=2),
+        observed_at=now,
+        quality=DataQuality.GOOD,
+        authorized_evidence=True,
+        area="area-1",
+        metadata={"record_type": "alarm", "record_id": "ALM-3401"},
+    )
+    cand = Result(
+        task_id="t5-20a",
+        run_id="r5-20a",
+        status=TaskStatus.SUCCEEDED,
+        answer="ok",
+        execution_metrics=ExecutionMetrics(),
+    )
+
+    # (a) Partial SCADA tool failure (read_alarms succeeded, read_readings failed_transient)
+    history_partial_scada = [
+        {"tool_id": "scada.read_alarms", "outcome": "succeeded"},
+        {"tool_id": "scada.read_readings", "outcome": "failed_transient", "error": "503"},
+    ]
+    task_strict = TaskSpec(
+        task_id="t5-20a",
+        user_id="operator_ro",
+        profile_id="p1",
+        scope=TaskScope(facility_id="facility-a", allowed_areas=("area-1",), read_only=True),
+        query="Check bomba 34",
+        evidence_requirements=EvidenceRequirements(allow_partial_on_source_failure=False),
+    )
+    res_fail = verifier_fn(task_strict, "r5-20a", (obs_alarm,), history_partial_scada, cand, None)
+    assert res_fail.status == TaskStatus.FAILED
+    assert res_fail.partial_info is not None
+    assert "scada:read_readings" in res_fail.partial_info["source_errors"]
+
+    task_allow_partial = task_strict.model_copy(
+        update={
+            "evidence_requirements": EvidenceRequirements(allow_partial_on_source_failure=True)
+        }
+    )
+    res_partial = verifier_fn(
+        task_allow_partial, "r5-20a", (obs_alarm,), history_partial_scada, cand, None
+    )
+    assert res_partial.status == TaskStatus.PARTIAL
+
+    # (b) Query mentioning single area under 2-area scope matches planner without false pause
+    task_query_area = TaskSpec(
+        task_id="t5-20b",
+        user_id="operator_ro",
+        profile_id="p1",
+        scope=TaskScope(
+            facility_id="facility-a",
+            allowed_areas=("area-1", "area-2"),
+            read_only=True,
+        ),
+        query="Check bomba 34 in area-1",
+    )
+    res_area = verifier_fn(
+        task_query_area,
+        "r5-20b",
+        (obs_alarm,),
+        [{"tool_id": "scada.read_alarms", "outcome": "succeeded"}],
+        cand,
+        None,
+    )
+    assert res_area.status == TaskStatus.SUCCEEDED
+    assert all(o.area == "area-1" for o in res_area.verified_observations)

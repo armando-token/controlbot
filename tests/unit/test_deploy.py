@@ -409,3 +409,45 @@ def test_deploy_validate_and_manage_upgrade_and_rollback(tmp_path: Path) -> None
         assert check_conn.execute("SELECT val FROM sentinel;").fetchall() == [("keep-me",)]
     finally:
         check_conn.close()
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_18_package_quotes_spaces_and_rollback_rejects_symlinks(tmp_path: Path) -> None:
+    import shlex
+    import shutil
+
+    from deploy.package import create_release_manifest, write_release_manifest
+    from deploy.rollback import RollbackError, execute_rollback
+
+    spaced_root = tmp_path / "dir with spaces"
+    spaced_root.mkdir(parents=True, exist_ok=True)
+    for rel_dir in ("src", "lab", "deploy", "ops", "scripts"):
+        shutil.copytree(_REPO_ROOT / rel_dir, spaced_root / rel_dir)
+    shutil.copy2(_REPO_ROOT / "pyproject.toml", spaced_root / "pyproject.toml")
+    shutil.copy2(_REPO_ROOT / "uv.lock", spaced_root / "uv.lock")
+
+    manifest = create_release_manifest(
+        root_dir=spaced_root,
+        install_config_path=spaced_root / "deploy" / "install_config.yaml",
+    )
+    expected_quoted = shlex.quote(str(spaced_root.resolve()))
+    assert f"--root-dir {expected_quoted}" in manifest.restore_command
+
+    manifest_path = spaced_root / "deploy" / "release_manifest.json"
+    write_release_manifest(manifest, manifest_path)
+
+    # Replace a packaged artifact with a symlink -> execute_rollback must reject it
+    outside_target = tmp_path / "outside_target.py"
+    outside_target.write_bytes((spaced_root / "src" / "__init__.py").read_bytes())
+    artifact_path = spaced_root / "src" / "__init__.py"
+    artifact_path.unlink()
+    artifact_path.symlink_to(outside_target)
+
+    with pytest.raises(RollbackError, match="Symlinked artifact"):
+        execute_rollback(
+            manifest_path=manifest_path,
+            root_dir=spaced_root,
+            state_dir=tmp_path / "state",
+            verify_checksums=True,
+        )

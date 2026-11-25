@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -219,7 +220,7 @@ def create_release_manifest(
     install_cfg_hash = compute_sha256(resolved_install)
     restore_cmd = (
         "uv run python -m deploy.rollback "
-        f"--manifest deploy/release_manifest.json --root-dir {resolved_root}"
+        f"--manifest deploy/release_manifest.json --root-dir {shlex.quote(str(resolved_root))}"
     )
 
     return ReleaseManifest(

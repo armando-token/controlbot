@@ -389,19 +389,32 @@ def build_industrial_result_verifier(
         if not observations and not industrial_tools_ran:
             return candidate
 
-        source_errors: dict[str, str] = {}
+        tool_failures: dict[str, str] = {}
         ok_sources = {obs.source for obs in observations}
         for item in history:
             if not isinstance(item, dict):
                 continue
             tid = str(item.get("tool_id", ""))
             outcome = str(item.get("outcome", ""))
-            if outcome in ("failed_transient", "failed_semantic", "failed_permission"):
-                err_text = str(item.get("error") or outcome)
-                if tid.startswith("scada.") and "scada" not in ok_sources:
+            if outcome == "succeeded":
+                tool_failures.pop(tid, None)
+            elif outcome in ("failed_transient", "failed_semantic", "failed_permission"):
+                tool_failures[tid] = str(item.get("error") or outcome)
+
+        source_errors: dict[str, str] = {}
+        for tid, err_text in tool_failures.items():
+            if tid.startswith("scada."):
+                if "scada" not in ok_sources:
                     source_errors["scada"] = err_text
-                elif tid.startswith("maint.") and "maintenance" not in ok_sources:
+                else:
+                    sub_name = tid.split(".", 1)[1] if "." in tid else tid
+                    source_errors[f"scada:{sub_name}"] = err_text
+            elif tid.startswith("maint."):
+                if "maintenance" not in ok_sources:
                     source_errors["maintenance"] = err_text
+                else:
+                    sub_name = tid.split(".", 1)[1] if "." in tid else tid
+                    source_errors[f"maintenance:{sub_name}"] = err_text
 
         target_area: str | None = None
         if len(task_spec.scope.allowed_areas) == 1:
@@ -413,6 +426,10 @@ def build_industrial_result_verifier(
                 or resolved_area in task_spec.scope.allowed_areas
             ):
                 target_area = resolved_area
+        if target_area is None:
+            target_area = _resolve_single_query_area(
+                task_spec.query, task_spec.scope.allowed_areas, config
+            )
 
         filtered_obs = (
             tuple(obs for obs in observations if obs.area == target_area)
@@ -484,15 +501,38 @@ def _query_mentions_area(low_q: str, norm_q: str, area: str) -> bool:
     )
 
 
+def _resolve_single_query_area(
+    query: str,
+    allowed_areas: Sequence[str],
+    config: FacilityConfig,
+) -> str | None:
+    candidate_areas = (
+        list(allowed_areas)
+        if allowed_areas
+        else sorted({a.area for a in config.assets if a.area})
+    )
+    if len(candidate_areas) < 2:
+        return None
+    low_q = query.lower()
+    norm_q = re.sub(r"[-_\s]+", " ", low_q)
+    matched_areas = [
+        area for area in candidate_areas if _query_mentions_area(low_q, norm_q, area)
+    ]
+    if len(matched_areas) == 1:
+        return matched_areas[0]
+    return None
+
+
 def _resolve_area_from_human_input(
     human_input: Mapping[str, Any] | None,
     config: FacilityConfig,
 ) -> str | None:
     if not human_input:
         return None
-    raw_area = human_input.get("area") or human_input.get("choice")
-    if isinstance(raw_area, str) and raw_area.strip():
-        return raw_area.strip()
+    for key in ("area", "choice"):
+        raw_val = human_input.get(key)
+        if isinstance(raw_val, str) and raw_val.strip():
+            return raw_val.strip()
     raw_asset_id = human_input.get("asset_id")
     if isinstance(raw_asset_id, str) and raw_asset_id.strip():
         target_id = raw_asset_id.strip()
@@ -511,15 +551,7 @@ def _extract_chosen_area(
     resolved_area = _resolve_area_from_human_input(prompt_ctx.human_input, config)
     if resolved_area is not None:
         return resolved_area
-    if len(prompt_ctx.allowed_areas) >= 2:
-        low_q = prompt_ctx.query.lower()
-        norm_q = re.sub(r"[-_\s]+", " ", low_q)
-        matched_areas = [
-            area for area in prompt_ctx.allowed_areas if _query_mentions_area(low_q, norm_q, area)
-        ]
-        if len(matched_areas) == 1:
-            return matched_areas[0]
-    return None
+    return _resolve_single_query_area(prompt_ctx.query, prompt_ctx.allowed_areas, config)
 
 
 def _tool_already_called_for_area(

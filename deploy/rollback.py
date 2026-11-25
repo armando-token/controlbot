@@ -125,6 +125,20 @@ def execute_rollback(
     if verify_checksums:
         base_dir = (root_dir or Path.cwd()).resolve()
         for item in manifest.artifacts:
+            raw_rel = item.relative_path.replace("\\", "/")
+            rel_parts = Path(raw_rel).parts
+            if not rel_parts or raw_rel.startswith("/") or ".." in rel_parts:
+                raise RollbackError(
+                    f"Artifact path escapes root_dir: {item.relative_path}"
+                )
+            cur = base_dir
+            for part in rel_parts:
+                cur = cur / part
+                if cur.is_symlink():
+                    raise RollbackError(
+                        "Symlinked artifact or path component rejected during rollback: "
+                        f"{item.relative_path}"
+                    )
             target_file = (base_dir / item.relative_path).resolve()
             if not target_file.is_relative_to(base_dir):
                 raise RollbackError(

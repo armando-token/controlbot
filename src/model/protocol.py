@@ -16,6 +16,10 @@ class ModelProtocolError(RuntimeError):
     """Raised when a model backend returns malformed or invalid structured output."""
 
 
+class ModelPermissionError(ModelProtocolError):
+    """Raised when a model attempts to call a tool outside its allowed tool list."""
+
+
 class TransientModelError(RuntimeError):
     """Raised on retryable model transport or temporary backend failures."""
 

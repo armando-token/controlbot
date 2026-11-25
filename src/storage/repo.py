@@ -26,6 +26,7 @@ from src.contracts.common import (
 from src.contracts.enums import (
     TERMINAL_TASK_STATUSES,
     EffectClass,
+    ReceiptOutcome,
     StepStatus,
     TaskStatus,
     is_terminal_status,
@@ -575,6 +576,11 @@ class StorageRepo:
             ).fetchone()
             if existing is not None:
                 raise ConflictError(f"Task {task_spec.task_id!r} already exists.")
+            existing_run = conn.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?", (root_run.run_id,)
+            ).fetchone()
+            if existing_run is not None:
+                raise ConflictError(f"Run {root_run.run_id!r} already exists.")
 
             conn.execute(
                 """
@@ -2622,6 +2628,26 @@ class StorageRepo:
                 },
                 recorded_at_iso=now_iso,
             )
+            redacted_args = redact_payload_strict(
+                json.loads(str(step_row["redacted_args_json"]))
+            )
+            failed_receipt = ActionReceipt(
+                receipt_id=f"rcpt-{uuid.uuid4().hex[:12]}",
+                task_id=run.task_id,
+                run_id=run.run_id,
+                step_id=step_id,
+                attempt=max(1, step.attempt),
+                tool_id=step.tool_id,
+                redacted_args=redacted_args if isinstance(redacted_args, dict) else {},
+                operation_key=step.operation_key,
+                observed_before=None,
+                observed_after=None,
+                duration_ms=0.0,
+                evidence_refs=(),
+                outcome=ReceiptOutcome.FAILED_TRANSIENT,
+                error_detail="read_retries_exhausted_during_recovery",
+                recorded_at=now,
+            )
             self._reconcile_step_unknown_tx(
                 conn,
                 step_row,
@@ -2631,6 +2657,7 @@ class StorageRepo:
                 "failed_transient",
                 "read_retries_exhausted_during_recovery",
                 now_iso=now_iso,
+                receipt=failed_receipt,
             )
             return "failed"
 

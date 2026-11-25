@@ -315,3 +315,112 @@ def test_solo_unconfigured_asset_id_triggers_contradiction_and_unit_check() -> N
     )
     assert res.status == TaskStatus.PARTIAL
     assert len(res.contradictions) == 1
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_04_verifier_enforces_min_sources() -> None:
+    from src.contracts.models import EvidenceRequirements
+
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    verifier = Verifier()
+    scada_alarm = _make_obs(
+        source="scada",
+        asset_id="bomba-34-a1",
+        observed_label="bomba 34",
+        area="area-1",
+        record_type="alarm",
+        record_id="ALM-3401",
+        value="HIGH_VIBRATION",
+        unit="alarm_code",
+    )
+
+    task_fail = TaskSpec(
+        task_id="t-min-src-fail",
+        user_id="operator_ro",
+        profile_id="p1",
+        scope=TaskScope(facility_id="facility-a", allowed_areas=("area-1",), read_only=True),
+        query="Check bomba 34",
+        evidence_requirements=EvidenceRequirements(
+            min_sources=2,
+            allow_partial_on_source_failure=False,
+        ),
+    )
+    res_fail = verifier.verify_and_synthesize(
+        task=task_fail,
+        config=cfg,
+        observations=[scada_alarm],
+        source_errors={},
+        target_asset_query="bomba 34",
+        target_area="area-1",
+    )
+    assert res_fail.status == TaskStatus.FAILED
+    assert res_fail.partial_info is not None
+    assert res_fail.partial_info["min_sources"] == 2
+    assert res_fail.partial_info["available_sources"] == ["scada"]
+    assert "min_sources=2" in res_fail.answer
+
+    task_partial = task_fail.model_copy(
+        update={
+            "evidence_requirements": EvidenceRequirements(
+                min_sources=2,
+                allow_partial_on_source_failure=True,
+            )
+        }
+    )
+    res_partial = verifier.verify_and_synthesize(
+        task=task_partial,
+        config=cfg,
+        observations=[scada_alarm],
+        source_errors={},
+        target_asset_query="bomba 34",
+        target_area="area-1",
+    )
+    assert res_partial.status == TaskStatus.PARTIAL
+    assert res_partial.partial_info is not None
+    assert res_partial.partial_info["min_sources"] == 2
+    assert res_partial.partial_info["available_sources"] == ["scada"]
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_05_verifier_flags_paired_unconfigured_asset_id() -> None:
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    verifier = Verifier()
+    scada_bogus = _make_obs(
+        source="scada",
+        asset_id="BOGUS-99",
+        observed_label="bomba 34",
+        area="area-1",
+        record_type="alarm",
+        record_id="ALM-9901",
+        value="HIGH_VIBRATION",
+        unit="alarm_code",
+    )
+    maint_bogus = _make_obs(
+        source="maintenance",
+        asset_id="BOGUS-99",
+        observed_label="bomba 34",
+        area="area-1",
+        record_type="work_order",
+        record_id="WO-9901",
+        value="Seal replaced",
+        unit="event",
+    )
+    task = TaskSpec(
+        task_id="t-paired-bogus",
+        user_id="operator_ro",
+        profile_id="p1",
+        scope=TaskScope(facility_id="facility-a", allowed_areas=("area-1",), read_only=True),
+        query="Check bomba 34",
+    )
+    res = verifier.verify_and_synthesize(
+        task=task,
+        config=cfg,
+        observations=[scada_bogus, maint_bogus],
+        target_asset_query="bomba 34",
+        target_area="area-1",
+    )
+    assert len(res.contradictions) >= 1
+    assert res.status != TaskStatus.SUCCEEDED
+    assert any("BOGUS-99" in c.summary for c in res.contradictions)

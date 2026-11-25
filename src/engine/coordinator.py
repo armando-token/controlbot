@@ -44,7 +44,7 @@ from src.model.protocol import (
     ModelClient,
     ModelDecision,
     ModelDelegationRequest,
-    ModelProtocolError,
+    ModelPermissionError,
     PromptContext,
     TransientModelError,
 )
@@ -200,22 +200,46 @@ class Coordinator:
         snapshot = self._repo.get_run_snapshot(run_id)
         requested_tools = human_input.get("allowed_tools")
         if (
-            isinstance(requested_tools, (list, tuple))
-            and snapshot.effective_scope.allowed_tools
-            and not set(requested_tools).issubset(snapshot.effective_scope.allowed_tools)
+            "allowed_tools" in human_input
+            and (
+                not isinstance(requested_tools, (list, tuple))
+                or any(not isinstance(item, str) for item in requested_tools)
+                or (
+                    snapshot.effective_scope.allowed_tools
+                    and (
+                        not requested_tools
+                        or not set(requested_tools).issubset(
+                            snapshot.effective_scope.allowed_tools
+                        )
+                    )
+                )
+            )
         ):
-                self._repo.append_audit_log(
-                    task_id=snapshot.task_spec.task_id,
-                    run_id=run_id,
-                    actor="coordinator",
-                    action="resume_scope_widening_rejected",
-                    decision="deny",
-                    detail={"requested_tools": list(requested_tools)},
-                )
-                raise PlanValidationError(
-                    "human_input cannot widen TaskScope.allowed_tools on resume."
-                )
-        if human_input.get("read_only") is False and snapshot.effective_scope.read_only:
+            self._repo.append_audit_log(
+                task_id=snapshot.task_spec.task_id,
+                run_id=run_id,
+                actor="coordinator",
+                action="resume_scope_widening_rejected",
+                decision="deny",
+                detail={
+                    "requested_tools": (
+                        list(requested_tools)
+                        if isinstance(requested_tools, (list, tuple))
+                        else str(requested_tools)
+                    )
+                },
+            )
+            raise PlanValidationError(
+                "human_input cannot widen TaskScope.allowed_tools on resume."
+            )
+        if (
+            "read_only" in human_input
+            and snapshot.effective_scope.read_only
+            and (
+                not isinstance(human_input["read_only"], bool)
+                or not human_input["read_only"]
+            )
+        ):
             self._repo.append_audit_log(
                 task_id=snapshot.task_spec.task_id,
                 run_id=run_id,
@@ -229,11 +253,14 @@ class Coordinator:
         requested_origins = human_input.get("allowed_origins")
         if (
             "allowed_origins" in human_input
-            and isinstance(requested_origins, (list, tuple))
-            and requested_origins
             and (
-                not snapshot.effective_scope.allowed_origins
-                or not set(requested_origins).issubset(snapshot.effective_scope.allowed_origins)
+                not isinstance(requested_origins, (list, tuple))
+                or any(not isinstance(item, str) for item in requested_origins)
+                or not requested_origins
+                or not snapshot.effective_scope.allowed_origins
+                or not set(requested_origins).issubset(
+                    snapshot.effective_scope.allowed_origins
+                )
             )
         ):
             self._repo.append_audit_log(
@@ -242,7 +269,13 @@ class Coordinator:
                 actor="coordinator",
                 action="resume_scope_widening_rejected",
                 decision="deny",
-                detail={"requested_origins": list(requested_origins)},
+                detail={
+                    "requested_origins": (
+                        list(requested_origins)
+                        if isinstance(requested_origins, (list, tuple))
+                        else str(requested_origins)
+                    )
+                },
             )
             raise PlanValidationError(
                 "human_input cannot widen TaskScope.allowed_origins on resume."
@@ -251,11 +284,18 @@ class Coordinator:
         requested_areas = human_input.get("allowed_areas")
         if (
             "allowed_areas" in human_input
-            and snapshot.effective_scope.allowed_areas
             and (
                 not isinstance(requested_areas, (list, tuple))
-                or not requested_areas
-                or not set(requested_areas).issubset(snapshot.effective_scope.allowed_areas)
+                or any(not isinstance(item, str) for item in requested_areas)
+                or (
+                    snapshot.effective_scope.allowed_areas
+                    and (
+                        not requested_areas
+                        or not set(requested_areas).issubset(
+                            snapshot.effective_scope.allowed_areas
+                        )
+                    )
+                )
             )
         ):
             self._repo.append_audit_log(
@@ -358,6 +398,20 @@ class Coordinator:
             )
             reason = "unresolved_unknown_steps"
             answer = "Cannot settle as succeeded while unresolved unknown steps remain."
+
+        for child in snapshot.child_runs:
+            if not is_terminal_status(child.status):
+                child_target = (
+                    TaskStatus.CANCELLED
+                    if target_status == TaskStatus.CANCELLED
+                    else TaskStatus.FAILED
+                )
+                with contextlib.suppress(Exception):
+                    self._repo.transition_run_status(
+                        child.run_id,
+                        child_target,
+                        f"parent_settled_{target_status.value}",
+                    )
 
         wall_s = self._active_wall_seconds(snapshot)
         updated_usage = self._repo.update_wall_seconds(task_spec.task_id, wall_s)
@@ -736,6 +790,88 @@ class Coordinator:
             for r in snapshot.receipts
         ]
 
+        # Restore prior child observations and resume any waiting_for_input children
+        if (
+            not observations
+            and snapshot.result is not None
+            and snapshot.result.verified_observations
+        ):
+            observations.extend(snapshot.result.verified_observations)
+        if snapshot.child_runs:
+            waiting_kids = [
+                c for c in snapshot.child_runs if c.status == TaskStatus.WAITING_FOR_INPUT
+            ]
+            for c_done in snapshot.child_runs:
+                if c_done.status != TaskStatus.WAITING_FOR_INPUT:
+                    c_snap = self._repo.get_run_snapshot(c_done.run_id)
+                    history.append(
+                        {
+                            "delegation": c_done.transition_reason or c_done.run_id,
+                            "child_run_id": c_done.run_id,
+                            "status": c_done.status.value,
+                            "answer": c_snap.result.answer if c_snap.result else "",
+                        }
+                    )
+            if waiting_kids and pending_human_input is not None:
+                resumed_kids: list[Run] = []
+                for w_child in waiting_kids:
+                    with contextlib.suppress(
+                        TerminalStateError, PlanValidationError, BudgetExceededError
+                    ):
+                        resumed_kids.append(
+                            self._repo.resume_from_input(w_child.run_id, pending_human_input)
+                        )
+                if resumed_kids:
+                    resumed_results = await asyncio.gather(
+                        *(self.run_until_settled(c.run_id) for c in resumed_kids)
+                    )
+                    still_waiting: list[tuple[Run, Result]] = []
+                    for c_run, c_res in zip(resumed_kids, resumed_results, strict=True):
+                        observations.extend(c_res.verified_observations)
+                        contradictions.extend(c_res.contradictions)
+                        history.append(
+                            {
+                                "delegation": c_run.transition_reason or c_run.run_id,
+                                "child_run_id": c_run.run_id,
+                                "status": c_res.status.value,
+                                "answer": c_res.answer,
+                            }
+                        )
+                        if c_res.status == TaskStatus.WAITING_FOR_INPUT:
+                            still_waiting.append((c_run, c_res))
+                    if still_waiting:
+                        active_wall = self._active_wall_seconds(self._repo.get_run_snapshot(run_id))
+                        usage_now = self._repo.get_budget_usage(task_id)
+                        req_action = "; ".join(
+                            c_res.required_action
+                            or f"Child {c_run.run_id} requires human input"
+                            for c_run, c_res in still_waiting
+                        )
+                        merged_partial: dict[str, Any] = {
+                            "waiting_child_run_ids": [c_run.run_id for c_run, _ in still_waiting]
+                        }
+                        if still_waiting[0][1].partial_info:
+                            merged_partial.update(still_waiting[0][1].partial_info)
+                        paused_res = Result(
+                            task_id=task_id,
+                            run_id=run_id,
+                            status=TaskStatus.WAITING_FOR_INPUT,
+                            answer=req_action,
+                            verified_observations=tuple(observations),
+                            partial_info=merged_partial,
+                            contradictions=tuple(contradictions),
+                            required_action=req_action,
+                            execution_metrics=self._budget_manager.to_execution_metrics(usage_now),
+                        )
+                        self._repo.pause_for_input(
+                            run_id,
+                            req_action,
+                            reason="child_waiting_for_input",
+                            result=paused_res,
+                            wall_seconds_elapsed=active_wall,
+                        )
+                        return paused_res
+
         # Resolve any UNKNOWN effect step if human_input explicitly answered it;
         # otherwise re-pause for confirmation instead of allowing SUCCEEDED with UNKNOWN steps.
         unknown_steps = self._repo.list_unknown_steps(run_id)
@@ -953,9 +1089,7 @@ class Coordinator:
                 raise
             except Exception as exc:
                 self._repo.reconcile_budget(model_res.reservation_id, release_only=True)
-                if isinstance(exc, ModelProtocolError) and (
-                    "outside allowed tool list" in str(exc)
-                ):
+                if isinstance(exc, ModelPermissionError):
                     policy_reason = (
                         "read_only_policy_denied"
                         if task_spec.scope.read_only
@@ -1084,8 +1218,20 @@ class Coordinator:
                         required_action=None,
                         execution_metrics=self._budget_manager.to_execution_metrics(usage_now),
                     )
+                    verifier_task_spec = (
+                        task_spec.model_copy(
+                            update={
+                                "scope": post_snapshot.effective_scope,
+                                "evidence_requirements": task_spec.evidence_requirements.model_copy(
+                                    update={"min_sources": 1}
+                                ),
+                            }
+                        )
+                        if post_snapshot.run.depth > 0
+                        else task_spec
+                    )
                     verified_result = self._result_verifier(
-                        task_spec,
+                        verifier_task_spec,
                         run_id,
                         tuple(observations),
                         history,
@@ -1234,6 +1380,7 @@ class Coordinator:
             child_results = await asyncio.gather(
                 *(self.run_until_settled(c.run_id) for c in child_runs)
             )
+            waiting_children: list[tuple[ModelDelegationRequest, Run, Result]] = []
             for req, c_run, c_res in zip(batch, child_runs, child_results, strict=True):
                 observations.extend(c_res.verified_observations)
                 contradictions.extend(c_res.contradictions)
@@ -1245,6 +1392,8 @@ class Coordinator:
                         "answer": c_res.answer,
                     }
                 )
+                if c_res.status == TaskStatus.WAITING_FOR_INPUT:
+                    waiting_children.append((req, c_run, c_res))
                 if self._repo.is_cancel_requested(task_spec.task_id):
                     latest = self._repo.get_run_snapshot(parent_run.run_id)
                     return self._build_settled_result(
@@ -1254,6 +1403,39 @@ class Coordinator:
                         observations=tuple(observations),
                         contradictions=tuple(contradictions),
                     )
+            if waiting_children:
+                active_wall = self._active_wall_seconds(
+                    self._repo.get_run_snapshot(parent_run.run_id)
+                )
+                usage_now = self._repo.get_budget_usage(task_spec.task_id)
+                req_action = "; ".join(
+                    c_res.required_action or f"Child {c_run.run_id} requires human input"
+                    for _, c_run, c_res in waiting_children
+                )
+                merged_partial: dict[str, Any] = {
+                    "waiting_child_run_ids": [c_run.run_id for _, c_run, _ in waiting_children]
+                }
+                if waiting_children[0][2].partial_info:
+                    merged_partial.update(waiting_children[0][2].partial_info)
+                paused_res = Result(
+                    task_id=task_spec.task_id,
+                    run_id=parent_run.run_id,
+                    status=TaskStatus.WAITING_FOR_INPUT,
+                    answer=req_action,
+                    verified_observations=tuple(observations),
+                    partial_info=merged_partial,
+                    contradictions=tuple(contradictions),
+                    required_action=req_action,
+                    execution_metrics=self._budget_manager.to_execution_metrics(usage_now),
+                )
+                self._repo.pause_for_input(
+                    parent_run.run_id,
+                    req_action,
+                    reason="child_waiting_for_input",
+                    result=paused_res,
+                    wall_seconds_elapsed=active_wall,
+                )
+                return paused_res
 
         return None
 
@@ -1554,6 +1736,12 @@ class Coordinator:
                             ),
                             None,
                         )
+                        reconciled_output = (
+                            latest_receipt.observed_after
+                            if latest_receipt is not None
+                            and isinstance(latest_receipt.observed_after, dict)
+                            else {}
+                        )
                         history.append(
                             {
                                 "tool_id": tool_id,
@@ -1567,10 +1755,96 @@ class Coordinator:
                                 "error": None,
                             }
                         )
+                        progress_token = (
+                            str(reconciled_output["progress_token"])
+                            if "progress_token" in reconciled_output
+                            else None
+                        )
+                        self._repo.record_step_signature(
+                            task_id=task_id,
+                            run_id=run_id,
+                            step_index=leased.step_index,
+                            tool_id=tool_id,
+                            target_key=target_origin or snapshot.effective_scope.facility_id,
+                            canonical_args_hash=canonical_json_hash(
+                                exec_result.receipt.redacted_args
+                            ),
+                            result_hash=canonical_json_hash(
+                                {
+                                    "outcome": ReceiptOutcome.SUCCEEDED.value,
+                                    "output": reconciled_output,
+                                }
+                            ),
+                            progress_token=progress_token,
+                            succeeded=True,
+                        )
+                        sigs = self._repo.get_step_signatures(run_id)
+                        poller_tools = {
+                            tid
+                            for tid in self._tool_registry.list_specs()
+                            if self._tool_registry.is_poller(tid)
+                        }
+                        loop_decision = self._loop_detector.evaluate(
+                            sigs, poller_tools=poller_tools
+                        )
+                        if loop_decision.action == "halt":
+                            self._repo.append_event(
+                                task_id=task_id,
+                                run_id=run_id,
+                                step_id=leased.step_id,
+                                event_type="loop_detected",
+                                reason=loop_decision.reason,
+                                payload={"kind": loop_decision.kind},
+                            )
+                            self._repo.append_audit_log(
+                                task_id=task_id,
+                                run_id=run_id,
+                                step_id=leased.step_id,
+                                actor="loop_detector",
+                                action="loop_halted",
+                                decision="deny",
+                                detail={
+                                    "kind": loop_decision.kind,
+                                    "reason": loop_decision.reason,
+                                },
+                            )
+                            target = (
+                                TaskStatus.PARTIAL
+                                if observations
+                                and task_spec.evidence_requirements.allow_partial_on_source_failure
+                                else TaskStatus.FAILED
+                            )
+                            return self._settle_terminal(
+                                task_spec=task_spec,
+                                run_id=run_id,
+                                target_status=target,
+                                reason=loop_decision.reason,
+                                answer=f"Execution halted by loop guard: {loop_decision.reason}",
+                                observations=tuple(observations),
+                                contradictions=tuple(contradictions),
+                                partial_info={
+                                    "loop_kind": loop_decision.kind,
+                                    "reason": loop_decision.reason,
+                                },
+                            )
                         return None
                     if outcome_kind == "retry":
                         local_retries += 1
                         continue
+                    if outcome_kind == "noop":
+                        latest = self._repo.get_run_snapshot(run_id)
+                        if latest.result is not None:
+                            return latest.result
+                        return self._build_settled_result(
+                            task_spec=task_spec,
+                            run=latest.run,
+                            answer=(
+                                f"Run reached status {latest.run.status.value} "
+                                "during reconciliation."
+                            ),
+                            observations=tuple(observations),
+                            contradictions=tuple(contradictions),
+                        )
                     if outcome_kind == "waiting_for_human":
                         paused_snap = self._repo.get_run_snapshot(run_id)
                         req_action = (

@@ -21,6 +21,7 @@ from src.model.protocol import (
     BudgetRemaining,
     ModelClient,
     ModelDecision,
+    ModelPermissionError,
     ModelProtocolError,
     ModelToolCall,
     ModelUsage,
@@ -389,7 +390,7 @@ class LocalHttpModelClient:
                     raise ModelProtocolError("tool_calls[0].function.name must be non-empty.")
                 tool_id = tool_id.strip()
                 if tool_id not in tool_map:
-                    raise ModelProtocolError(
+                    raise ModelPermissionError(
                         f"Permission denied: tool_id {tool_id!r} is not allowed "
                         "(outside allowed tool list)."
                     )
@@ -479,23 +480,27 @@ class LocalHttpModelClient:
                 raise ModelProtocolError("tool_call.tool_id must be a non-empty string.")
             tc_tool_id = tc_tool_id.strip()
             if tc_tool_id not in tool_map:
-                raise ModelProtocolError(
+                raise ModelPermissionError(
                     f"Permission denied: tool_id {tc_tool_id!r} is not allowed "
                     "(outside allowed tool list)."
                 )
             spec = tool_map.get(tc_tool_id)
             raw_tc_args = raw_tc.get("args")
+            clean_tc_args = dict(raw_tc_args) if isinstance(raw_tc_args, dict) else None
+            popped_origin: Any = None
+            if clean_tc_args is not None and "__target_origin__" in clean_tc_args:
+                popped_origin = clean_tc_args.pop("__target_origin__", None)
+                raw_tc = {**raw_tc, "args": clean_tc_args}
+                parsed_obj = {**parsed_obj, "tool_call": raw_tc}
             if raw_tc.get("target_origin") is None:
-                inferred_origin: Any = None
-                if isinstance(raw_tc_args, dict):
-                    inferred_origin = raw_tc_args.get("__target_origin__")
+                inferred_origin: Any = popped_origin
+                if inferred_origin is None and clean_tc_args is not None:
+                    inferred_origin = clean_tc_args.get("target_origin")
                     if inferred_origin is None:
-                        inferred_origin = raw_tc_args.get("target_origin")
-                    if inferred_origin is None:
-                        inferred_origin = raw_tc_args.get("origin")
+                        inferred_origin = clean_tc_args.get("origin")
                     if inferred_origin is None:
                         for url_key in ("url", "target_url"):
-                            candidate_url = raw_tc_args.get(url_key)
+                            candidate_url = clean_tc_args.get(url_key)
                             if isinstance(candidate_url, str) and candidate_url.startswith(
                                 ("http://", "https://")
                             ):

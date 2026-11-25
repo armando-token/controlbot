@@ -433,3 +433,189 @@ async def test_web_api_and_ui_secret_redaction_release_owner_and_blank_query(
             err_page = await client.get(blank_ui.headers["location"])
             assert err_page.status_code == 200
             assert "error-banner" in err_page.text
+
+
+@pytest.mark.tier5
+@pytest.mark.n2
+async def test_t5_01_ui_submit_enforces_origin_and_config_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    web_app = create_app(db_path=tmp_path / "ui_gate.sqlite3")
+    async with (
+        run_asgi_server(web_app) as web_origin,
+        httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+    ):
+        resp_ext = await client.post(
+            "/ui/tasks",
+            data={
+                "query": "Check bomba 34",
+                "facility_id": "facility-a",
+                "allowed_origins": "https://evil.example.com",
+            },
+            follow_redirects=False,
+        )
+        assert resp_ext.status_code == 303
+        assert resp_ext.headers["location"].startswith("/?error=")
+        assert (await client.get("/api/tasks")).json()["tasks"] == []
+
+    # With GROKBOT_INSTALLATION_CONFIG active, unconfigured loopback origin is also rejected
+    scada_app = create_scada_app(fixture_mode="default")
+    async with run_asgi_server(scada_app) as scada_origin:
+        from src.adapters.config import load_facility_config
+
+        cfg_obj = load_facility_config(
+            Path("lab/configs/facility_a.json"),
+            origin_overrides={"scada": scada_origin},
+        )
+        cfg_path = tmp_path / "facility_t5_01.json"
+        cfg_path.write_text(cfg_obj.model_dump_json(indent=2), encoding="utf-8")
+        monkeypatch.setenv("GROKBOT_DB_PATH", str(tmp_path / "ui_cfg.sqlite3"))
+        monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles"))
+        monkeypatch.setenv("GROKBOT_INSTALLATION_CONFIG", str(cfg_path))
+        web_cfg_app = create_app()
+        async with (
+            web_cfg_app.router.lifespan_context(web_cfg_app),
+            run_asgi_server(web_cfg_app) as web_cfg_origin,
+            httpx.AsyncClient(base_url=web_cfg_origin, trust_env=False) as client2,
+        ):
+            resp_loop = await client2.post(
+                "/ui/tasks",
+                data={
+                    "query": "Check bomba 34",
+                    "facility_id": "facility-a",
+                    "allowed_origins": "http://127.0.0.1:19999",
+                },
+                follow_redirects=False,
+            )
+            assert resp_loop.status_code == 303
+            assert resp_loop.headers["location"].startswith("/?error=")
+            assert (await client2.get("/api/tasks")).json()["tasks"] == []
+
+
+@pytest.mark.tier5
+@pytest.mark.n2
+async def test_t5_02_api_submit_rejects_unconfigured_origin_under_partial_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scada_origin = "http://127.0.0.1:18101"
+    maint_origin = "http://127.0.0.1:18102"
+    monkeypatch.setenv("GROKBOT_DB_PATH", str(tmp_path / "partial_override.sqlite3"))
+    monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles_partial"))
+    monkeypatch.setenv("GROKBOT_SCADA_URL", scada_origin)
+    monkeypatch.setenv("GROKBOT_MAINTENANCE_URL", maint_origin)
+    monkeypatch.setenv("GROKBOT_ALLOWED_ORIGINS", f"{scada_origin},{maint_origin}")
+    monkeypatch.delenv("GROKBOT_EFFECT_SIM_URL", raising=False)
+    monkeypatch.delenv("GROKBOT_INSTALLATION_CONFIG", raising=False)
+
+    app1 = create_app()
+    async with (
+        app1.router.lifespan_context(app1),
+        run_asgi_server(app1) as origin1,
+        httpx.AsyncClient(base_url=origin1, trust_env=False) as client1,
+    ):
+        bad = await client1.post(
+            "/api/tasks",
+            json={
+                "user_id": "operator_ro",
+                "profile_id": "p1",
+                "facility_id": "facility-a",
+                "allowed_origins": ["http://127.0.0.1:19999"],
+                "query": "Check bomba 34",
+            },
+        )
+        assert bad.status_code == 422
+
+    # GROKBOT_ALLOWED_ORIGINS alone (no app URL overrides) also enforces configured_origins
+    monkeypatch.delenv("GROKBOT_SCADA_URL", raising=False)
+    monkeypatch.delenv("GROKBOT_MAINTENANCE_URL", raising=False)
+    monkeypatch.setenv("GROKBOT_DB_PATH", str(tmp_path / "allowed_only.sqlite3"))
+    monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles_allowed_only"))
+    monkeypatch.setenv("GROKBOT_ALLOWED_ORIGINS", scada_origin)
+
+    app2 = create_app()
+    async with (
+        app2.router.lifespan_context(app2),
+        run_asgi_server(app2) as origin2,
+        httpx.AsyncClient(base_url=origin2, trust_env=False) as client2,
+    ):
+        bad2 = await client2.post(
+            "/api/tasks",
+            json={
+                "user_id": "operator_ro",
+                "profile_id": "p1",
+                "facility_id": "facility-a",
+                "allowed_origins": ["http://127.0.0.1:19999"],
+                "query": "Check bomba 34",
+            },
+        )
+        assert bad2.status_code == 422
+
+
+@pytest.mark.tier5
+@pytest.mark.n2
+async def test_t5_21_web_app_bad_creds_json_non_utf8_form_and_quoted_redirects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json as _json
+
+    monkeypatch.setenv("GROKBOT_CREDENTIALS_JSON", "{bad json")
+    monkeypatch.setenv("GROKBOT_DB_PATH", str(tmp_path / "bad_creds.sqlite3"))
+    monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles_bad_creds"))
+    with pytest.raises(ValueError) as exc_info:
+        create_app()
+    assert type(exc_info.value) is ValueError
+    assert not isinstance(exc_info.value, _json.JSONDecodeError)
+    monkeypatch.delenv("GROKBOT_CREDENTIALS_JSON", raising=False)
+
+    coordinator = InMemoryCoordinatorStub()
+    web_app = create_app(db_path=tmp_path / "ui_edge.sqlite3", coordinator=coordinator)
+    async with (
+        run_asgi_server(web_app) as web_origin,
+        httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+    ):
+        bad_utf8 = await client.post(
+            "/ui/tasks",
+            content=b"\xff\xfe",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            follow_redirects=False,
+        )
+        assert bad_utf8.status_code == 400
+
+        special_run_id = "run+1 2"
+        submit_spec = await client.post(
+            "/api/tasks",
+            json={"query": "Test quoted redirect"},
+        )
+        assert submit_spec.status_code == 201
+        real_run_id = submit_spec.json()["run_id"]
+        # Seed a run with URL-unsafe characters in run_id on the stub
+        base_snap = coordinator._snapshots[real_run_id]
+        coordinator._snapshots[special_run_id] = base_snap.model_copy(
+            update={"run": base_snap.run.model_copy(update={"run_id": special_run_id})}
+        )
+        coordinator._order.append(special_run_id)
+        coordinator.transition_run(special_run_id, TaskStatus.RUNNING, "go")
+        coordinator.transition_run(
+            special_run_id,
+            TaskStatus.WAITING_FOR_INPUT,
+            "need_input",
+            required_action="Choose area",
+        )
+        res_resume = await client.post(
+            "/ui/tasks/run%2B1%202/resume",
+            data={"choice": "area-1"},
+            follow_redirects=False,
+        )
+        assert res_resume.status_code == 303
+        assert res_resume.headers["location"] == "/tasks/run%2B1+2"
+
+        res_cancel = await client.post(
+            "/ui/tasks/run%2B1%202/cancel",
+            data={"reason": "stop"},
+            follow_redirects=False,
+        )
+        assert res_cancel.status_code == 303
+        assert res_cancel.headers["location"] == "/tasks/run%2B1+2"

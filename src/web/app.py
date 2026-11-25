@@ -32,7 +32,7 @@ from src.contracts.common import (
     PlanValidationError,
     validate_http_origin,
 )
-from src.contracts.models import ActionReceipt, Run
+from src.contracts.models import ActionReceipt, Run, TaskSpec
 from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.storage.errors import ConflictError, NotFoundError
 from src.storage.redaction import (
@@ -103,7 +103,12 @@ def _build_default_credentials() -> dict[tuple[str, str, str], tuple[str, str]]:
     }
     raw_extra = os.environ.get("GROKBOT_CREDENTIALS_JSON", "").strip()
     if raw_extra:
-        parsed = json.loads(raw_extra)
+        try:
+            parsed = json.loads(raw_extra)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid GROKBOT_CREDENTIALS_JSON: {getattr(exc, 'msg', str(exc))}"
+            ) from exc
         if isinstance(parsed, dict):
             for key_str, val in parsed.items():
                 parts = [p.strip() for p in str(key_str).split(":")]
@@ -112,6 +117,10 @@ def _build_default_credentials() -> dict[tuple[str, str, str], tuple[str, str]]:
         elif isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict):
+                    if not all(k in item for k in ("app_id", "username", "password")):
+                        raise ValueError(
+                            "Invalid GROKBOT_CREDENTIALS_JSON entry: missing required key."
+                        )
                     creds[
                         (
                             str(item.get("user_id", "*")),
@@ -119,6 +128,8 @@ def _build_default_credentials() -> dict[tuple[str, str, str], tuple[str, str]]:
                             str(item["app_id"]),
                         )
                     ] = (str(item["username"]), str(item["password"]))
+        else:
+            raise ValueError("Invalid GROKBOT_CREDENTIALS_JSON: expected JSON object or array.")
     return creds
 
 
@@ -184,6 +195,79 @@ def _load_configured_origins_from_path(
             "defines zero configured app origins."
         )
     return {app_cfg.origin for app_cfg in facility_cfg.apps.values()}
+
+
+def _validate_task_origins(
+    task_spec: TaskSpec,
+    active_runtime: GrokbotRuntime | None,
+) -> None:
+    overrides = _env_origin_overrides()
+    raw_inst_env = os.environ.get("GROKBOT_INSTALLATION_CONFIG", "").strip()
+    raw_allowed = os.environ.get("GROKBOT_ALLOWED_ORIGINS", "").strip()
+    configured_origins: set[str] = set()
+    strict_configured_check = False
+
+    if task_spec.installation_config_path is not None:
+        strict_configured_check = True
+        configured_origins = _load_configured_origins_from_path(
+            task_spec.installation_config_path,
+            origin_overrides=overrides,
+        )
+    elif raw_inst_env:
+        strict_configured_check = True
+        configured_origins = _load_configured_origins_from_path(
+            raw_inst_env,
+            origin_overrides=overrides,
+        )
+    elif raw_allowed:
+        strict_configured_check = True
+        for raw_origin in raw_allowed.split(","):
+            if raw_origin.strip():
+                configured_origins.add(validate_http_origin(raw_origin.strip()))
+        if overrides:
+            configured_origins.update(overrides.values())
+    else:
+        if active_runtime is not None:
+            configured_origins.update(
+                app_cfg.origin for app_cfg in active_runtime.facility_config.apps.values()
+            )
+        if configured_origins and overrides:
+            configured_origins.update(overrides.values())
+
+    if task_spec.scope.allowed_origins:
+        if strict_configured_check:
+            if configured_origins:
+                disallowed = [
+                    origin
+                    for origin in task_spec.scope.allowed_origins
+                    if origin not in configured_origins
+                ]
+                if disallowed:
+                    raise ValueError(
+                        f"Unconfigured or disallowed allowed_origins: {disallowed}"
+                    )
+        else:
+            all_apps_overridden = active_runtime is not None and all(
+                app_id in overrides
+                for app_id in active_runtime.facility_config.apps
+            )
+            for origin in task_spec.scope.allowed_origins:
+                parsed_origin = urlparse(origin)
+                hostname = (parsed_origin.hostname or "").lower()
+                is_loopback = hostname in {"127.0.0.1", "localhost", "::1"}
+                if not is_loopback:
+                    raise ValueError(
+                        "Non-loopback allowed_origin requires "
+                        f"installation_config_path: {origin}"
+                    )
+                if (
+                    all_apps_overridden
+                    and configured_origins
+                    and origin not in configured_origins
+                ):
+                    raise ValueError(
+                        f"Unconfigured or disallowed allowed_origins: {[origin]}"
+                    )
 
 
 def _scrub_and_verify(payload: Any, *, label: str = "payload") -> Any:
@@ -526,69 +610,7 @@ def create_app(
     async def api_submit_task(payload: TaskSubmitRequest) -> JSONResponse:
         task_spec = payload.to_task_spec()
         try:
-            overrides = _env_origin_overrides()
-            raw_inst_env = os.environ.get("GROKBOT_INSTALLATION_CONFIG", "").strip()
-            configured_origins: set[str] = set()
-            strict_configured_check = False
-            if task_spec.installation_config_path is not None:
-                strict_configured_check = True
-                configured_origins = _load_configured_origins_from_path(
-                    task_spec.installation_config_path,
-                    origin_overrides=overrides,
-                )
-            elif raw_inst_env:
-                strict_configured_check = True
-                configured_origins = _load_configured_origins_from_path(
-                    raw_inst_env,
-                    origin_overrides=overrides,
-                )
-            else:
-                if active_runtime is not None:
-                    configured_origins.update(
-                        app_cfg.origin for app_cfg in active_runtime.facility_config.apps.values()
-                    )
-                raw_allowed = os.environ.get("GROKBOT_ALLOWED_ORIGINS", "").strip()
-                if raw_allowed:
-                    for raw_origin in raw_allowed.split(","):
-                        if raw_origin.strip():
-                            configured_origins.add(validate_http_origin(raw_origin.strip()))
-                if configured_origins and overrides:
-                    configured_origins.update(overrides.values())
-
-            if task_spec.scope.allowed_origins:
-                if strict_configured_check:
-                    if configured_origins:
-                        disallowed = [
-                            origin
-                            for origin in task_spec.scope.allowed_origins
-                            if origin not in configured_origins
-                        ]
-                        if disallowed:
-                            raise ValueError(
-                                f"Unconfigured or disallowed allowed_origins: {disallowed}"
-                            )
-                else:
-                    all_apps_overridden = active_runtime is not None and all(
-                        app_id in overrides
-                        for app_id in active_runtime.facility_config.apps
-                    )
-                    for origin in task_spec.scope.allowed_origins:
-                        parsed_origin = urlparse(origin)
-                        hostname = (parsed_origin.hostname or "").lower()
-                        is_loopback = hostname in {"127.0.0.1", "localhost", "::1"}
-                        if not is_loopback:
-                            raise ValueError(
-                                "Non-loopback allowed_origin requires "
-                                f"installation_config_path: {origin}"
-                            )
-                        if (
-                            all_apps_overridden
-                            and configured_origins
-                            and origin not in configured_origins
-                        ):
-                            raise ValueError(
-                                f"Unconfigured or disallowed allowed_origins: {[origin]}"
-                            )
+            _validate_task_origins(task_spec, active_runtime)
         except (OSError, ValueError, ValidationError, OriginNotAllowedError) as exc:
             raise HTTPException(
                 status_code=422,
@@ -765,7 +787,14 @@ def create_app(
         )
 
     async def _read_form(request: Request) -> dict[str, str]:
-        raw = (await request.body()).decode("utf-8")
+        body_bytes = await request.body()
+        try:
+            raw = body_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid UTF-8 form body.",
+            ) from exc
         parsed = parse_qs(raw, keep_blank_values=True)
         return {k: vals[0] for k, vals in parsed.items() if vals}
 
@@ -789,15 +818,25 @@ def create_app(
                 allowed_origins=origins_tuple,
                 allowed_areas=areas_tuple,
             )
-            run = await maybe_await(coord.submit_task(req.to_task_spec()))
-        except (ValidationError, ConflictError, PlanValidationError) as exc:
+            task_spec = req.to_task_spec()
+            _validate_task_origins(task_spec, active_runtime)
+            run = await maybe_await(coord.submit_task(task_spec))
+        except (
+            ValidationError,
+            ConflictError,
+            PlanValidationError,
+            OriginNotAllowedError,
+            InvalidStateTransitionError,
+            ValueError,
+            OSError,
+        ) as exc:
             safe_err = str(_scrub_and_verify(str(exc), label="error"))
             return RedirectResponse(
                 url=f"/?error={quote_plus(safe_err)}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
         return RedirectResponse(
-            url=f"/tasks/{run.run_id}",
+            url=f"/tasks/{quote_plus(run.run_id)}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -820,8 +859,9 @@ def create_app(
                 url=f"/tasks/{safe_run_id}?error={quote_plus(safe_err)}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
+        safe_run_id = quote_plus(str(_scrub_and_verify(run_id, label="run_id")))
         return RedirectResponse(
-            url=f"/tasks/{run_id}",
+            url=f"/tasks/{safe_run_id}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 
@@ -844,8 +884,9 @@ def create_app(
                 url=f"/tasks/{safe_run_id}?error={quote_plus(safe_err)}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
+        safe_run_id = quote_plus(str(_scrub_and_verify(run_id, label="run_id")))
         return RedirectResponse(
-            url=f"/tasks/{run_id}",
+            url=f"/tasks/{safe_run_id}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
 

@@ -90,7 +90,10 @@ def _parse_iso_utc(raw: str) -> datetime | None:
         return None
     if cleaned.endswith("Z"):
         cleaned = f"{cleaned[:-1]}+00:00"
-    dt = datetime.fromisoformat(cleaned)
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
     return ensure_utc(dt)
 
 

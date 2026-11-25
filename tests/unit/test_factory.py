@@ -2485,3 +2485,177 @@ def test_evaluate_patch_closes_binary_leak_cross_section_symlink_space_timestamp
         text=True,
     ).stdout.strip()
     assert head_after == base_head
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_03_factory_blocks_symlink_write_in_files_to_modify_and_repro_test(
+    tmp_path: Path,
+) -> None:
+    lab_repo = tmp_path / "lab_repo_t5_03"
+    base_sha = _init_git_repo(lab_repo)
+    acc_dir = lab_repo / "tests" / "acceptance"
+    acc_dir.mkdir(parents=True, exist_ok=True)
+    acc_file = acc_dir / "test_a01.py"
+    acc_file.write_text("def test_a01() -> None:\n    assert False\n", encoding="utf-8")
+    (lab_repo / "lab").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "lab" / "alias.py").symlink_to("../tests/acceptance/test_a01.py")
+    subprocess.run(["git", "-C", str(lab_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "add test_a01 and symlink"],
+        check=True,
+    )
+    base_sha = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    store = FactoryStore(tmp_path / "factory_t5_03.db")
+    engine = FactoryEngine(lab_repo, store)
+    store.add_backlog_item(
+        BacklogItem(
+            item_id="B-SYM-WRITE",
+            title="Symlink tamper attempt",
+            priority=1,
+            hypothesis="Attempt write through symlink",
+            target_metric="failures",
+            baseline_repro_cmd="pytest -q",
+            max_attempts=5,
+        )
+    )
+
+    cand1 = CandidatePatch(
+        candidate_id="cand-sym-1",
+        item_id="B-SYM-WRITE",
+        branch_name="factory/sym-1",
+        hypothesis="Overwrite acceptance via symlink",
+        target_metric="failures",
+        proposal_hash="sym-write-1",
+        files_to_modify={
+            "lab/alias.py": "def test_a01() -> None:\n    assert True\n",
+            "lab/benign.txt": "harmless\n",
+        },
+    )
+    with pytest.raises((PolicyImmutabilityError, IsolationBoundaryError)):
+        engine.run_candidate_cycle(cand1)
+
+    assert "assert False" in acc_file.read_text(encoding="utf-8")
+    assert not (lab_repo / "lab" / "benign.txt").exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base_sha
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == ""
+    )
+
+    cand2 = CandidatePatch(
+        candidate_id="cand-sym-2",
+        item_id="B-SYM-WRITE",
+        branch_name="factory/sym-2",
+        hypothesis="Overwrite acceptance via repro_test_path symlink",
+        target_metric="failures",
+        proposal_hash="sym-write-2",
+        files_to_modify={"lab/benign2.txt": "harmless\n"},
+        repro_test_path="lab/alias.py",
+        repro_test_content="def test_a01() -> None:\n    assert True\n",
+    )
+    with pytest.raises((PolicyImmutabilityError, IsolationBoundaryError)):
+        engine.run_candidate_cycle(cand2)
+
+    assert "assert False" in acc_file.read_text(encoding="utf-8")
+    assert not (lab_repo / "lab" / "benign2.txt").exists()
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_06_evaluate_patch_rejects_deferred_symlink_create_or_modify_plus_rename(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lab_repo = tmp_path / "lab_repo_t5_06"
+    _init_git_repo(lab_repo)
+    (lab_repo / "lab" / "inner").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "lab" / "inner" / "existing_sym").symlink_to("safe_dir")
+    subprocess.run(["git", "-C", str(lab_repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(lab_repo), "commit", "-m", "add safe symlink"], check=True)
+    db_path = tmp_path / "factory_t5_06.db"
+
+    patches = [
+        (
+            "diff --git a/lab/inner/new_sym b/lab/inner/new_sym\n"
+            "new file mode 120000\n"
+            "index 0000000..1111111\n"
+            "--- /dev/null\n"
+            "+++ b/lab/inner/new_sym\n"
+            "@@ -0,0 +1 @@\n"
+            "+tests\n"
+            "diff --git a/lab/inner/new_sym b/sym_to_tests\n"
+            "similarity index 100%\n"
+            "rename from lab/inner/new_sym\n"
+            "rename to sym_to_tests\n"
+        ),
+        (
+            "diff --git a/lab/inner/existing_sym b/lab/inner/existing_sym\n"
+            "index 1111111..2222222 120000\n"
+            "--- a/lab/inner/existing_sym\n"
+            "+++ b/lab/inner/existing_sym\n"
+            "@@ -1 +1 @@\n"
+            "-safe_dir\n"
+            "+../tests\n"
+            "diff --git a/lab/inner/existing_sym b/sym_to_tests\n"
+            "similarity index 100%\n"
+            "rename from lab/inner/existing_sym\n"
+            "rename to sym_to_tests\n"
+        ),
+    ]
+    for idx, ptext in enumerate(patches):
+        pfile = tmp_path / f"t5_06_{idx}.patch"
+        pfile.write_text(ptext, encoding="utf-8")
+        rc = factory_cli_main(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(pfile),
+                "--json",
+            ]
+        )
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_18_isolation_guard_rejects_profile_markers_in_repo_path(
+    tmp_path: Path,
+) -> None:
+    from src.factory.policy import IsolationGuard
+
+    for marker in (".grokbot_profiles", "browser_profiles"):
+        bad_repo = tmp_path / marker / "repo"
+        _init_git_repo(bad_repo)
+        with pytest.raises(IsolationBoundaryError, match="ISOLATION_BOUNDARY_VIOLATION"):
+            IsolationGuard.validate_paths(
+                tmp_path / "clean_factory.db",
+                bad_repo,
+            )

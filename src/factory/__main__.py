@@ -503,6 +503,7 @@ def _handle_evaluate_patch(args: argparse.Namespace) -> int:
             repo_path,
             parsed.renamed_pairs,
             touched_paths=touched,
+            symlink_added_targets=parsed.symlink_added_targets,
         )
         all_symlink_targets = list(
             dict.fromkeys([*parsed.symlink_added_targets, *renamed_symlinks])

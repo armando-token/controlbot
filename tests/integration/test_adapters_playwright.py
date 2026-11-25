@@ -614,3 +614,70 @@ async def test_adapter_alias_scope_areas_unreachable_and_verifier_hardening(
         assert res_multi_contradiction.status == TaskStatus.PARTIAL
         assert len(res_multi_contradiction.contradictions) >= 1
         assert all(c.unresolved for c in res_multi_contradiction.contradictions)
+
+
+@pytest.mark.tier5
+@pytest.mark.n2
+async def test_t5_12_corrupt_meta_navigate_during_takeover_and_lease_reopen_race(
+    tmp_path: Path,
+) -> None:
+    from src.adapters.sessions import SessionOwnershipError, SessionTakenOverError
+
+    scada_app = create_scada_app(fixture_mode="default")
+    async with run_asgi_server(scada_app) as scada_origin:
+        profile_root = tmp_path / "profiles_t5_12"
+        # (a) Corrupt session_meta.json -> SessionOwnershipError
+        for idx, bad_content in enumerate(["{bad json", "[]"]):
+            p_dir = profile_root / f"op{idx}" / "p1" / "scada"
+            p_dir.mkdir(parents=True, exist_ok=True)
+            (p_dir / "session_meta.json").write_text(bad_content, encoding="utf-8")
+            async with SessionManager(profile_root, headless=True) as mgr:
+                with pytest.raises(SessionOwnershipError):
+                    await mgr.open_session(f"op{idx}", "p1", "scada", (scada_origin,))
+
+        # (b) navigate blocked during takeover
+        async with SessionManager(profile_root, headless=True) as mgr:
+            sess = await mgr.open_session("op_nav", "p1", "scada", (scada_origin,))
+            await mgr.request_takeover(sess.session_id, owner="alice", reason="manual")
+            with pytest.raises(SessionTakenOverError):
+                await mgr.navigate(sess.session_id, f"{scada_origin}/alarms")
+            await mgr.release_takeover(sess.session_id, owner="alice")
+
+            # (c) close + reopen + acquire_lease identity check on lease exit
+            lease1 = mgr.acquire_lease(sess.session_id)
+            await lease1.__aenter__()
+            await mgr.close_session(sess.session_id)
+            sess2 = await mgr.open_session("op_nav", "p1", "scada", (scada_origin,))
+            async with mgr.acquire_lease(sess2.session_id):
+                await lease1.__aexit__(None, None, None)
+                state2 = await mgr.get_session_state(sess2.session_id)
+                assert state2 is not None
+                assert state2.active_lease is True
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_17_malformed_adapter_timestamp_yields_none_and_unauthorized() -> None:
+    from src.adapters.maintenance import _parse_iso_utc as maint_parse_iso_utc
+    from src.adapters.scada import _parse_iso_utc as scada_parse_iso_utc
+    from src.contracts.models import EvidenceRequirements
+
+    assert scada_parse_iso_utc("not-a-date") is None
+    assert maint_parse_iso_utc("not-a-date") is None
+
+    obs = Observation(
+        source="scada",
+        session_id="op__p1__scada",
+        asset_id="bomba-34-a1",
+        observed_label="bomba 34",
+        value="HIGH_VIBRATION",
+        unit="alarm_code",
+        source_time=scada_parse_iso_utc("not-a-date"),
+        quality=DataQuality.GOOD,
+        area="area-1",
+    )
+    verified = Verifier().verify_observation(
+        obs, EvidenceRequirements(require_source_timestamp=True)
+    )
+    assert verified.authorized_evidence is False
+    assert "missing_source_time" in verified.metadata.get("rejection_reasons", [])

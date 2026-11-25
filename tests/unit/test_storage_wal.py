@@ -570,3 +570,29 @@ def test_strict_redaction_scrubs_and_detects_secret_dict_keys_and_auth_tokens(
     )
     with pytest.raises(ValueError, match="unredacted secret"):
         repo.append_receipt(bad_key_rcpt)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_16_redaction_suffixed_token_and_punctuation_adjacent_redacted() -> None:
+    raw_url = "https://scada.local/api?my_service_token=secret123&other=ok"
+    assert contains_unredacted_secret_strict(raw_url) is True
+    scrubbed = redact_string_strict(raw_url)
+    assert scrubbed == "https://scada.local/api?my_service_token=[REDACTED]&other=ok"
+    assert contains_unredacted_secret_strict(scrubbed) is False
+
+    assert contains_unredacted_secret_strict("Bearer [REDACTED], next") is False
+    assert contains_unredacted_secret_strict({"msg": "Basic [REDACTED]; done"}) is False
+    assert contains_unredacted_secret_strict("Bearer real_secret_abc, next") is True
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_17_duplicate_run_id_raises_conflict_error(tmp_path: Path) -> None:
+    from src.storage.errors import ConflictError
+
+    repo = StorageRepo(tmp_path / "dup_run.db", clock=FakeClock())
+    repo.init_db()
+    repo.create_task_and_run(_make_task("t-dup-1"), run_id="run-shared-id")
+    with pytest.raises(ConflictError, match="already exists"):
+        repo.create_task_and_run(_make_task("t-dup-2"), run_id="run-shared-id")

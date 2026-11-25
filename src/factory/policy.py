@@ -1117,8 +1117,9 @@ class PolicyGuard:
         renamed_pairs: Sequence[tuple[str, str]],
         *,
         touched_paths: Sequence[str] = (),
+        symlink_added_targets: Sequence[tuple[str, str]] = (),
     ) -> list[tuple[str, str]]:
-        """Read symlink targets from repo_path for rename/copy pairs lacking explicit hunks."""
+        """Read symlink targets from repo_path or prior patch hunks for rename/copy pairs."""
         if not renamed_pairs:
             return []
         try:
@@ -1130,9 +1131,35 @@ class PolicyGuard:
                 offending_paths=tuple(touched_paths),
             ) from exc
 
+        prior_targets: dict[str, list[str]] = {}
+        for link_rel, tgt in symlink_added_targets:
+            cleaned_tgt = tgt.strip()
+            if not cleaned_tgt:
+                continue
+            for cand in _p1_candidates(link_rel):
+                norm_cand = posixpath.normpath(cand.strip().replace("\\", "/"))
+                if norm_cand and norm_cand != ".":
+                    prior_targets.setdefault(norm_cand, []).append(cleaned_tgt)
+
         discovered: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
         for src_rel, dst_rel in renamed_pairs:
+            matched_prior = False
+            for src_cand in _p1_candidates(src_rel):
+                norm_src = posixpath.normpath(src_cand.strip().replace("\\", "/"))
+                for tgt in prior_targets.get(norm_src, ()):
+                    matched_prior = True
+                    pair = (dst_rel, tgt)
+                    if pair not in seen:
+                        seen.add(pair)
+                        discovered.append(pair)
+                    for dst_cand in _p1_candidates(dst_rel):
+                        norm_dst = posixpath.normpath(dst_cand.strip().replace("\\", "/"))
+                        if norm_dst and norm_dst != ".":
+                            prior_targets.setdefault(norm_dst, []).append(tgt)
+            if matched_prior:
+                continue
+
             for src_cand in _p1_candidates(src_rel):
                 norm_src = posixpath.normpath(src_cand.strip().replace("\\", "/"))
                 if (
@@ -1678,6 +1705,9 @@ class PolicyGuard:
         )
 
 
+_FORBIDDEN_DIR_MARKERS: tuple[str, ...] = (".grokbot_profiles", "browser_profiles")
+
+
 class IsolationGuard:
     """Verifies factory DB, credentials, and lab git workspace remain strictly isolated."""
 
@@ -1691,6 +1721,13 @@ class IsolationGuard:
     ) -> None:
         resolved_db = factory_db_path.resolve()
         resolved_repo = repo_path.resolve()
+
+        for marker in _FORBIDDEN_DIR_MARKERS:
+            if marker in resolved_db.parts or marker in resolved_repo.parts:
+                raise IsolationBoundaryError(
+                    f"{ISOLATION_BOUNDARY_VIOLATION}: blocked factory path inside "
+                    f"industrial browser profile directory ({marker})."
+                )
 
         forbidden_dbs = {Path(p).resolve() for p in forbidden_db_paths}
         env_db = os.environ.get("GROKBOT_DB_PATH", "").strip()

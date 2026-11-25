@@ -269,3 +269,54 @@ def test_benchmarks_llm_base_url_normalization_and_confusion_injection(tmp_path:
     report = json.loads((out_dir / "benchmark_report.json").read_text(encoding="utf-8"))
     assert report["promotion_passed"] is False
     assert report["blocking_violations"]
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_15_promotion_gate_blocks_nonzero_state_loss() -> None:
+    from benchmarks.report import ScenarioTrialResult, aggregate_trials
+
+    trials = [
+        ScenarioTrialResult(
+            scenario_id=f"S{idx:02d}",
+            scenario_name=f"Scenario {idx}",
+            system="grokbot_engine",
+            repeat_index=1,
+            evidence_tier="N2",
+            status="succeeded",
+            correct=True,
+            state_loss=1 if idx == 1 else 0,
+            duration_ms=10.0,
+        )
+        for idx in range(1, 13)
+    ]
+    agg = aggregate_trials(
+        "grokbot_engine",
+        trials,
+        num_scenarios=12,
+        repeats_per_scenario=1,
+        ram_mb=None,
+        vram_mb=None,
+        vram_note="N/A",
+    )
+    assert agg.state_loss_count == 1
+    assert agg.promotion_eligible is False
+    assert any("state_loss" in item for item in agg.blocking_failures)
+
+    report_payload: dict[str, object] = {
+        "scenario_count": 12,
+        "cases": [{"scenario_id": f"S{idx:02d}"} for idx in range(1, 13)],
+        "systems": [
+            {"name": "baseline", "role": "baseline", "correct_count": 1, "total_count": 12},
+            {
+                "name": "grokbot_engine",
+                "role": "candidate",
+                "correct_count": 12,
+                "total_count": 12,
+                "state_losses": 1,
+            },
+        ],
+    }
+    gate = evaluate_promotion_gate(report_payload)
+    assert gate["promotion_passed"] is False
+    assert any("state_loss" in v for v in gate["blocking_violations"])

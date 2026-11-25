@@ -342,10 +342,8 @@ class Verifier:
                     )
 
             # 2b. Cross-source conflicts across ALL observations from distinct sources
-            if len(per_source) == 1:
-                sole_source = source_names[0]
-                sole_obs_list = per_source[sole_source]
-                for obs in sole_obs_list:
+            def _flag_unconfigured_obs(obs_seq: Sequence[Observation]) -> None:
+                for obs in obs_seq:
                     if _resolve_asset_mapping_any_source(obs, config) is not None:
                         continue
                     label_mapped = _resolve_asset_mapping_by_label(obs, config)
@@ -406,6 +404,9 @@ class Verifier:
                                 unresolved=True,
                             )
                         )
+
+            if len(per_source) == 1:
+                _flag_unconfigured_obs(per_source[source_names[0]])
                 continue
             if len(per_source) < 2:
                 continue
@@ -441,6 +442,9 @@ class Verifier:
                         unresolved=True,
                     )
                 )
+            else:
+                for source_name in source_names:
+                    _flag_unconfigured_obs(per_source[source_name])
 
         return tuple(contradictions)
 
@@ -642,8 +646,16 @@ class Verifier:
                 + "; ".join(c.summary for c in contradictions)
             )
 
+        insufficient_sources = len(available_sources) < task.evidence_requirements.min_sources
+        if insufficient_sources:
+            answer_parts.append(
+                f"Insufficient authorized sources: got {len(available_sources)} "
+                f"({', '.join(available_sources) or 'none'}), "
+                f"required min_sources={task.evidence_requirements.min_sources}."
+            )
+
         partial_info: dict[str, Any] | None = None
-        if errors_dict or rejected_obs:
+        if errors_dict or rejected_obs or insufficient_sources:
             partial_info = {
                 "available_sources": available_sources,
                 "missing_sources": missing_sources,
@@ -651,12 +663,15 @@ class Verifier:
                 "rejected_record_ids": [
                     o.metadata.get("record_id", o.asset_id) for o in rejected_obs
                 ],
+                "min_sources": task.evidence_requirements.min_sources,
             }
 
-        has_partial_source_failure = bool(errors_dict) and (
+        has_partial_source_failure = (bool(errors_dict) or insufficient_sources) and (
             task.evidence_requirements.allow_partial_on_source_failure
         )
-        if errors_dict and not task.evidence_requirements.allow_partial_on_source_failure:
+        if (
+            errors_dict or insufficient_sources
+        ) and not task.evidence_requirements.allow_partial_on_source_failure:
             final_status = TaskStatus.FAILED
         elif contradictions or has_partial_source_failure:
             final_status = TaskStatus.PARTIAL
