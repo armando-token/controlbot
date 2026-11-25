@@ -616,21 +616,6 @@ def make_industrial_turn_factory(
 
         chosen_area = _extract_chosen_area(prompt_ctx, config)
         asset_query = _infer_asset_query(prompt_ctx.query, config)
-        if (
-            prompt_ctx.depth == 0
-            and chosen_area is None
-            and len(prompt_ctx.allowed_areas) >= 2
-        ):
-            return EmulatedTurn(
-                decision=ModelDecision(
-                    decision_type="request_input",
-                    required_action=(
-                        f"Ambiguous area scope for {asset_query} across "
-                        f"{', '.join(prompt_ctx.allowed_areas)}; specify target area."
-                    ),
-                    usage=usage,
-                )
-            )
 
         # Depth=1 child delegation when min_sources >= 2 and both SCADA & Maint are available
         scada_tools = tuple(

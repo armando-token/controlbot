@@ -472,7 +472,7 @@ async def test_coordinator_accumulates_human_inputs_chronologically_across_resum
 
 
 @pytest.mark.n1
-def test_make_industrial_turn_factory_pre_tool_disambiguation_and_area_requery() -> None:
+def test_make_industrial_turn_factory_area_resolution_and_requery() -> None:
     from src.adapters.config import load_facility_config
     from src.adapters.maintenance import get_maintenance_tool_specs
     from src.adapters.scada import get_scada_tool_specs
@@ -494,8 +494,8 @@ def test_make_industrial_turn_factory_pre_tool_disambiguation_and_area_requery()
         tokens_remaining=24000,
     )
 
-    # 1. Pre-tool disambiguation when >=2 areas allowed and no area chosen yet
-    pause_turn = turn_factory(
+    # 1. Unscoped multi-area initial turn queries source without area so Verifier checks records
+    initial_turn = turn_factory(
         PromptContext(
             task_id="t-ambig",
             run_id="r-ambig",
@@ -511,10 +511,11 @@ def test_make_industrial_turn_factory_pre_tool_disambiguation_and_area_requery()
         tools,
         budget,
     )
-    assert isinstance(pause_turn.decision, ModelDecision)
-    assert pause_turn.decision.decision_type == "request_input"
-    req_action = pause_turn.decision.required_action or ""
-    assert "area-1" in req_action and "area-2" in req_action
+    assert isinstance(initial_turn.decision, ModelDecision)
+    assert initial_turn.decision.decision_type == "tool_call"
+    assert initial_turn.decision.tool_call is not None
+    assert initial_turn.decision.tool_call.tool_id == "scada.read_alarms"
+    assert "area" not in initial_turn.decision.tool_call.args
 
     # 2. If chosen_area is set and prior tool call lacked area, re-query with area
     requery_turn = turn_factory(
