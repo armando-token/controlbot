@@ -142,6 +142,7 @@ class PromptContext(FrozenModel):
     observations: tuple[Observation, ...] = ()
     human_input: dict[str, Any] | None = None
     turn_index: int = Field(default=0, ge=0)
+    min_sources: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _enforce_no_secrets(self) -> PromptContext:

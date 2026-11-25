@@ -7,7 +7,7 @@ import contextlib
 import inspect
 import uuid
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import Field
@@ -371,11 +371,15 @@ class Coordinator:
         return result
 
     async def recover_inflight_runs(
-        self, coordinator_id: str | None = None
+        self,
+        coordinator_id: str | None = None,
+        *,
+        assume_previous_worker_dead: bool = False,
     ) -> RecoverySummary:
         """Recover interrupted runs, expired leases, UNKNOWN effects (A08), and budgets (A14)."""
         del coordinator_id
         now = self._now()
+        cutoff = now + timedelta(days=1) if assume_previous_worker_dead else now
         expired_res_cleaned = 0
         reset_steps = 0
         unknown_reconciled = 0
@@ -383,9 +387,9 @@ class Coordinator:
         recovered_run_ids: set[str] = set()
 
         # Step A: Reconcile expired budget reservations (and active reservations on expired steps)
-        expired_step_ids = {s.step_id for s in self._repo.list_expired_leased_steps(as_of=now)}
+        expired_step_ids = {s.step_id for s in self._repo.list_expired_leased_steps(as_of=cutoff)}
         seen_res_ids: set[str] = set()
-        for res in self._repo.list_expired_reservations(as_of=now):
+        for res in self._repo.list_expired_reservations(as_of=cutoff):
             seen_res_ids.add(res.reservation_id)
             if self._repo.try_expire_stranded_reservation(res.reservation_id):
                 expired_res_cleaned += 1
@@ -399,10 +403,10 @@ class Coordinator:
                     expired_res_cleaned += 1
 
         # Step B: Inspect expired step leases (atomic, race-safe across concurrent coordinators)
-        for step in self._repo.list_expired_leased_steps(as_of=now):
+        for step in self._repo.list_expired_leased_steps(as_of=cutoff):
             if step.status in (StepStatus.LEASED, StepStatus.PREPARED):
                 if (
-                    self._repo.try_reset_pre_exec_step_to_pending(step.step_id, as_of=now)
+                    self._repo.try_reset_pre_exec_step_to_pending(step.step_id, as_of=cutoff)
                     is not None
                 ):
                     recovered_run_ids.add(step.run_id)
@@ -411,7 +415,7 @@ class Coordinator:
                 step.status in (StepStatus.EXECUTING, StepStatus.VERIFYING)
                 and self._repo.try_mark_expired_inflight_step_unknown(
                     step.step_id,
-                    as_of=now,
+                    as_of=cutoff,
                     reason="crash_recovery_lease_expired_in_flight",
                 )
                 is not None
@@ -837,6 +841,7 @@ class Coordinator:
                 observations=tuple(observations),
                 human_input=safe_human,
                 turn_index=turn_index,
+                min_sources=task_spec.evidence_requirements.min_sources,
             )
             reserve_tokens = self._budget_manager.estimate_model_reserve_tokens(
                 prompt_ctx,
@@ -1501,7 +1506,7 @@ class Coordinator:
                 )
                 return paused_res
 
-            # Handle ambiguous EFFECT timeout -> StepStatus.UNKNOWN + human review (A08)
+            # Ambiguous EFFECT timeout -> reconcile if registered, else pause (A08)
             if exec_result.outcome == ReceiptOutcome.UNKNOWN_NEEDS_RECONCILIATION:
                 try:
                     self._repo.mark_step_unknown(
@@ -1519,6 +1524,55 @@ class Coordinator:
                         observations=tuple(observations),
                         contradictions=tuple(contradictions),
                     )
+                if self._tool_registry.get_reconciler(tool_id) is not None:
+                    rec_details = self._repo.get_step_execution_details(leased.step_id)
+                    rec_snap = self._repo.get_run_snapshot(run_id)
+                    outcome_kind = await self._reconcile_unknown_effect(rec_details, rec_snap)
+                    if outcome_kind == "reconciled":
+                        reconciled_snap = self._repo.get_run_snapshot(run_id)
+                        latest_receipt = next(
+                            (
+                                r
+                                for r in reversed(reconciled_snap.receipts)
+                                if r.step_id == leased.step_id
+                            ),
+                            None,
+                        )
+                        history.append(
+                            {
+                                "tool_id": tool_id,
+                                "args": exec_result.receipt.redacted_args,
+                                "outcome": ReceiptOutcome.SUCCEEDED.value,
+                                "output": (
+                                    latest_receipt.observed_after
+                                    if latest_receipt is not None
+                                    else None
+                                ),
+                                "error": None,
+                            }
+                        )
+                        return None
+                    if outcome_kind == "retry":
+                        local_retries += 1
+                        continue
+                    if outcome_kind == "waiting_for_human":
+                        paused_snap = self._repo.get_run_snapshot(run_id)
+                        req_action = (
+                            paused_snap.run.required_action
+                            or f"Human review required for unconfirmed effect {op_key} ({tool_id})"
+                        )
+                        usage_now = self._repo.get_budget_usage(task_id)
+                        return Result(
+                            task_id=task_id,
+                            run_id=run_id,
+                            status=TaskStatus.WAITING_FOR_INPUT,
+                            answer=req_action,
+                            verified_observations=tuple(observations),
+                            contradictions=tuple(contradictions),
+                            required_action=req_action,
+                            execution_metrics=self._budget_manager.to_execution_metrics(usage_now),
+                        )
+
                 req_action = (
                     f"Human review required for unconfirmed effect {op_key} ({tool_id})"
                 )

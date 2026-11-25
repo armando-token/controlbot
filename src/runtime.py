@@ -35,7 +35,7 @@ from src.adapters.sessions import (
 )
 from src.adapters.verifier import Verifier
 from src.contracts.common import InvalidStateTransitionError, PlanValidationError, utc_now
-from src.contracts.enums import BackendMode, is_terminal_status
+from src.contracts.enums import BackendMode, TaskStatus, is_terminal_status
 from src.contracts.models import Observation, Result, Run, TaskSpec, ToolSpec
 from src.engine.coordinator import Coordinator, CoordinatorConfig, ResultVerifier
 from src.engine.tool_registry import (
@@ -52,6 +52,7 @@ from src.model.protocol import (
     BudgetRemaining,
     ModelClient,
     ModelDecision,
+    ModelDelegationRequest,
     ModelProtocolError,
     ModelToolCall,
     ModelUsage,
@@ -210,10 +211,16 @@ def register_industrial_tools(
                 "evidence_refs": list(receipt.evidence_refs),
             }
 
-        registry.register(scada_specs["scada.read_alarms"], _handle_scada_alarms, replace=replace)
+        registry.register(
+            scada_specs["scada.read_alarms"],
+            _handle_scada_alarms,
+            is_poller=True,
+            replace=replace,
+        )
         registry.register(
             scada_specs["scada.read_readings"],
             _handle_scada_readings,
+            is_poller=True,
             replace=replace,
         )
 
@@ -265,6 +272,7 @@ def register_industrial_tools(
         registry.register(
             maint_specs["maint.read_work_orders"],
             _handle_maint_work_orders,
+            is_poller=True,
             replace=replace,
         )
 
@@ -428,6 +436,42 @@ def build_industrial_result_verifier(
     return _verify
 
 
+def _infer_effect_asset_id(query: str, config: FacilityConfig) -> str:
+    m = re.search(r"\basset_id\s*=\s*([A-Za-z0-9_.-]+)", query, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    for asset in config.assets:
+        if asset.asset_id.lower() in query.lower():
+            return asset.asset_id
+    m_on = re.search(r"\bon\s+([A-Za-z0-9_.-]+)", query, re.IGNORECASE)
+    if m_on:
+        return m_on.group(1)
+    if config.assets:
+        return config.assets[0].asset_id
+    return "bomba-34-a1"
+
+
+def _infer_effect_action(query: str) -> str:
+    m_eq = re.search(r"\baction\s*=\s*([A-Za-z0-9_.-]+)", query, re.IGNORECASE)
+    if m_eq:
+        return m_eq.group(1)
+    m_apply = re.search(r"\bapply\s+([A-Za-z0-9_.-]+)", query, re.IGNORECASE)
+    if m_apply:
+        return m_apply.group(1)
+    return "ack_alarm"
+
+
+def _infer_effect_operation_key(query: str, run_id: str) -> str:
+    m = re.search(
+        r"\b(?:idempotency_key|operation_key)\s*=\s*([A-Za-z0-9_.:-]+)",
+        query,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    return f"op-{run_id}"
+
+
 def make_industrial_turn_factory(
     config: FacilityConfig,
 ) -> Callable[[PromptContext, Sequence[ToolSpec], BudgetRemaining], EmulatedTurn]:
@@ -438,7 +482,6 @@ def make_industrial_turn_factory(
         tools: Sequence[ToolSpec],
         budget_remaining: BudgetRemaining,
     ) -> EmulatedTurn:
-        del budget_remaining
         usage = ModelUsage(
             prompt_tokens=48,
             completion_tokens=24,
@@ -452,6 +495,120 @@ def make_industrial_turn_factory(
             if isinstance(item, dict) and item.get("tool_id")
         ]
 
+        # Depth=1 child delegation when min_sources >= 2 and both SCADA & Maint are available
+        scada_tools = tuple(
+            tid for tid in ("scada.read_alarms", "scada.read_readings") if tid in tool_map
+        )
+        if (
+            prompt_ctx.depth == 0
+            and prompt_ctx.turn_index == 0
+            and not prompt_ctx.history
+            and prompt_ctx.min_sources >= 2
+            and budget_remaining.depth_remaining >= 1
+            and budget_remaining.active_children_remaining >= 2
+            and scada_tools
+            and "maint.read_work_orders" in tool_map
+        ):
+            scada_origins = tuple(
+                dict.fromkeys(
+                    origin
+                    for tid in scada_tools
+                    for origin in tool_map[tid].allowed_origins
+                )
+            )
+            maint_origins = tuple(tool_map["maint.read_work_orders"].allowed_origins)
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="delegate",
+                    delegations=(
+                        ModelDelegationRequest(
+                            child_label="scada-branch",
+                            query=prompt_ctx.query,
+                            allowed_tools=scada_tools,
+                            allowed_origins=scada_origins,
+                            allowed_areas=prompt_ctx.allowed_areas,
+                            read_only=True,
+                        ),
+                        ModelDelegationRequest(
+                            child_label="maint-branch",
+                            query=prompt_ctx.query,
+                            allowed_tools=("maint.read_work_orders",),
+                            allowed_origins=maint_origins,
+                            allowed_areas=prompt_ctx.allowed_areas,
+                            read_only=True,
+                        ),
+                    ),
+                    usage=usage,
+                )
+            )
+
+        # Effect tools when explicitly targeted or requested by query
+        low_q = prompt_ctx.query.lower()
+        effect_only_scope = bool(tool_map) and set(tool_map) <= {
+            "effect.apply",
+            "effect.inspect_state",
+        }
+        effect_requested = effect_only_scope or any(
+            tok in low_q
+            for tok in (
+                "idempotency_key=",
+                "operation_key=",
+                "fail_after_apply=",
+                "reset_latch",
+                "effect.apply",
+            )
+        )
+        if effect_requested:
+            op_key = _infer_effect_operation_key(prompt_ctx.query, prompt_ctx.run_id)
+            if "effect.apply" in tool_map and "effect.apply" not in called_tools:
+                spec = tool_map["effect.apply"]
+                asset_id = _infer_effect_asset_id(prompt_ctx.query, config)
+                action = _infer_effect_action(prompt_ctx.query)
+                fail_after = bool(
+                    re.search(r"fail_after_apply\s*=\s*true", prompt_ctx.query, re.IGNORECASE)
+                )
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="tool_call",
+                        tool_call=ModelToolCall(
+                            tool_id="effect.apply",
+                            args={
+                                "operation_key": op_key,
+                                "asset_id": asset_id,
+                                "action": action,
+                                "fail_after_apply": fail_after,
+                            },
+                            target_origin=(
+                                spec.allowed_origins[0] if spec.allowed_origins else None
+                            ),
+                            completion_verifier=spec.verifier_name,
+                            rationale=f"Apply effect {action} on {asset_id}.",
+                        ),
+                        usage=usage,
+                    )
+                )
+            if (
+                "effect.inspect_state" in tool_map
+                and "effect.apply" not in tool_map
+                and "effect.inspect_state" not in called_tools
+            ):
+                spec = tool_map["effect.inspect_state"]
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="tool_call",
+                        tool_call=ModelToolCall(
+                            tool_id="effect.inspect_state",
+                            args={"operation_key": op_key},
+                            target_origin=(
+                                spec.allowed_origins[0] if spec.allowed_origins else None
+                            ),
+                            completion_verifier=spec.verifier_name,
+                            rationale=f"Inspect effect state for {op_key}.",
+                        ),
+                        usage=usage,
+                    )
+                )
+
         chosen_area: str | None = None
         if len(prompt_ctx.allowed_areas) == 1:
             chosen_area = prompt_ctx.allowed_areas[0]
@@ -461,6 +618,21 @@ def make_industrial_turn_factory(
                 chosen_area = raw_area.strip()
 
         asset_query = _infer_asset_query(prompt_ctx.query, config)
+        has_delegations = any(
+            isinstance(item, dict) and "delegation" in item for item in prompt_ctx.history
+        )
+        if has_delegations:
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="final",
+                    final_answer=(
+                        f"Collected {len(prompt_ctx.observations)} observation(s) "
+                        f"for {asset_query} via child delegations."
+                    ),
+                    usage=usage,
+                )
+            )
+
         plan_order = ("scada.read_alarms", "scada.read_readings", "maint.read_work_orders")
         for tool_id in plan_order:
             if tool_id in tool_map and tool_id not in called_tools:
@@ -724,7 +896,15 @@ class GrokbotRuntime:
 
     async def __aenter__(self) -> GrokbotRuntime:
         await self.session_manager.start()
-        await self.coordinator.recover_inflight_runs()
+        await self.coordinator.recover_inflight_runs(assume_previous_worker_dead=True)
+        if self.web_coordinator._auto_run:
+            for run in self.repo.list_inflight_runs():
+                if run.depth == 0 and run.status in (
+                    TaskStatus.QUEUED,
+                    TaskStatus.RUNNING,
+                    TaskStatus.RECOVERING,
+                ):
+                    self.web_coordinator._schedule_run(run.run_id)
         return self
 
     async def __aexit__(self, *_: Any) -> None:

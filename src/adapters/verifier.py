@@ -532,7 +532,7 @@ class Verifier:
                 run_id=run_id,
                 status=TaskStatus.WAITING_FOR_INPUT,
                 answer=ambiguity_action,
-                verified_observations=verified_obs,
+                verified_observations=(),
                 required_action=ambiguity_action,
                 execution_metrics=exec_metrics,
             )

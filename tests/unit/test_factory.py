@@ -598,3 +598,115 @@ def test_factory_cli_run_empty_backlog_and_force_fail_pause_cleanly(
         text=True,
     ).stdout.strip()
     assert head_after == base_head
+
+
+@pytest.mark.n1
+def test_factory_cli_evaluate_patch_and_run_cycle_exhaustion_and_md_backlog(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lab_repo = tmp_path / "lab_repo"
+    _init_git_repo(lab_repo)
+    base_head = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    db_path = tmp_path / "factory_cli.db"
+
+    tamper_patch = tmp_path / "tamper.patch"
+    tamper_patch.write_text(
+        "diff --git a/src/engine/tool_registry.py b/src/engine/tool_registry.py\n"
+        "--- a/src/engine/tool_registry.py\n"
+        "+++ b/src/engine/tool_registry.py\n"
+        "@@ -1 +1 @@\n"
+        "-ALLOW = False\n"
+        "+ALLOW = True\n",
+        encoding="utf-8",
+    )
+    rc_eval = factory_cli_main(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--factory-db",
+            str(db_path),
+            "--patch",
+            str(tamper_patch),
+            "--json",
+        ]
+    )
+    captured_eval = capsys.readouterr()
+    assert rc_eval == 1
+    assert "POLICY_IMMUTABILITY_VIOLATION" in captured_eval.out
+    assert (
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base_head
+    )
+
+    backlog_md = tmp_path / "BACKLOG.md"
+    backlog_md.write_text("- [ ] `B-MD-01`: Fix asset confusion in lookup.\n", encoding="utf-8")
+    out_dir = tmp_path / "out_cycle"
+    rc_rej = factory_cli_main(
+        [
+            "run-cycle",
+            "--repo",
+            str(lab_repo),
+            "--factory-db",
+            str(db_path),
+            "--backlog",
+            str(backlog_md),
+            "--candidate-mode",
+            "reject-asset-confusion",
+            "--output-dir",
+            str(out_dir),
+            "--json",
+        ]
+    )
+    captured_rej = capsys.readouterr()
+    assert rc_rej == 0
+    rej_payload = json.loads(captured_rej.out)
+    assert rej_payload["status"] == "REJECTED"
+    assert Path(rej_payload["regression_test_path"]).is_file()
+
+    db_ex = tmp_path / "factory_ex.db"
+    rc_ex1 = factory_cli_main(
+        [
+            "run-cycle",
+            "--repo",
+            str(lab_repo),
+            "--factory-db",
+            str(db_ex),
+            "--max-attempts",
+            "2",
+            "--simulate-exhaustion",
+            "--json",
+        ]
+    )
+    assert rc_ex1 == 0
+    ex1 = json.loads(capsys.readouterr().out)
+    assert ex1["attempts_used"] == 1
+
+    rc_ex2 = factory_cli_main(
+        [
+            "run-cycle",
+            "--repo",
+            str(lab_repo),
+            "--factory-db",
+            str(db_ex),
+            "--max-attempts",
+            "2",
+            "--simulate-exhaustion",
+            "--json",
+        ]
+    )
+    assert rc_ex2 == 0
+    ex2 = json.loads(capsys.readouterr().out)
+    assert ex2["attempts_used"] == 2
+    assert "PAUSED" in ex2["status"]

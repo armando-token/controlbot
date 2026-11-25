@@ -350,3 +350,62 @@ def test_deploy_config_human_output_install_and_manifest_fields(
         assert rows == [("intact",)]
     finally:
         check_conn.close()
+
+
+@pytest.mark.n1
+def test_deploy_validate_and_manage_upgrade_and_rollback(tmp_path: Path) -> None:
+    import sqlite3
+
+    from deploy.manage import main as deploy_manage_main
+
+    bad_cfg = tmp_path / "bad_deploy.json"
+    bad_cfg.write_text(
+        json.dumps(
+            {
+                "allowed_origins": ["https://external.invalid"],
+                "permissions": ["scada:read"],
+                "policy_version": "1.0.0",
+                "backend_mode": "emulated",
+                "ports": {"web": 8080},
+                "storage_path": str(tmp_path / "unused.sqlite3"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    bad_proc = subprocess.run(
+        [sys.executable, "-m", "deploy.validate", "--config", str(bad_cfg)],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad_proc.returncode != 0
+
+    db_path = tmp_path / "runtime_wal.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("CREATE TABLE sentinel (id INTEGER PRIMARY KEY, val TEXT);")
+    conn.execute("INSERT INTO sentinel (val) VALUES ('keep-me');")
+    conn.commit()
+    conn.close()
+
+    work_dir = tmp_path / "deploy_work"
+    rc = deploy_manage_main(
+        [
+            "upgrade-and-rollback",
+            "--config",
+            str(_REPO_ROOT / "deploy" / "install_config.yaml"),
+            "--db-path",
+            str(db_path),
+            "--work-dir",
+            str(work_dir),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert (work_dir / "current_release.json").is_file()
+    check_conn = sqlite3.connect(db_path)
+    try:
+        assert check_conn.execute("SELECT val FROM sentinel;").fetchall() == [("keep-me",)]
+    finally:
+        check_conn.close()

@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -286,16 +287,35 @@ def _trial_detail(
     return "; ".join(parts)
 
 
+def _normalize_llm_url(raw_url: str) -> tuple[str, str]:
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme and parsed.netloc:
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path.rstrip("/")
+        endpoint_path = (
+            "/v1/chat/completions"
+            if path in {"", "/v1"}
+            else f"{path}/chat/completions"
+        )
+        return origin, endpoint_path
+    return raw_url.strip(), "/v1/chat/completions"
+
+
 def _make_model_kwargs(
     *,
     mode: BenchmarkMode,
     llm_origin: str | None,
+    llm_endpoint_path: str = "/v1/chat/completions",
     model_id: str,
 ) -> tuple[BackendMode, LocalModelConfig | None, LocalHttpModelClient | None]:
     if mode == "local_http":
         if llm_origin is None:
             raise ValueError("local_http mode requires a validated loopback llm_origin.")
-        cfg = LocalModelConfig(origin=llm_origin, model_id=model_id)
+        cfg = LocalModelConfig(
+            origin=llm_origin,
+            endpoint_path=llm_endpoint_path,
+            model_id=model_id,
+        )
         return BackendMode.LOCAL_HTTP, cfg, LocalHttpModelClient(cfg)
     return BackendMode.EMULATED, None, None
 
@@ -307,6 +327,7 @@ async def _run_engine_scenario(
     tmp_dir: Path,
     mode: BenchmarkMode,
     llm_origin: str | None,
+    llm_endpoint_path: str = "/v1/chat/completions",
     model_id: str,
 ) -> ScenarioTrialResult:
     if scenario.n3_pending:
@@ -329,7 +350,10 @@ async def _run_engine_scenario(
     trial_dir = tmp_dir / f"{sid}_r{repeat_index}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     backend_mode, local_cfg, http_client = _make_model_kwargs(
-        mode=mode, llm_origin=llm_origin, model_id=model_id
+        mode=mode,
+        llm_origin=llm_origin,
+        llm_endpoint_path=llm_endpoint_path,
+        model_id=model_id,
     )
 
     if sid == "A01":
@@ -1739,8 +1763,10 @@ async def run_benchmarks(
     repeats: int = 1,
     scenarios: Sequence[str] | None = None,
     llm_origin: str | None = None,
+    llm_endpoint_path: str = "/v1/chat/completions",
     model_id: str = "qwen2.5-7b-instruct",
     command_str: str = "python -m benchmarks.runner",
+    inject_asset_confusion: bool = False,
 ) -> BenchmarkReport:
     """Execute paired RuleBasedBaseline vs GrokbotEngine benchmarks and return BenchmarkReport."""
     if repeats < 1:
@@ -1799,6 +1825,7 @@ async def run_benchmarks(
                                 tmp_dir=tmp_path,
                                 mode=mode,
                                 llm_origin=mock_origin,
+                                llm_endpoint_path="/v1/chat/completions",
                                 model_id=model_id,
                             )
                         )
@@ -1814,9 +1841,25 @@ async def run_benchmarks(
                             tmp_dir=tmp_path,
                             mode=mode,
                             llm_origin=eff_origin,
+                            llm_endpoint_path=llm_endpoint_path,
                             model_id=model_id,
                         )
                     )
+
+    if inject_asset_confusion:
+        for idx, trial in enumerate(trials):
+            if trial.system == "grokbot_engine" and trial.executed:
+                trials[idx] = trial.model_copy(
+                    update={
+                        "correct": False,
+                        "wrong_asset_attribution": True,
+                        "status": "wrong_asset_injected",
+                        "detail": (
+                            "Injected synthetic wrong asset attribution for gate verification."
+                        ),
+                    }
+                )
+                break
 
     baseline_trials = [t for t in trials if t.system == "baseline"]
     engine_trials = [t for t in trials if t.system == "grokbot_engine"]
@@ -1917,6 +1960,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional local HTTP LLM server origin when --mode local_http.",
     )
     parser.add_argument(
+        "--llm-base-url",
+        default="",
+        help="Optional OpenAI-compatible /v1 base URL when --mode local_http.",
+    )
+    parser.add_argument(
+        "--inject-asset-confusion",
+        action="store_true",
+        help="Inject one synthetic wrong asset attribution to verify promotion gate blocking.",
+    )
+    parser.add_argument(
         "--model-id",
         default="qwen2.5-7b-instruct",
         help="Model ID reported in local_http mode.",
@@ -1943,7 +1996,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.scenarios
         else None
     )
-    llm_origin = args.llm_origin.strip() or None
+    raw_llm = (args.llm_base_url or args.llm_origin).strip()
+    if raw_llm:
+        llm_origin, llm_endpoint_path = _normalize_llm_url(raw_llm)
+    else:
+        llm_origin = None
+        llm_endpoint_path = "/v1/chat/completions"
     raw_argv = argv if argv is not None else sys.argv[1:]
     cmd_str = " ".join(["python -m benchmarks.runner", *raw_argv])
 
@@ -1953,8 +2011,10 @@ def main(argv: list[str] | None = None) -> int:
             repeats=args.repeats,
             scenarios=selected,
             llm_origin=llm_origin,
+            llm_endpoint_path=llm_endpoint_path,
             model_id=args.model_id,
             command_str=cmd_str,
+            inject_asset_confusion=args.inject_asset_confusion,
         )
     )
 

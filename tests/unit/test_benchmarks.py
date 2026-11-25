@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from benchmarks.report import (
     A12AdaptationMetrics,
@@ -249,3 +252,20 @@ def test_evaluate_promotion_gate_recomputes_violations_from_metrics() -> None:
     res_few = evaluate_promotion_gate(few_report)
     assert res_few["promotion_passed"] is False
     assert any("< 12" in v for v in res_few["blocking_violations"])
+
+
+@pytest.mark.n1
+def test_benchmarks_llm_base_url_normalization_and_confusion_injection(tmp_path: Path) -> None:
+    from benchmarks.runner import _normalize_llm_url
+    from benchmarks.runner import main as bench_main
+
+    origin, endpoint = _normalize_llm_url("http://127.0.0.1:8080/v1")
+    assert origin == "http://127.0.0.1:8080"
+    assert endpoint == "/v1/chat/completions"
+
+    out_dir = tmp_path / "flawed_bench"
+    rc = bench_main(["--inject-asset-confusion", "--output-dir", str(out_dir)])
+    assert rc == 1
+    report = json.loads((out_dir / "benchmark_report.json").read_text(encoding="utf-8"))
+    assert report["promotion_passed"] is False
+    assert report["blocking_violations"]

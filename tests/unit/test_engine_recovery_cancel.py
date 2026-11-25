@@ -940,3 +940,87 @@ def test_mark_step_unknown_without_lease_generation_rejects_terminal_and_cancell
     assert any(
         a.action == "stale_unknown_rejected" for a in repo.list_audit_logs(task_id="t-canc-unk")
     )
+
+
+@pytest.mark.n1
+async def test_assume_previous_worker_dead_reclaims_unexpired_model_reservation_and_reconciles_step(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "startup_reclaim.db"
+    clock = FakeClock()
+    repo = StorageRepo(db_path, clock=clock)
+    repo.init_db()
+
+    eff_spec = ToolSpec(
+        tool_id="apply_valve",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.EFFECT,
+        timeout_s=10.0,
+        verifier_name="v",
+    )
+    applied_calls = 0
+
+    async def timeout_after_apply(
+        args: dict[str, Any], ctx: ToolExecutionContext
+    ) -> dict[str, Any]:
+        nonlocal applied_calls
+        del args, ctx
+        applied_calls += 1
+        raise TimeoutError("simulated post-apply timeout")
+
+    reg = ToolRegistry(clock=clock)
+    reg.register(
+        eff_spec,
+        timeout_after_apply,
+        reconciler=lambda op, idem, ctx: (True, {"valve": "reset", "op": op}),
+        supports_idempotency=True,
+    )
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    model = EmulatedModelClient(
+        mode="custom",
+        default_turns=[
+            EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="apply_valve",
+                        args={},
+                        target_origin="https://scada.local",
+                    ),
+                    usage=usage,
+                )
+            ),
+            EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="final", final_answer="reconciled", usage=usage
+                )
+            ),
+        ],
+    )
+    coord = Coordinator(repo, model, reg, clock=clock)
+    run = coord.submit_task(_task("t-reconcile-inline"))
+    res = await coord.run_until_settled(run.run_id)
+    assert res.status == TaskStatus.SUCCEEDED
+    assert applied_calls == 1
+
+    # Unexpired model reservation is preserved when assume_previous_worker_dead=False,
+    # and reclaimed immediately when assume_previous_worker_dead=True.
+    _, r2 = repo.create_task_and_run(_task("t-unexpired-res"))
+    repo.transition_run_status(r2.run_id, TaskStatus.RUNNING, "go")
+    repo.reserve_budget(
+        "t-unexpired-res", r2.run_id, "model", model_calls=1, tokens=500, ttl_s=60.0
+    )
+    sum_default = await coord.recover_inflight_runs()
+    assert sum_default.expired_reservations_cleaned == 0
+    assert repo.get_budget_usage("t-unexpired-res").model_calls_reserved == 1
+
+    sum_startup = await coord.recover_inflight_runs(assume_previous_worker_dead=True)
+    assert sum_startup.expired_reservations_cleaned == 1
+    post_usage = repo.get_budget_usage("t-unexpired-res")
+    assert post_usage.model_calls_reserved == 0
+    assert post_usage.model_calls_used == 1
+    assert post_usage.total_tokens_used == 500
