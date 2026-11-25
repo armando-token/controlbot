@@ -1193,3 +1193,379 @@ def test_evaluate_patch_rejects_parent_multihop_ancestor_120000_and_circular_sym
         assert all(row[0] == "patch_evaluation_rejected" for row in deny_rows)
     finally:
         conn.close()
+
+
+@pytest.mark.n1
+def test_evaluate_patch_and_audit_branch_reject_case_variants_and_unmerged_120000_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lab_repo = tmp_path / "lab_repo"
+    _init_git_repo(lab_repo)
+    (lab_repo / "tests" / "acceptance").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "tests" / "acceptance" / "test_a01.py").write_text(
+        "assert False\n", encoding="utf-8"
+    )
+    (lab_repo / "src" / "contracts").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "src" / "contracts" / "models.py").write_text("X = 1\n", encoding="utf-8")
+    (lab_repo / "lab" / "safe_dir").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "lab" / "safe_dir" / "ok.py").write_text("OK = 1\n", encoding="utf-8")
+    if os.name == "posix":
+        (lab_repo / "lab" / "link_upper").symlink_to("../Tests")
+        (lab_repo / "lab" / "safe_dir" / "inner_to_tests").symlink_to("../../tests")
+
+    subprocess.run(["git", "-C", str(lab_repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "add case fixtures"],
+        check=True,
+        capture_output=True,
+    )
+    base_head = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    db_path = tmp_path / "factory_case.db"
+
+    def _run_cli(argv: list[str]) -> tuple[int, dict[str, Any]]:
+        rc = factory_cli_main(argv)
+        out = capsys.readouterr().out
+        return rc, json.loads(out)
+
+    # 1. Case-variant direct paths: Tests/acceptance/test_a01.py & SRC/contracts/models.py
+    for name, rel in [
+        ("case_tests", "Tests/acceptance/test_a01.py"),
+        ("case_src", "SRC/contracts/models.py"),
+    ]:
+        p_case = tmp_path / f"{name}.patch"
+        p_case.write_text(
+            f"diff --git a/{rel} b/{rel}\n"
+            f"--- a/{rel}\n"
+            f"+++ b/{rel}\n"
+            "@@ -1 +1 @@\n"
+            "-assert False\n"
+            "+assert True  # CASE_BYPASS\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_case),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["policy_passed"] is False
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 2. Case-variant repo symlink: lab/link_upper -> ../Tests
+    if os.name == "posix":
+        p_sym_upper = tmp_path / "case_sym.patch"
+        p_sym_upper.write_text(
+            "diff --git a/lab/link_upper/acceptance/test_a01.py "
+            "b/lab/link_upper/acceptance/test_a01.py\n"
+            "--- a/lab/link_upper/acceptance/test_a01.py\n"
+            "+++ b/lab/link_upper/acceptance/test_a01.py\n"
+            "@@ -1 +1 @@\n"
+            "-assert False\n"
+            "+assert True  # SYM_CASE_BYPASS\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_sym_upper),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 3. 2-hunk 120000 case-variant symlink: sym_up -> Tests + case-variant lookup SYM_UP/...
+    p_120000_up = tmp_path / "case_120000.patch"
+    p_120000_up.write_text(
+        "diff --git a/sym_up b/sym_up\n"
+        "new file mode 120000\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/sym_up\n"
+        "@@ -0,0 +1 @@\n"
+        "+Tests\n"
+        "diff --git a/sym_up/acceptance/test_a01.py b/sym_up/acceptance/test_a01.py\n"
+        "--- a/sym_up/acceptance/test_a01.py\n"
+        "+++ b/sym_up/acceptance/test_a01.py\n"
+        "@@ -1 +1 @@\n"
+        "-assert False\n"
+        "+assert True  # CASE_120000_BYPASS\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_120000_up),
+            "--json",
+        ]
+    )
+    assert rc == 1
+    assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    if os.name == "posix":
+        p_120000_case_lookup = tmp_path / "case_lookup_120000.patch"
+        p_120000_case_lookup.write_text(
+            "diff --git a/lab/sym_safe b/lab/sym_safe\n"
+            "new file mode 120000\n"
+            "index 0000000..1234567\n"
+            "--- /dev/null\n"
+            "+++ b/lab/sym_safe\n"
+            "@@ -0,0 +1 @@\n"
+            "+safe_dir\n"
+            "diff --git a/lab/SYM_SAFE/inner_to_tests/acceptance/test_a01.py "
+            "b/lab/SYM_SAFE/inner_to_tests/acceptance/test_a01.py\n"
+            "--- a/lab/SYM_SAFE/inner_to_tests/acceptance/test_a01.py\n"
+            "+++ b/lab/SYM_SAFE/inner_to_tests/acceptance/test_a01.py\n"
+            "@@ -1 +1 @@\n"
+            "-assert False\n"
+            "+assert True\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_cli(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(p_120000_case_lookup),
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 4. audit-branch committing Tests/acceptance/test_a01.py (core.ignorecase=false)
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "checkout", "-b", "cand_ci"],
+        check=True,
+        capture_output=True,
+    )
+    (lab_repo / "Tests" / "acceptance").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "Tests" / "acceptance" / "test_a01.py").write_text(
+        "assert True  # CI_BYPASS\n", encoding="utf-8"
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(lab_repo),
+            "-c",
+            "core.ignorecase=false",
+            "add",
+            "Tests/acceptance/test_a01.py",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "ci bypass"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "checkout", "-f", "main"],
+        check=True,
+        capture_output=True,
+    )
+    rc, payload = _run_cli(
+        [
+            "audit-branch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--branch",
+            "cand_ci",
+            "--base",
+            "main",
+            "--json",
+        ]
+    )
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["policy_passed"] is False
+    assert "POLICY_IMMUTABILITY_VIOLATION" in str(payload["reason"])
+
+    # 5. audit-branch on unmerged branch committing 120000 symlink (lab/link_to_tests -> ../tests)
+    if os.name == "posix":
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "checkout", "-b", "cand_120000"],
+            check=True,
+            capture_output=True,
+        )
+        (lab_repo / "lab" / "link_to_tests").symlink_to("../tests")
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "add", "lab/link_to_tests"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "commit", "-m", "add unmerged 120000 symlink"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "checkout", "-f", "main"],
+            check=True,
+            capture_output=True,
+        )
+        rc, payload = _run_cli(
+            [
+                "audit-branch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--branch",
+                "cand_120000",
+                "--base",
+                "main",
+                "--json",
+            ]
+        )
+        assert rc == 1
+        assert payload["ok"] is False
+        assert payload["policy_passed"] is False
+        assert "POLICY_IMMUTABILITY_VIOLATION" in str(payload["reason"])
+
+        # Legitimate unmerged 120000 symlink in non-immutable safe_dir stays ALLOWED
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "checkout", "-b", "cand_safe_120000"],
+            check=True,
+            capture_output=True,
+        )
+        (lab_repo / "lab" / "new_safe_link").symlink_to("safe_dir")
+        (lab_repo / "lab" / "safe_dir" / "ok.py").write_text("OK = 2\n", encoding="utf-8")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(lab_repo),
+                "add",
+                "lab/new_safe_link",
+                "lab/safe_dir/ok.py",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "commit", "-m", "add safe 120000 symlink"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "checkout", "-f", "main"],
+            check=True,
+            capture_output=True,
+        )
+        rc, payload = _run_cli(
+            [
+                "audit-branch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--branch",
+                "cand_safe_120000",
+                "--base",
+                "main",
+                "--json",
+            ]
+        )
+        assert rc == 0
+        assert payload["ok"] is True
+        assert payload["policy_passed"] is True
+
+    # 6. Case-variant forbidden path (RT.DB rejected, smart.db allowed)
+    rt_db = tmp_path / "rt.db"
+    rt_db.write_bytes(b"sqlite")
+    monkeypatch.setenv("GROKBOT_FORBIDDEN_PATHS", str(rt_db))
+
+    p_rt_upper = tmp_path / "rt_upper.patch"
+    p_rt_upper.write_text(
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def compute_steps() -> int:\n"
+        "-    return 50\n"
+        '+    return len(open("RT.DB", "rb").read())\n',
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_rt_upper),
+            "--json",
+        ]
+    )
+    assert rc == 1
+    assert payload["violation"] == "ISOLATION_BOUNDARY_VIOLATION"
+
+    p_smart = tmp_path / "smart_ok.patch"
+    p_smart.write_text(
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def compute_steps() -> int:\n"
+        "-    return 50\n"
+        '+    _name = "smart.db"\n'
+        "+    return 25\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_cli(
+        [
+            "evaluate-patch",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db_path),
+            "--patch",
+            str(p_smart),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+    assert payload["policy_passed"] is True
+
+    head_after = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after == base_head

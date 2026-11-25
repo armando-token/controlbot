@@ -67,6 +67,320 @@ def _extract_path_candidates_from_line(line: str) -> list[str]:
     return candidates
 
 
+_C_ESCAPE_MAP: dict[str, int] = {
+    "\\": ord("\\"),
+    '"': ord('"'),
+    "a": 7,
+    "b": 8,
+    "f": 12,
+    "n": 10,
+    "r": 13,
+    "t": 9,
+    "v": 11,
+}
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _consume_quoted_git_token(text: str, start: int = 0) -> tuple[str, int]:
+    """Parse a C-quoted git diff path token starting at `start`."""
+    if start >= len(text) or text[start] != '"':
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: expected quoted git diff path in {text!r}."
+        )
+    buf = bytearray()
+    idx = start + 1
+    while idx < len(text):
+        ch = text[idx]
+        if ch == '"':
+            try:
+                return buf.decode("utf-8"), idx + 1
+            except UnicodeDecodeError as exc:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: invalid UTF-8 in quoted diff path."
+                ) from exc
+        if ch == "\\":
+            idx += 1
+            if idx >= len(text):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: truncated escape in diff path {text!r}."
+                )
+            esc = text[idx]
+            if esc in _C_ESCAPE_MAP:
+                buf.append(_C_ESCAPE_MAP[esc])
+                idx += 1
+            elif esc in "01234567":
+                oct_digits = esc
+                idx += 1
+                for _ in range(2):
+                    if idx < len(text) and text[idx] in "01234567":
+                        oct_digits += text[idx]
+                        idx += 1
+                    else:
+                        break
+                buf.append(int(oct_digits, 8) & 0xFF)
+            else:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: invalid escape \\{esc} in diff path."
+                )
+        else:
+            buf.extend(ch.encode("utf-8"))
+            idx += 1
+    raise PolicyImmutabilityError(
+        f"{POLICY_IMMUTABILITY_VIOLATION}: unterminated quoted diff path in {text!r}."
+    )
+
+
+def _unquote_git_path(token: str) -> str:
+    stripped = token.strip()
+    if stripped.startswith('"'):
+        decoded, end_idx = _consume_quoted_git_token(stripped, 0)
+        if stripped[end_idx:].strip():
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: trailing garbage after quoted path {token!r}."
+            )
+        return decoded
+    return stripped
+
+
+def _parse_diff_git_line(line: str) -> tuple[str, str]:
+    rest = line[len("diff --git ") :]
+    if not rest.strip():
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable empty diff --git header."
+        )
+
+    left_raw: str
+    right_raw: str
+    if '"' in rest:
+        idx = 0
+        while idx < len(rest) and rest[idx] == " ":
+            idx += 1
+        if idx >= len(rest):
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+            )
+        if rest[idx] == '"':
+            left_raw, idx = _consume_quoted_git_token(rest, idx)
+        else:
+            next_sp = rest.find(" ", idx)
+            if next_sp == -1:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                )
+            left_raw = rest[idx:next_sp]
+            idx = next_sp
+        if idx >= len(rest) or rest[idx] != " ":
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+            )
+        while idx < len(rest) and rest[idx] == " ":
+            idx += 1
+        if idx >= len(rest):
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+            )
+        if rest[idx] == '"':
+            right_raw, end_idx = _consume_quoted_git_token(rest, idx)
+            if rest[end_idx:].strip():
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                )
+        else:
+            right_raw = rest[idx:].rstrip()
+    else:
+        trimmed = rest.strip()
+        parts = trimmed.split(" ")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            left_raw, right_raw = parts[0], parts[1]
+        else:
+            m = re.match(r"^a/(.+?) b/(.+)$", trimmed)
+            if m:
+                left_raw, right_raw = f"a/{m.group(1)}", f"b/{m.group(2)}"
+            elif len(trimmed) % 2 == 1:
+                mid = len(trimmed) // 2
+                if trimmed[mid] == " " and trimmed[:mid] == trimmed[mid + 1 :]:
+                    left_raw = right_raw = trimmed[:mid]
+                else:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                    )
+            else:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                )
+
+    if left_raw.startswith("a/") and right_raw.startswith("b/"):
+        left, right = left_raw[2:], right_raw[2:]
+    else:
+        left = (
+            left_raw[2:]
+            if left_raw.startswith("a/") and not right_raw.startswith("a/")
+            else left_raw
+        )
+        right = (
+            right_raw[2:]
+            if right_raw.startswith("b/") and not left_raw.startswith("b/")
+            else right_raw
+        )
+
+    if not left or not right:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff --git header {line!r}."
+        )
+    return left, right
+
+
+def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> str | None:
+    rest = line[len(header_prefix) :]
+    if rest.startswith('"'):
+        raw, end_idx = _consume_quoted_git_token(rest, 0)
+        trailing = rest[end_idx:]
+        if trailing and not trailing.startswith("\t") and trailing.strip():
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff header {line!r}."
+            )
+    else:
+        raw = rest.split("\t", 1)[0].strip()
+
+    if raw == "/dev/null":
+        return None
+    if not raw:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff header {line!r}."
+        )
+    if raw.startswith(git_prefix):
+        raw = raw[len(git_prefix) :]
+    if not raw:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path after prefix in diff header {line!r}."
+        )
+    return raw
+
+
+def parse_unified_patch(
+    patch_text: str,
+) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Parse git/unified diff path headers, added lines, and 120000 symlink targets."""
+    touched: list[str] = []
+    added_lines: list[str] = []
+    symlink_added_targets: list[tuple[str, str]] = []
+
+    def _add_touched(path_str: str) -> None:
+        if path_str != "/dev/null" and path_str not in touched:
+            touched.append(path_str)
+
+    in_hunk = False
+    old_rem = 0
+    new_rem = 0
+    current_is_symlink = False
+    current_section_paths: list[str] = []
+
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            in_hunk = False
+            old_rem = 0
+            new_rem = 0
+            current_is_symlink = False
+            current_section_paths = []
+            left, right = _parse_diff_git_line(line)
+            _add_touched(left)
+            _add_touched(right)
+            current_section_paths.extend([left, right])
+            continue
+
+        if line.startswith("@@"):
+            m = _HUNK_HEADER_RE.match(line)
+            if m is None:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff hunk header {line!r}."
+                )
+            old_rem = int(m.group(2)) if m.group(2) is not None else 1
+            new_rem = int(m.group(4)) if m.group(4) is not None else 1
+            in_hunk = old_rem > 0 or new_rem > 0
+            continue
+
+        if in_hunk:
+            if line.startswith("+"):
+                added = line[1:]
+                added_lines.append(added)
+                if current_is_symlink:
+                    link_rel = current_section_paths[-1] if current_section_paths else ""
+                    symlink_added_targets.append((link_rel, added))
+                new_rem -= 1
+            elif line.startswith("-"):
+                old_rem -= 1
+            elif line.startswith(" ") or line == "":
+                old_rem -= 1
+                new_rem -= 1
+            elif line.startswith("\\"):
+                pass
+            else:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: malformed diff hunk body line {line!r}."
+                )
+            if old_rem <= 0 and new_rem <= 0:
+                in_hunk = False
+            continue
+
+        if line.startswith(
+            (
+                "new file mode 120000",
+                "deleted file mode 120000",
+                "old mode 120000",
+                "new mode 120000",
+            )
+        ):
+            current_is_symlink = True
+            continue
+        if line.startswith("index ") and line.rstrip().endswith(" 120000"):
+            current_is_symlink = True
+            continue
+
+        if line.startswith("--- "):
+            p = _parse_minus_plus_header(line, "--- ", "a/")
+            if p is not None:
+                _add_touched(p)
+                current_section_paths.append(p)
+            continue
+
+        if line.startswith("+++ "):
+            p = _parse_minus_plus_header(line, "+++ ", "b/")
+            if p is not None:
+                _add_touched(p)
+                current_section_paths.append(p)
+            continue
+
+        matched_meta = False
+        for meta_hdr in ("rename from ", "rename to ", "copy from ", "copy to "):
+            if line.startswith(meta_hdr):
+                raw_meta = line[len(meta_hdr) :].strip()
+                if not raw_meta:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in {meta_hdr.strip()} header."
+                    )
+                unquoted = _unquote_git_path(raw_meta)
+                if not unquoted:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in {meta_hdr.strip()} header."
+                    )
+                _add_touched(unquoted)
+                current_section_paths.append(unquoted)
+                matched_meta = True
+                break
+        if matched_meta:
+            continue
+
+        if line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line[1:])
+
+    if patch_text.strip() and not touched:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: non-empty patch yielded zero touched paths."
+        )
+
+    return touched, added_lines, symlink_added_targets
+
+
 class PolicyGuard:
     """Enforces unconditional immutability of acceptance criteria, policy, and safety guards."""
 
@@ -160,10 +474,14 @@ class PolicyGuard:
                     exact_tokens.append(res_str)
 
             name = Path(item).name
-            if cls._is_explicit_forbidden_basename(item, name) and name not in seen_names:
+            name_folded = name.casefold()
+            if cls._is_explicit_forbidden_basename(item, name) and name_folded not in {
+                existing.casefold() for existing in seen_names
+            }:
                 seen_names.add(name)
                 pat = re.compile(
-                    rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.])"
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.])",
+                    re.IGNORECASE,
                 )
                 basename_patterns.append((name, pat))
 
@@ -180,27 +498,31 @@ class PolicyGuard:
         normalized = posixpath.normpath(raw)
         if normalized in ("", ".") or normalized.startswith("/") or ".." in normalized.split("/"):
             return True
+        norm_folded = normalized.casefold()
         for prefix in self._immutable_prefixes:
             raw_prefix = prefix.replace("\\", "/")
             clean_prefix = posixpath.normpath(raw_prefix)
             if clean_prefix in ("", "."):
                 continue
-            if normalized == clean_prefix or normalized.startswith(f"{clean_prefix}/"):
+            prefix_folded = clean_prefix.casefold()
+            if norm_folded == prefix_folded or norm_folded.startswith(f"{prefix_folded}/"):
                 return True
         filename = Path(normalized).name
-        if _IMMUTABLE_NAME_RE.search(filename):
+        if _IMMUTABLE_NAME_RE.search(filename) or _IMMUTABLE_NAME_RE.search(filename.casefold()):
             return True
-        return bool(_IMMUTABLE_NAME_RE.search(normalized))
+        return bool(_IMMUTABLE_NAME_RE.search(normalized) or _IMMUTABLE_NAME_RE.search(norm_folded))
 
     def _is_immutable_ancestor(self, rel_path: str) -> bool:
         norm = posixpath.normpath(rel_path.strip().replace("\\", "/"))
         if norm in ("", ".") or norm.startswith("/") or ".." in norm.split("/"):
             return True
+        norm_folded = norm.casefold()
         for prefix in self._immutable_prefixes:
             clean_prefix = posixpath.normpath(prefix.replace("\\", "/"))
             if clean_prefix in ("", "."):
                 continue
-            if clean_prefix == norm or clean_prefix.startswith(f"{norm}/"):
+            prefix_folded = clean_prefix.casefold()
+            if prefix_folded == norm_folded or prefix_folded.startswith(f"{norm_folded}/"):
                 return True
         return False
 
@@ -222,15 +544,26 @@ class PolicyGuard:
     ) -> str | None:
         if resolved_target in forbidden_resolved:
             return str(resolved_target)
+        resolved_folded = str(resolved_target).casefold()
         for forb_res in forbidden_resolved:
+            forb_folded = str(forb_res).casefold()
+            if resolved_folded == forb_folded:
+                return str(resolved_target)
             with contextlib.suppress(OSError, ValueError):
                 if resolved_target.is_relative_to(forb_res):
                     return str(forb_res)
-        if resolved_target.name in forbidden_names:
+            forb_prefix = forb_folded.rstrip("/")
+            if forb_prefix and resolved_folded.startswith(f"{forb_prefix}/"):
+                return str(forb_res)
+        forbidden_names_folded = {n.casefold() for n in forbidden_names}
+        if (
+            resolved_target.name in forbidden_names
+            or resolved_target.name.casefold() in forbidden_names_folded
+        ):
             return resolved_target.name
         if raw_target:
             raw_name = Path(raw_target).name
-            if raw_name in forbidden_names:
+            if raw_name in forbidden_names or raw_name.casefold() in forbidden_names_folded:
                 return raw_name
         return None
 
@@ -375,14 +708,17 @@ class PolicyGuard:
                                 if tok not in seen_exact:
                                     seen_exact.add(tok)
                                     extra_exact.append(tok)
-                            if entry.name and entry.name not in seen_names:
+                            if entry.name and entry.name.casefold() not in {
+                                n.casefold() for n in seen_names
+                            }:
                                 seen_names.add(entry.name)
                                 extra_patterns.append(
                                     (
                                         entry.name,
                                         re.compile(
                                             rf"(?<![A-Za-z0-9_.-]){re.escape(entry.name)}"
-                                            r"(?![A-Za-z0-9_.])"
+                                            r"(?![A-Za-z0-9_.])",
+                                            re.IGNORECASE,
                                         ),
                                     )
                                 )
@@ -416,7 +752,8 @@ class PolicyGuard:
         forb_res = forbidden_resolved or set()
         forb_names = forbidden_names or set()
 
-        added_symlinks: dict[str, str] = {}
+        added_symlinks_exact: dict[str, str] = {}
+        added_symlinks_folded: dict[str, str] = {}
         for link_rel, target_str in symlink_added_targets:
             norm_link = posixpath.normpath(link_rel.strip().replace("\\", "/"))
             if (
@@ -514,33 +851,37 @@ class PolicyGuard:
                         offending_paths=tuple(touched_paths) or (link_rel,),
                     )
 
-            added_symlinks[norm_link] = lexical_target_rel
+            added_symlinks_exact[norm_link] = lexical_target_rel
+            added_symlinks_folded[norm_link.casefold()] = lexical_target_rel
 
-        if added_symlinks and touched_paths:
+        if added_symlinks_exact and touched_paths:
             resolved_touched: list[str] = []
-            max_hops = max(16, len(added_symlinks) * 2 + 4)
+            max_hops = max(16, len(added_symlinks_exact) * 2 + 4)
             for orig_path in touched_paths:
                 cur_path = posixpath.normpath(orig_path.strip().replace("\\", "/"))
-                seen_paths: set[str] = {cur_path}
+                seen_paths: set[str] = {cur_path.casefold()}
                 completed = False
                 for _ in range(max_hops):
                     parts = cur_path.split("/")
                     replaced = False
                     for idx in range(1, len(parts) + 1):
                         prefix = "/".join(parts[:idx])
-                        if prefix in added_symlinks:
-                            target_base = added_symlinks[prefix]
+                        target_base = added_symlinks_exact.get(prefix)
+                        if target_base is None:
+                            target_base = added_symlinks_folded.get(prefix.casefold())
+                        if target_base is not None:
                             remainder = "/".join(parts[idx:])
                             next_path = posixpath.normpath(
                                 f"{target_base}/{remainder}" if remainder else target_base
                             )
-                            if next_path in seen_paths:
+                            next_folded = next_path.casefold()
+                            if next_folded in seen_paths:
                                 raise PolicyImmutabilityError(
                                     f"{POLICY_IMMUTABILITY_VIOLATION}: circular symlink patch "
                                     f"involving {orig_path!r}.",
                                     offending_paths=tuple(touched_paths),
                                 )
-                            seen_paths.add(next_path)
+                            seen_paths.add(next_folded)
                             cur_path = next_path
                             replaced = True
                             break
@@ -595,8 +936,9 @@ class PolicyGuard:
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden runtime DB or credential boundary ({pat.pattern})."
                     )
+            added_folded = added.casefold()
             for tok in exact_tokens:
-                if tok in added:
+                if tok in added or tok.casefold() in added_folded:
                     raise IsolationBoundaryError(
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden runtime DB or credential path ({tok})."
@@ -672,19 +1014,20 @@ class PolicyGuard:
                 f"({patch_proc.stderr.strip()})."
             )
 
-        added_lines = [
-            line[1:]
-            for line in patch_proc.stdout.splitlines()
-            if line.startswith("+") and not line.startswith("+++")
-        ]
+        parsed_touched, added_lines, symlink_added_targets = parse_unified_patch(
+            patch_proc.stdout
+        )
+        touched_paths = list(dict.fromkeys([*changed_paths, *parsed_touched]))
+        self.check_candidate_paths(touched_paths)
         self.check_added_lines(
             added_lines,
-            touched_paths=changed_paths,
+            touched_paths=touched_paths,
             repo_path=repo_path,
             exact_tokens=exact_tokens,
             basename_patterns=basename_patterns,
             forbidden_resolved=forbidden_resolved,
             forbidden_names=forbidden_names,
+            symlink_added_targets=symlink_added_targets,
         )
 
 
