@@ -10,7 +10,7 @@
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas M7-T3 verificado**: `a0724140070656686b5e4ec34a07cb89e005686b` (`fix(m7-t3): close binary diff headers, 120000 binary patch & null-byte edge cases`)
+- **Commit de código y pruebas M7-T3 verificado**: `08687e02019fba2bb56a0569add765b5d2eca7e2` (`fix(m7-t3): close binary patch leak, cross-section symlink, space timestamp & short case-fold gaps`)
 - **Cadena de commits de hitos en `main`**:
   - `d95e98e` — `chore(m1): initialize repo, diagnostics, frozen contracts, research & ADRs`
   - `ccadffc` — `M1: remediate mypy e2e exclusion, redaction hardening, contract invariants, and doctor checks`
@@ -35,6 +35,8 @@
   - `2a7da5a` — `fix(m7-t3): enforce -p1 diff prefixes, symlink rename checks & NFC/NFD normalization`
   - `655d988` — `docs(night-report): update NIGHT_REPORT with M7-T3-R5 commit SHA 2a7da5a and verification counts`
   - `a072414` — `fix(m7-t3): close binary diff headers, 120000 binary patch & null-byte edge cases`
+  - `4c4f39c` — `docs(night-report): update NIGHT_REPORT with M7-T3-R5 commit SHA a072414 and verification counts`
+  - `08687e0` — `fix(m7-t3): close binary patch leak, cross-section symlink, space timestamp & short case-fold gaps`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -83,10 +85,10 @@
 
 ### 3.3 Resultados medidos (Benchmarks M6 & Fábrica M7)
 - **Benchmark comparativo emparejado (`13` escenarios N1/N2 ejecutables; `A11` = `PENDING_N3_LINUX_ENV`)**:
-   - **Modo `emulated`** (`make bench`, commit `a072414`):
-     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=409.73ms`, `p95=426.98ms`.
-     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1229.37ms`, `p95=1473.06ms`, `tool_calls=34`, `model_calls=42`, `tokens=3514`, `RAM=79.98 MB`.
-     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.229s`, `verified_succeeded=True`.
+   - **Modo `emulated`** (`make bench`, commit `08687e0`):
+     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=409.92ms`, `p95=426.79ms`.
+     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1226.49ms`, `p95=1473.88ms`, `tool_calls=34`, `model_calls=42`, `tokens=3514`, `RAM=80.02 MB`.
+     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.235s`, `verified_succeeded=True`.
    - **Modo `local_http` contra servidor mock OpenAI en loopback** (`python -m benchmarks.runner --mode local_http --json`):
      - `GrokbotEngine`: **`13/13` (`100.0%`)**, `model_type="local_http_mock"`, `promotion_eligible=True`, `median=1239.283ms`, `p95=1534.818ms`, `tool_calls=36`, `model_calls=44`, `tokens=3656`, `RAM=80.50 MB`, `A12 verified_succeeded=True`.
    - **Fail-closed con endpoint local inalcanzable** (`--mode local_http --llm-origin http://127.0.0.1:9 --scenarios A08,A09`):
@@ -103,7 +105,7 @@
 - **`make doctor`**: Exit `0` (`n1_ready=True`, `n2_ready=True`, `n3_status=PENDING_N3_LINUX_ENV`).
 - **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`).
 - **`make typecheck`**: Exit `0` (`Success: no issues found in 99 source files`, `mypy --strict`).
-- **`make test-n1`**: Exit `0` (**`121 passed`**).
+- **`make test-n1`**: Exit `0` (**`122 passed`**).
 - **`make test-n2`**: Exit `0` (**`42 passed`**, `0` warnings).
 - **`make test-acceptance`**: Exit `0` (**`19 passed`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
@@ -143,8 +145,8 @@
 
 ## 6. Horas usadas, recursos observados y riesgo principal
 
-- **Ventana nocturna**: inicio `2026-11-25T09:07:18Z`, cierre M7-T3 `2026-11-25T14:38:00Z` (~`5.51 horas` transcurridas de un presupuesto total de `8.0 horas` hasta `17:07Z`, conservando margen reservado para Tier 4, Tier 5 y reporte final).
-- **Recursos observados**: Apple M1 (8 cores), `8 GB` RAM; RSS pico medido en benchmarks `~79.98 MB`; VRAM `N/A` (sin servidor LLM local ni GPU Linux en este host).
+- **Ventana nocturna**: inicio `2026-11-25T09:07:18Z`, cierre M7-T3 `2026-11-25T18:16:00Z` (~`9.14 horas` acumuladas entre M0–M7-T3 incluyendo remediaciones de hardening de `src/factory/policy.py`, manteniendo ejecución continua hasta completar Tier 4, Tier 5 y reporte final).
+- **Recursos observados**: Apple M1 (8 cores), `8 GB` RAM; RSS pico medido en benchmarks `~80.02 MB`; VRAM `N/A` (sin servidor LLM local ni GPU Linux en este host).
 - **Riesgo principal**: la ejecución real **N3** en Linux (bloqueo de egreso a nivel kernel `netns`/`iptables`, precisión/latencia/VRAM de un modelo cuantizado real en CPU/GPU local, y sesión AT-SPI/X11/Wayland en vivo) permanece sin validar en hardware Linux hasta disponer del entorno destino, y Tier 4 + Tier 5 de `tests/e2e/` corresponden a las fases siguientes de M7.
 
 ---
