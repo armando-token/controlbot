@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -417,7 +418,7 @@ def _generate_cand1_benchmark_artifacts(
     provenance = ProvenanceMetadata(
         benchmark_id="bench-factory-cand1",
         git_commit=git_commit,
-        timestamp_utc="2026-11-25T00:00:00Z",
+        timestamp_utc=datetime.now(UTC).isoformat(),
         host_os=os.uname().sysname,
         host_arch=os.uname().machine,
         python_version=sys.version.split()[0],

@@ -17,8 +17,6 @@ from src.factory.engine import EvalResult, FactoryEngine, rollback_from_manifest
 from src.factory.errors import FactoryError, IsolationBoundaryError, PolicyImmutabilityError
 from src.factory.models import BacklogItem, CandidatePatch, CycleBudget, compute_proposal_hash
 from src.factory.policy import (
-    _ISOLATION_BREACH_PATTERNS,
-    _POLICY_BYPASS_PATTERNS,
     ISOLATION_BOUNDARY_VIOLATION,
     POLICY_IMMUTABILITY_VIOLATION,
     IsolationGuard,
@@ -464,6 +462,320 @@ def _load_backlog_items(backlog_path: Path, *, max_attempts: int) -> list[Backlo
     return unchecked or checked
 
 
+_C_ESCAPE_MAP: dict[str, int] = {
+    "\\": ord("\\"),
+    '"': ord('"'),
+    "a": 7,
+    "b": 8,
+    "f": 12,
+    "n": 10,
+    "r": 13,
+    "t": 9,
+    "v": 11,
+}
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _consume_quoted_git_token(text: str, start: int = 0) -> tuple[str, int]:
+    """Parse a C-quoted git diff path token starting at `start`."""
+    if start >= len(text) or text[start] != '"':
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: expected quoted git diff path in {text!r}."
+        )
+    buf = bytearray()
+    idx = start + 1
+    while idx < len(text):
+        ch = text[idx]
+        if ch == '"':
+            try:
+                return buf.decode("utf-8"), idx + 1
+            except UnicodeDecodeError as exc:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: invalid UTF-8 in quoted diff path."
+                ) from exc
+        if ch == "\\":
+            idx += 1
+            if idx >= len(text):
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: truncated escape in diff path {text!r}."
+                )
+            esc = text[idx]
+            if esc in _C_ESCAPE_MAP:
+                buf.append(_C_ESCAPE_MAP[esc])
+                idx += 1
+            elif esc in "01234567":
+                oct_digits = esc
+                idx += 1
+                for _ in range(2):
+                    if idx < len(text) and text[idx] in "01234567":
+                        oct_digits += text[idx]
+                        idx += 1
+                    else:
+                        break
+                buf.append(int(oct_digits, 8) & 0xFF)
+            else:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: invalid escape \\{esc} in diff path."
+                )
+        else:
+            buf.extend(ch.encode("utf-8"))
+            idx += 1
+    raise PolicyImmutabilityError(
+        f"{POLICY_IMMUTABILITY_VIOLATION}: unterminated quoted diff path in {text!r}."
+    )
+
+
+def _unquote_git_path(token: str) -> str:
+    stripped = token.strip()
+    if stripped.startswith('"'):
+        decoded, end_idx = _consume_quoted_git_token(stripped, 0)
+        if stripped[end_idx:].strip():
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: trailing garbage after quoted path {token!r}."
+            )
+        return decoded
+    return stripped
+
+
+def _parse_diff_git_line(line: str) -> tuple[str, str]:
+    rest = line[len("diff --git ") :]
+    if not rest.strip():
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable empty diff --git header."
+        )
+
+    left_raw: str
+    right_raw: str
+    if '"' in rest:
+        idx = 0
+        while idx < len(rest) and rest[idx] == " ":
+            idx += 1
+        if idx >= len(rest):
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+            )
+        if rest[idx] == '"':
+            left_raw, idx = _consume_quoted_git_token(rest, idx)
+        else:
+            next_sp = rest.find(" ", idx)
+            if next_sp == -1:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                )
+            left_raw = rest[idx:next_sp]
+            idx = next_sp
+        if idx >= len(rest) or rest[idx] != " ":
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+            )
+        while idx < len(rest) and rest[idx] == " ":
+            idx += 1
+        if idx >= len(rest):
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+            )
+        if rest[idx] == '"':
+            right_raw, end_idx = _consume_quoted_git_token(rest, idx)
+            if rest[end_idx:].strip():
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                )
+        else:
+            right_raw = rest[idx:].rstrip()
+    else:
+        trimmed = rest.strip()
+        parts = trimmed.split(" ")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            left_raw, right_raw = parts[0], parts[1]
+        else:
+            m = re.match(r"^a/(.+?) b/(.+)$", trimmed)
+            if m:
+                left_raw, right_raw = f"a/{m.group(1)}", f"b/{m.group(2)}"
+            elif len(trimmed) % 2 == 1:
+                mid = len(trimmed) // 2
+                if trimmed[mid] == " " and trimmed[:mid] == trimmed[mid + 1 :]:
+                    left_raw = right_raw = trimmed[:mid]
+                else:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                    )
+            else:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
+                )
+
+    if left_raw.startswith("a/") and right_raw.startswith("b/"):
+        left, right = left_raw[2:], right_raw[2:]
+    else:
+        left = (
+            left_raw[2:]
+            if left_raw.startswith("a/") and not right_raw.startswith("a/")
+            else left_raw
+        )
+        right = (
+            right_raw[2:]
+            if right_raw.startswith("b/") and not left_raw.startswith("b/")
+            else right_raw
+        )
+
+    if not left or not right:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff --git header {line!r}."
+        )
+    return left, right
+
+
+def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> str | None:
+    rest = line[len(header_prefix) :]
+    if rest.startswith('"'):
+        raw, end_idx = _consume_quoted_git_token(rest, 0)
+        trailing = rest[end_idx:]
+        if trailing and not trailing.startswith("\t") and trailing.strip():
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff header {line!r}."
+            )
+    else:
+        raw = rest.split("\t", 1)[0].strip()
+
+    if raw == "/dev/null":
+        return None
+    if not raw:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff header {line!r}."
+        )
+    if raw.startswith(git_prefix):
+        raw = raw[len(git_prefix) :]
+    if not raw:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: empty path after prefix in diff header {line!r}."
+        )
+    return raw
+
+
+def _parse_unified_patch(
+    patch_text: str,
+) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Parse git/unified diff path headers and added lines; fail closed on invalid headers."""
+    touched: list[str] = []
+    added_lines: list[str] = []
+    symlink_added_targets: list[tuple[str, str]] = []
+
+    def _add_touched(path_str: str) -> None:
+        if path_str != "/dev/null" and path_str not in touched:
+            touched.append(path_str)
+
+    in_hunk = False
+    old_rem = 0
+    new_rem = 0
+    current_is_symlink = False
+    current_section_paths: list[str] = []
+
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            in_hunk = False
+            old_rem = 0
+            new_rem = 0
+            current_is_symlink = False
+            current_section_paths = []
+            left, right = _parse_diff_git_line(line)
+            _add_touched(left)
+            _add_touched(right)
+            current_section_paths.extend([left, right])
+            continue
+
+        if line.startswith("@@"):
+            m = _HUNK_HEADER_RE.match(line)
+            if m is None:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff hunk header {line!r}."
+                )
+            old_rem = int(m.group(2)) if m.group(2) is not None else 1
+            new_rem = int(m.group(4)) if m.group(4) is not None else 1
+            in_hunk = old_rem > 0 or new_rem > 0
+            continue
+
+        if in_hunk:
+            if line.startswith("+"):
+                added = line[1:]
+                added_lines.append(added)
+                if current_is_symlink:
+                    link_rel = current_section_paths[-1] if current_section_paths else ""
+                    symlink_added_targets.append((link_rel, added))
+                new_rem -= 1
+            elif line.startswith("-"):
+                old_rem -= 1
+            elif line.startswith(" ") or line == "":
+                old_rem -= 1
+                new_rem -= 1
+            elif line.startswith("\\"):
+                pass
+            else:
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: malformed diff hunk body line {line!r}."
+                )
+            if old_rem <= 0 and new_rem <= 0:
+                in_hunk = False
+            continue
+
+        if line.startswith(
+            (
+                "new file mode 120000",
+                "deleted file mode 120000",
+                "old mode 120000",
+                "new mode 120000",
+            )
+        ):
+            current_is_symlink = True
+            continue
+        if line.startswith("index ") and line.rstrip().endswith(" 120000"):
+            current_is_symlink = True
+            continue
+
+        if line.startswith("--- "):
+            p = _parse_minus_plus_header(line, "--- ", "a/")
+            if p is not None:
+                _add_touched(p)
+                current_section_paths.append(p)
+            continue
+
+        if line.startswith("+++ "):
+            p = _parse_minus_plus_header(line, "+++ ", "b/")
+            if p is not None:
+                _add_touched(p)
+                current_section_paths.append(p)
+            continue
+
+        matched_meta = False
+        for meta_hdr in ("rename from ", "rename to ", "copy from ", "copy to "):
+            if line.startswith(meta_hdr):
+                raw_meta = line[len(meta_hdr) :].strip()
+                if not raw_meta:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in {meta_hdr.strip()} header."
+                    )
+                unquoted = _unquote_git_path(raw_meta)
+                if not unquoted:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in {meta_hdr.strip()} header."
+                    )
+                _add_touched(unquoted)
+                current_section_paths.append(unquoted)
+                matched_meta = True
+                break
+        if matched_meta:
+            continue
+
+        if line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line[1:])
+
+    if patch_text.strip() and not touched:
+        raise PolicyImmutabilityError(
+            f"{POLICY_IMMUTABILITY_VIOLATION}: non-empty patch yielded zero touched paths."
+        )
+
+    return touched, added_lines, symlink_added_targets
+
+
 def _handle_evaluate_patch(args: argparse.Namespace) -> int:
     if not args.repo:
         raise FactoryError("Missing --repo / GROKBOT_FACTORY_REPO for evaluate-patch.")
@@ -492,47 +804,24 @@ def _handle_evaluate_patch(args: argparse.Namespace) -> int:
 
     patch_text = patch_path.read_text(encoding="utf-8")
     touched: list[str] = []
-    added_lines: list[str] = []
-    for line in patch_text.splitlines():
-        if line.startswith("diff --git "):
-            m = re.match(r"^diff --git a/(.+?) b/(.+)$", line)
-            if m:
-                for p in (m.group(1), m.group(2)):
-                    if p != "/dev/null" and p not in touched:
-                        touched.append(p)
-        elif line.startswith("--- a/") or line.startswith("+++ b/"):
-            p = line[6:].strip()
-            if p and p not in touched:
-                touched.append(p)
-        elif line.startswith("+") and not line.startswith("+++"):
-            added_lines.append(line[1:])
-
     guard = PolicyGuard(forbidden_paths=[*forbidden_dbs, *forbidden_creds])
     try:
+        touched, added_lines, symlink_added_targets = _parse_unified_patch(patch_text)
         guard.check_candidate_paths(touched)
-        forbidden_tokens = guard._normalize_forbidden_paths(
-            [*forbidden_dbs, *forbidden_creds]
+        exact_tokens, basename_patterns, forbidden_resolved, forbidden_names = (
+            guard.check_repo_symlinks(repo_path, touched)
         )
-        for added in added_lines:
-            for pat in _POLICY_BYPASS_PATTERNS:
-                if pat.search(added):
-                    raise PolicyImmutabilityError(
-                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch attempted to "
-                        f"weaken policy/verification guard ({pat.pattern}).",
-                        offending_paths=tuple(touched),
-                    )
-            for pat in _ISOLATION_BREACH_PATTERNS:
-                if pat.search(added):
-                    raise IsolationBoundaryError(
-                        f"{ISOLATION_BOUNDARY_VIOLATION}: patch referenced "
-                        f"forbidden runtime DB or credential boundary ({pat.pattern})."
-                    )
-            for tok in forbidden_tokens:
-                if tok in added:
-                    raise IsolationBoundaryError(
-                        f"{ISOLATION_BOUNDARY_VIOLATION}: patch referenced "
-                        f"forbidden path ({tok})."
-                    )
+        guard.check_added_lines(
+            added_lines,
+            touched_paths=touched,
+            repo_path=repo_path,
+            extra_search_dirs=[patch_path.resolve().parent, Path.cwd()],
+            exact_tokens=exact_tokens,
+            basename_patterns=basename_patterns,
+            forbidden_resolved=forbidden_resolved,
+            forbidden_names=forbidden_names,
+            symlink_added_targets=symlink_added_targets,
+        )
     except (PolicyImmutabilityError, IsolationBoundaryError) as exc:
         violation_code = (
             POLICY_IMMUTABILITY_VIOLATION

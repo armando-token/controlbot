@@ -710,3 +710,259 @@ def test_factory_cli_evaluate_patch_and_run_cycle_exhaustion_and_md_backlog(
     ex2 = json.loads(capsys.readouterr().out)
     assert ex2["attempts_used"] == 2
     assert "PAUSED" in ex2["status"]
+
+
+@pytest.mark.n1
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "",
+        ".",
+        "./",
+        "/abs/path",
+        "/etc/passwd",
+        "../outside",
+        "foo/../../outside.py",
+        "foo/../tests/acceptance/test_a01.py",
+        "foo/../app.py",
+        "src/./contracts/models.py",
+        "./tests/e2e/tier1/test_f01.py",
+        "src\\contracts\\models.py",
+    ],
+)
+def test_policy_guard_normalizes_and_rejects_traversal_paths(bad_path: str) -> None:
+    guard = PolicyGuard()
+    assert guard.is_immutable_path(bad_path) is True
+    with pytest.raises(PolicyImmutabilityError, match="POLICY_IMMUTABILITY_VIOLATION"):
+        guard.check_candidate_paths([bad_path])
+
+
+@pytest.mark.n1
+def test_evaluate_patch_hardening_noprefix_rename_traversal_symlink_and_short_forbidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lab_repo = tmp_path / "lab_repo"
+    _init_git_repo(lab_repo)
+    (lab_repo / "tests" / "acceptance").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "tests" / "acceptance" / "test_a01.py").write_text(
+        "def test_a01() -> None:\n    assert False\n", encoding="utf-8"
+    )
+    (lab_repo / "src" / "contracts").mkdir(parents=True, exist_ok=True)
+    (lab_repo / "src" / "contracts" / "models.py").write_text(
+        "ALLOW = False\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(lab_repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "commit", "-m", "add acceptance & contracts"],
+        check=True,
+        capture_output=True,
+    )
+    base_head = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    db_path = tmp_path / "factory_hardening.db"
+
+    def _run_eval(patch_file: Path) -> tuple[int, dict[str, object]]:
+        rc = factory_cli_main(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(patch_file),
+                "--json",
+            ]
+        )
+        out = capsys.readouterr().out
+        return rc, json.loads(out)
+
+    # 1. git diff --no-prefix on tests/acceptance/test_a01.py
+    (lab_repo / "tests" / "acceptance" / "test_a01.py").write_text(
+        "def test_a01() -> None:\n    assert True\n", encoding="utf-8"
+    )
+    noprefix_diff = subprocess.run(
+        ["git", "-C", str(lab_repo), "diff", "--no-prefix"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    subprocess.run(
+        ["git", "-C", str(lab_repo), "checkout", "--", "."], check=True, capture_output=True
+    )
+    p_noprefix = tmp_path / "noprefix.patch"
+    p_noprefix.write_text(noprefix_diff, encoding="utf-8")
+    rc, payload = _run_eval(p_noprefix)
+    assert rc == 1
+    assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+    assert "tests/acceptance/test_a01.py" in payload["touched_paths"]  # type: ignore[operator]
+
+    # 2. Pure rename without a/ b/
+    p_rename = tmp_path / "rename.patch"
+    p_rename.write_text(
+        "diff --git app.py tests/acceptance/test_a01.py\n"
+        "rename from app.py\n"
+        "rename to tests/acceptance/test_a01.py\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_eval(p_rename)
+    assert rc == 1
+    assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 3. Quoted git path + copy to
+    p_quoted = tmp_path / "quoted.patch"
+    p_quoted.write_text(
+        'diff --git "app.py" "tests/acceptance/my test.py"\n'
+        'copy from app.py\n'
+        'copy to "tests/acceptance/my test.py"\n',
+        encoding="utf-8",
+    )
+    rc, payload = _run_eval(p_quoted)
+    assert rc == 1
+    assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 4. Internal ./ and ../ traversals
+    for name, rel in [
+        ("dot", "src/./contracts/models.py"),
+        ("traversal", "foo/../tests/acceptance/test_a01.py"),
+    ]:
+        p_trav = tmp_path / f"{name}.patch"
+        p_trav.write_text(
+            f"diff --git a/{rel} b/{rel}\n"
+            f"--- a/{rel}\n"
+            f"+++ b/{rel}\n"
+            "@@ -1 +1 @@\n"
+            "-x = 1\n"
+            "+x = 2\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_trav)
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 5. Non-empty garbage patch yielding zero touched_paths & unparseable header
+    for name, content in [
+        ("garbage", "not a unified diff at all\n"),
+        ("bad_header", "diff --git only_one_token\n"),
+    ]:
+        p_bad = tmp_path / f"{name}.patch"
+        p_bad.write_text(content, encoding="utf-8")
+        rc, payload = _run_eval(p_bad)
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # 6. Symlink in repo pointing to immutable file or outside repo
+    if os.name == "posix":
+        immut_link = lab_repo / "sneaky_immut.py"
+        immut_link.symlink_to("tests/acceptance/test_a01.py")
+        p_sym_immut = tmp_path / "sym_immut.patch"
+        p_sym_immut.write_text(
+            "diff --git a/sneaky_immut.py b/sneaky_immut.py\n"
+            "--- a/sneaky_immut.py\n"
+            "+++ b/sneaky_immut.py\n"
+            "@@ -1 +1 @@\n"
+            "-x = 1\n"
+            "+x = 2\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_sym_immut)
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        immut_link.unlink()
+
+        outside_target = tmp_path / "outside.py"
+        outside_target.write_text("X = 1\n", encoding="utf-8")
+        esc_link = lab_repo / "escape_link.py"
+        esc_link.symlink_to(outside_target)
+        p_sym_esc = tmp_path / "sym_esc.patch"
+        p_sym_esc.write_text(
+            "diff --git a/escape_link.py b/escape_link.py\n"
+            "--- a/escape_link.py\n"
+            "+++ b/escape_link.py\n"
+            "@@ -1 +1 @@\n"
+            "-X = 1\n"
+            "+X = 2\n",
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_sym_esc)
+        assert rc == 1
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+        esc_link.unlink()
+
+    # 7. GROKBOT_FORBIDDEN_PATHS short basename (rt.db) & symlink (alias_link.db -> rt.db)
+    rt_db = tmp_path / "rt.db"
+    rt_db.write_bytes(b"sqlite")
+    monkeypatch.setenv("GROKBOT_FORBIDDEN_PATHS", str(rt_db))
+
+    p_short = tmp_path / "short_forb.patch"
+    p_short.write_text(
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def compute_steps() -> int:\n"
+        "-    return 50\n"
+        '+    return len(open("rt.db", "rb").read())\n',
+        encoding="utf-8",
+    )
+    rc, payload = _run_eval(p_short)
+    assert rc == 1
+    assert payload["violation"] == "ISOLATION_BOUNDARY_VIOLATION"
+
+    if os.name == "posix":
+        alias_link = lab_repo / "alias_link.db"
+        alias_link.symlink_to(rt_db)
+        p_alias = tmp_path / "alias_forb.patch"
+        p_alias.write_text(
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def compute_steps() -> int:\n"
+            "-    return 50\n"
+            '+    return len(open("alias_link.db", "rb").read())\n',
+            encoding="utf-8",
+        )
+        rc, payload = _run_eval(p_alias)
+        assert rc == 1
+        assert payload["violation"] == "ISOLATION_BOUNDARY_VIOLATION"
+        alias_link.unlink()
+
+    # 8. Valid unrelated unprefixed patch (even with "smart.db" string) must remain ALLOWED
+    p_valid = tmp_path / "valid_noprefix.patch"
+    p_valid.write_text(
+        "diff --git app.py app.py\n"
+        "--- app.py\n"
+        "+++ app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def compute_steps() -> int:\n"
+        "-    return 50\n"
+        '+    _label = "smart.db"\n'
+        "+    return 25\n",
+        encoding="utf-8",
+    )
+    rc, payload = _run_eval(p_valid)
+    assert rc == 0
+    assert payload["status"] == "ALLOWED"
+    assert payload["policy_passed"] is True
+
+    # Repo HEAD untouched & audit log persisted
+    head_after = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after == base_head
+    conn = open_factory_connection(db_path)
+    try:
+        rows = conn.execute("SELECT decision FROM factory_audit_log;").fetchall()
+        assert len(rows) >= 10
+    finally:
+        conn.close()
