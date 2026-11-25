@@ -10,7 +10,7 @@
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas M7-T3 verificado**: `93b7e0c421cfebceb8c66066d7819b292c6c44fc` (`fix(m7-t3): resolve crash recovery, poller loop guard, depth=1 delegation, factory/deploy/benchmark CLIs & ambiguity observations`)
+- **Commit de código y pruebas M7-T3 verificado**: `25ff3229ca1dfbcc220b25651464ba874be5d4ad` (`fix(m7-t3): harden evaluate-patch diff parsing, path normalization, symlink/forbidden checks & demo timestamp`)
 - **Cadena de commits de hitos en `main`**:
   - `d95e98e` — `chore(m1): initialize repo, diagnostics, frozen contracts, research & ADRs`
   - `ccadffc` — `M1: remediate mypy e2e exclusion, redaction hardening, contract invariants, and doctor checks`
@@ -25,6 +25,8 @@
   - `16acc13` — `fix(m7-t2): resolve policy denial evidence, config validation, dual backend routing, benchmark gate, N3 summary & factory CLI`
   - `95d9fe1` — `docs(night-report): update NIGHT_REPORT with M7-T2 commit SHA 16acc13 and verification counts`
   - `93b7e0c` — `fix(m7-t3): resolve crash recovery, poller loop guard, depth=1 delegation, factory/deploy/benchmark CLIs & ambiguity observations`
+  - `03f681b` — `docs(night-report): update NIGHT_REPORT with M7-T3 commit SHA 93b7e0c and verification counts`
+  - `25ff322` — `fix(m7-t3): harden evaluate-patch diff parsing, path normalization, symlink/forbidden checks & demo timestamp`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -73,10 +75,10 @@
 
 ### 3.3 Resultados medidos (Benchmarks M6 & Fábrica M7)
 - **Benchmark comparativo emparejado (`13` escenarios N1/N2 ejecutables; `A11` = `PENDING_N3_LINUX_ENV`)**:
-   - **Modo `emulated`** (`make bench`, commit `93b7e0c`):
-     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=414.22ms`, `p95=431.18ms`.
-     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1235.26ms`, `p95=1472.25ms`, `tool_calls=34`, `model_calls=42`, `tokens=3514`, `RAM=79.89 MB`.
-     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.238s`, `verified_succeeded=True`.
+   - **Modo `emulated`** (`make bench`, commit `25ff322`):
+     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=414.25ms`, `p95=430.95ms`.
+     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1237.04ms`, `p95=1469.93ms`, `tool_calls=34`, `model_calls=42`, `tokens=3514`, `RAM=79.89 MB`.
+     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.237s`, `verified_succeeded=True`.
    - **Modo `local_http` contra servidor mock OpenAI en loopback** (`python -m benchmarks.runner --mode local_http --json`):
      - `GrokbotEngine`: **`13/13` (`100.0%`)**, `model_type="local_http_mock"`, `promotion_eligible=True`, `median=1239.283ms`, `p95=1534.818ms`, `tool_calls=36`, `model_calls=44`, `tokens=3656`, `RAM=80.50 MB`, `A12 verified_succeeded=True`.
    - **Fail-closed con endpoint local inalcanzable** (`--mode local_http --llm-origin http://127.0.0.1:9 --scenarios A08,A09`):
@@ -93,7 +95,7 @@
 - **`make doctor`**: Exit `0` (`n1_ready=True`, `n2_ready=True`, `n3_status=PENDING_N3_LINUX_ENV`).
 - **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`).
 - **`make typecheck`**: Exit `0` (`Success: no issues found in 99 source files`, `mypy --strict`).
-- **`make test-n1`**: Exit `0` (**`105 passed`**).
+- **`make test-n1`**: Exit `0` (**`118 passed`**).
 - **`make test-n2`**: Exit `0` (**`42 passed`**, `0` warnings).
 - **`make test-acceptance`**: Exit `0` (**`19 passed`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
