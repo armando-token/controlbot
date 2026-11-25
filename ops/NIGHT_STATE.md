@@ -1,8 +1,9 @@
 # NIGHT_STATE — Grokbot-clon
 
 - **Run Start (UTC)**: `2026-11-25T09:07:18Z`
-- **Last Updated (UTC)**: `2026-11-25T12:14:00Z`
-- **Local Time**: `2026-11-25 04:14 PST` (America/Los_Angeles)
+- **Last Updated (UTC)**: `2026-11-25T22:29:00Z`
+- **Local Time**: `2026-11-25 14:29 PST` (America/Los_Angeles)
+- **Workspace Path**: `/Users/armandosilva/Projects/Grokbotclon`
 - **Night Budget Window**: `09:07Z–17:07Z` (8 hours wall-clock budget, max 3 concurrent tracks, last 35 minutes reserved for integration, verification, and reporting per Megaplan §2.1 & §5.1)
 - **Governing Specification**: `MEGAPLAN_IMPLEMENTACION_GROKBOT_LINUX_TEAMWORK.md` (untouched, `49719` bytes, sha256 `451b5147e3d2f12d478a82bf86a6c6ca361d4b76452ea1a5840b87a364f74eb8`)
 - **Product State Label**: `flujo con emulador (N1/N2 verificados; N3 Linux pendiente)`
@@ -50,4 +51,6 @@ These personal-account library links are inaccessible to local/offline agents. A
 | **M4** | Full wiring, `LocalHttpModelClient` + mock HTTP tests + N3 probe, human takeover + `A10`, subprocess `SIGKILL` (`A08`, `A14`), Linux AT-SPI interface + probe, `A01`–`A14` suite, `make demo` | `DONE` (`7eb9885`, `0e5a3ac`) | `67` N1 + `29` N2 + `14` acceptance pass, `make demo` pass; N3 stays `PENDING_N3_LINUX_ENV` |
 | **M5** | `benchmarks/` (`>=12` scenarios, fixed baseline vs engine), `lab/configs/facility_b.json` + Area 2 `A12` portability, `make bench` | `DONE` (`d2a027d`, `5cc4962`) | `13/13` GrokbotEngine vs `1/13` RuleBasedBaseline; `0` engine LOC delta on `A12` |
 | **M6** | `src/factory/` (M7 local software factory), `deploy/` (M8 declarative config + rollback + offline runbook), `scripts/verify_n3_linux.sh`, `Makefile` (`test-n3`, `test-offline`), integration fixes, `README.md`, `THIRD_PARTY_NOTICES.md`, `ops/NIGHT_REPORT.md` | `DONE` (`6a11a47` + docs commit) | `97` N1 + `41` N2 + `19` acceptance + `20` offline + `2` N3 skipped; `make demo`, `make bench`, `src.factory.demo` pass |
-| **M7 (E2E)** | Parallel E2E Tracking suite Tiers 1–4 pass + Tier 5 adversarial hardening | `PLANNED` | Depends on M6 & `TEST_READY.md` |
+| **M7 (E2E + Tier 5)** | Parallel E2E Tracking suite Tiers 1–4 pass (`230/230`) + Tier 5 adversarial coverage hardening (`T5-01`..`T5-23`) | `DONE` (`6c0146c`) | `230/230` E2E Tiers 1–4 (`99/99` T1, `99/99` T2, `22/22` T3, `10/10` T4) + `28/28` `@pytest.mark.tier5`; `148` N1 + `48` N2 + `19` acceptance + `26` offline + `2` N3 skipped (`PENDING_N3_LINUX_ENV`) |
+| **M8_CAPSTONE** | `AntigravityCliModelClient`, ArtCraft Office (`.xlsx`/`.docx`), 3rd authenticated portal | `PAUSED / DEFERRED` | Paused per user request (`2026-11-25T21:31:15Z`) so M1–M7 can be tested immediately; blueprints `c7b61f5c` & `5d5e2b7b` preserved |
+| **N3 Linux Pilot** | Linux `netns`/`iptables` `A11`, real local LLM weights, live `AT-SPI`/X11/Wayland (`B-N3-01..04`) | `PENDING_N3_LINUX_ENV` | Packaged with `scripts/verify_n3_linux.sh` and `deploy/OFFLINE_RUNBOOK.md` for target Linux host |
