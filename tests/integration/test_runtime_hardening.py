@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,11 +21,21 @@ from lab.scada_app import create_scada_app
 from lab.testing import run_asgi_server
 from src.adapters import MappingCredentialProvider, load_facility_config, make_session_id
 from src.contracts.common import PlanValidationError, utc_now
-from src.contracts.enums import BackendMode, ReceiptOutcome, TaskStatus
-from src.contracts.models import TaskScope, TaskSpec
-from src.model import EmulatedModelClient, ModelProtocolError
+from src.contracts.enums import BackendMode, EffectClass, ReceiptOutcome, TaskStatus
+from src.contracts.models import TaskScope, TaskSpec, ToolSpec
+from src.engine.coordinator import Coordinator, CoordinatorConfig
+from src.engine.tool_registry import ToolExecutionContext, ToolRegistry
+from src.model import (
+    EmulatedModelClient,
+    EmulatedTurn,
+    ModelDecision,
+    ModelProtocolError,
+    ModelToolCall,
+    ModelUsage,
+)
 from src.runtime import build_runtime
 from src.storage.redaction import contains_unredacted_secret_strict
+from src.storage.repo import StorageRepo
 
 _FACILITY_A_PATH = Path("lab/configs/facility_a.json")
 
@@ -679,4 +690,409 @@ async def test_runtime_inline_secret_in_query_scrubbed_for_prompt_context_and_se
                 ctx.query == "check bomba 34 token=[REDACTED]"
                 for ctx in runtime.model_client.call_history
             )
+
+
+@pytest.mark.n2
+async def test_web_rejects_invalid_or_secret_task_user_profile_ids_without_stranding_runs(
+    tmp_path: Path,
+) -> None:
+    ref_time = utc_now()
+    scada_app = create_scada_app(fixture_mode="default")
+    maint_app = create_maintenance_app(fixture_mode="default")
+    scada_app.state.scada_state.set_reference_time(ref_time)
+    maint_app.state.maintenance_state.set_reference_time(ref_time)
+    creds = MappingCredentialProvider(
+        {
+            ("operator_ro", "p1", "scada"): ("operator_ro", "scada-pass-ro"),
+            ("operator_ro", "p1", "maintenance"): ("maint_ro", "maint-pass-ro"),
+        }
+    )
+
+    async with (
+        run_asgi_server(scada_app) as scada_origin,
+        run_asgi_server(maint_app) as maint_origin,
+    ):
+        cfg = load_facility_config(
+            _FACILITY_A_PATH,
+            {"scada": scada_origin, "maintenance": maint_origin},
+        )
+        runtime = build_runtime(
+            db_path=tmp_path / "invalid_ids.sqlite3",
+            profile_root=tmp_path / "profiles",
+            facility_config=cfg,
+            credential_provider=creds,
+            reference_time_fn=lambda: ref_time,
+        )
+        async with (
+            runtime,
+            run_asgi_server(runtime.app) as web_origin,
+            httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+        ):
+            bad_payloads = [
+                (
+                    {
+                        "user_id": "operator_ro",
+                        "profile_id": "password=secret",
+                        "facility_id": "facility-a",
+                        "allowed_origins": [scada_origin, maint_origin],
+                        "allowed_areas": ["area-1"],
+                        "query": "check bomba 34",
+                    },
+                    422,
+                    True,
+                ),
+                (
+                    {
+                        "user_id": "password=secret",
+                        "profile_id": "p1",
+                        "facility_id": "facility-a",
+                        "allowed_origins": [scada_origin, maint_origin],
+                        "allowed_areas": ["area-1"],
+                        "query": "check bomba 34",
+                    },
+                    422,
+                    True,
+                ),
+                (
+                    {
+                        "user_id": "operator_ro",
+                        "profile_id": "../evil",
+                        "facility_id": "facility-a",
+                        "allowed_origins": [scada_origin, maint_origin],
+                        "allowed_areas": ["area-1"],
+                        "query": "check bomba 34",
+                    },
+                    422,
+                    False,
+                ),
+                (
+                    {
+                        "task_id": "password=secret",
+                        "user_id": "operator_ro",
+                        "profile_id": "p1",
+                        "facility_id": "facility-a",
+                        "allowed_origins": [scada_origin, maint_origin],
+                        "allowed_areas": ["area-1"],
+                        "query": "check bomba 34",
+                    },
+                    409,
+                    False,
+                ),
+            ]
+            for payload, expected_status, expect_redacted in bad_payloads:
+                resp = await client.post("/api/tasks", json=payload)
+                assert resp.status_code == expected_status
+                assert "password=secret" not in resp.text
+                assert not contains_unredacted_secret_strict(resp.json())
+                if expect_redacted:
+                    assert "password=[REDACTED]" in resp.text
+
+            # Direct adapter submit_task also rejects unsafe segments with PlanValidationError
+            with pytest.raises(PlanValidationError):
+                runtime.web_coordinator.submit_task(
+                    TaskSpec(
+                        task_id="task-bad-seg",
+                        user_id="operator_ro",
+                        profile_id="../evil",
+                        scope=TaskScope(
+                            facility_id="facility-a",
+                            allowed_origins=(scada_origin, maint_origin),
+                            allowed_areas=("area-1",),
+                        ),
+                        query="check bomba 34",
+                    )
+                )
+
+            listed = (await client.get("/api/tasks")).json()
+            assert listed["tasks"] == []
+
+
+@pytest.mark.n2
+async def test_web_422_validation_error_scrubs_secrets_in_evidence_requirements(
+    tmp_path: Path,
+) -> None:
+    ref_time = utc_now()
+    scada_app = create_scada_app(fixture_mode="default")
+    maint_app = create_maintenance_app(fixture_mode="default")
+    scada_app.state.scada_state.set_reference_time(ref_time)
+    maint_app.state.maintenance_state.set_reference_time(ref_time)
+    creds = MappingCredentialProvider(
+        {
+            ("operator_ro", "p1", "scada"): ("operator_ro", "scada-pass-ro"),
+            ("operator_ro", "p1", "maintenance"): ("maint_ro", "maint-pass-ro"),
+        }
+    )
+
+    async with (
+        run_asgi_server(scada_app) as scada_origin,
+        run_asgi_server(maint_app) as maint_origin,
+    ):
+        cfg = load_facility_config(
+            _FACILITY_A_PATH,
+            {"scada": scada_origin, "maintenance": maint_origin},
+        )
+        runtime = build_runtime(
+            db_path=tmp_path / "validation_422.sqlite3",
+            profile_root=tmp_path / "profiles",
+            facility_config=cfg,
+            credential_provider=creds,
+            reference_time_fn=lambda: ref_time,
+        )
+        async with (
+            runtime,
+            run_asgi_server(runtime.app) as web_origin,
+            httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+        ):
+            r1 = await client.post(
+                "/api/tasks",
+                json={
+                    "query": "check bomba 34",
+                    "evidence_requirements": {"password=secret": 1},
+                },
+            )
+            assert r1.status_code == 422
+            assert "password=secret" not in r1.text
+            assert "password=[REDACTED]" in r1.text
+            assert not contains_unredacted_secret_strict(r1.json())
+
+            r2 = await client.post(
+                "/api/tasks",
+                json={
+                    "query": "check bomba 34",
+                    "evidence_requirements": {"min_sources": "password=secret"},
+                },
+            )
+            assert r2.status_code == 422
+            assert "password=secret" not in r2.text
+            assert "password=[REDACTED]" in r2.text
+            assert not contains_unredacted_secret_strict(r2.json())
+
+            r3 = await client.post(
+                "/api/tasks",
+                json={
+                    "query": "check bomba 34",
+                    "evidence_requirements": {"password": "raw_secret_val_99"},
+                },
+            )
+            assert r3.status_code == 422
+            assert "raw_secret_val_99" not in r3.text
+            assert "[REDACTED]" in r3.text
+            assert not contains_unredacted_secret_strict(r3.json())
+
+
+@pytest.mark.n2
+async def test_coordinator_run_loop_settles_failed_on_unexpected_step_value_error(
+    tmp_path: Path,
+) -> None:
+    repo = StorageRepo(tmp_path / "coord_defense.sqlite3")
+    repo.init_db()
+
+    registry = ToolRegistry()
+    tool_spec = ToolSpec(
+        tool_id="scada.read_alarms",
+        version="1.0.0",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+        output_schema={"type": "object", "properties": {}, "additionalProperties": True},
+        permissions=(),
+        allowed_origins=("http://127.0.0.1:9001",),
+        effect_class=EffectClass.READ,
+        verifier_name="default_verifier",
+    )
+
+    async def _handler(_args: dict[str, Any], _ctx: ToolExecutionContext) -> dict[str, Any]:
+        return {"output": {"ok": True}}
+
+    registry.register(tool_spec, _handler)
+
+    model = EmulatedModelClient(
+        mode="custom",
+        turn_factory=lambda _ctx, _tools, _rem: EmulatedTurn(
+            decision=ModelDecision(
+                decision_type="tool_call",
+                tool_call=ModelToolCall(
+                    tool_id="scada.read_alarms",
+                    args={"asset": "bomba 34"},
+                    target_origin="http://127.0.0.1:9001",
+                    completion_verifier="default_verifier",
+                ),
+                usage=ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            )
+        ),
+    )
+
+    def _failing_resolver(_task: TaskSpec, _tool_id: str) -> str | None:
+        raise ValueError("Invalid profile_id segment for profile path: 'password=secret'")
+
+    coord = Coordinator(
+        repo,
+        model,
+        registry,
+        config=CoordinatorConfig(),
+        session_id_resolver=_failing_resolver,
+    )
+
+    # Bypass submit_task directly via StorageRepo to verify _run_loop defense-in-depth
+    spec = TaskSpec(
+        task_id="task-defense-1",
+        user_id="operator_ro",
+        profile_id="password=secret",
+        scope=TaskScope(
+            facility_id="facility-a",
+            allowed_origins=("http://127.0.0.1:9001",),
+            allowed_areas=("area-1",),
+        ),
+        query="check bomba 34",
+    )
+    _, run = repo.create_task_and_run(spec)
+    result = await coord.run_until_settled(run.run_id)
+
+    assert result.status == TaskStatus.FAILED
+    assert "password=secret" not in result.answer
+    assert "password=[REDACTED]" in result.answer
+
+    snap = repo.get_run_snapshot(run.run_id)
+    assert snap.run.status == TaskStatus.FAILED
+    assert snap.run.transition_reason == "unexpected_execution_error"
+    assert repo.list_active_reservations() == []
+    audits = repo.list_audit_logs(task_id=spec.task_id)
+    assert any(a.action == "unexpected_execution_error" for a in audits)
+    assert not contains_unredacted_secret_strict([a.model_dump() for a in audits])
+
+
+@pytest.mark.n2
+async def test_web_422_and_tool_registry_scrub_secret_dict_keys_and_auth_tokens(
+    tmp_path: Path,
+) -> None:
+    ref_time = utc_now()
+    scada_app = create_scada_app(fixture_mode="default")
+    maint_app = create_maintenance_app(fixture_mode="default")
+    scada_app.state.scada_state.set_reference_time(ref_time)
+    maint_app.state.maintenance_state.set_reference_time(ref_time)
+    creds = MappingCredentialProvider(
+        {
+            ("operator_ro", "p1", "scada"): ("operator_ro", "scada-pass-ro"),
+            ("operator_ro", "p1", "maintenance"): ("maint_ro", "maint-pass-ro"),
+        }
+    )
+
+    async with (
+        run_asgi_server(scada_app) as scada_origin,
+        run_asgi_server(maint_app) as maint_origin,
+    ):
+        cfg = load_facility_config(
+            _FACILITY_A_PATH,
+            {"scada": scada_origin, "maintenance": maint_origin},
+        )
+        runtime = build_runtime(
+            db_path=tmp_path / "dict_keys_422.sqlite3",
+            profile_root=tmp_path / "profiles",
+            facility_config=cfg,
+            credential_provider=creds,
+            reference_time_fn=lambda: ref_time,
+        )
+        async with (
+            runtime,
+            run_asgi_server(runtime.app) as web_origin,
+            httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+        ):
+            r_nested = await client.post(
+                "/api/tasks",
+                json={
+                    "query": "check bomba 34",
+                    "evidence_requirements": {"min_sources": {"password=secret": 1}},
+                },
+            )
+            assert r_nested.status_code == 422
+            assert "password=secret" not in r_nested.text
+            assert "password=[REDACTED]" in r_nested.text
+            assert not contains_unredacted_secret_strict(r_nested.json())
+
+            r_extra = await client.post(
+                "/api/tasks",
+                json={
+                    "query": "check bomba 34",
+                    "extra_obj": {
+                        "api_key=sk-live-999": 1,
+                        "Bearer topsecret": 2,
+                        "token=xyz": 3,
+                    },
+                },
+            )
+            assert r_extra.status_code == 422
+            for raw in ("api_key=sk-live-999", "sk-live-999", "Bearer topsecret", "token=xyz"):
+                assert raw not in r_extra.text
+            assert not contains_unredacted_secret_strict(r_extra.json())
+
+            r_auth = await client.post(
+                "/api/tasks",
+                json={
+                    "query": "check bomba 34",
+                    "user_id": "authorization=topsecret",
+                },
+            )
+            assert r_auth.status_code == 422
+            assert "topsecret" not in r_auth.text
+            assert "authorization=[REDACTED]" in r_auth.text
+            assert not contains_unredacted_secret_strict(r_auth.json())
+
+    # Verify ToolRegistry.invoke scrubs secret-bearing dict keys before ActionReceipt storage
+    repo = StorageRepo(tmp_path / "tool_dict_keys.sqlite3")
+    repo.init_db()
+    spec = TaskSpec(
+        task_id="task-tool-dict-key",
+        user_id="operator_ro",
+        profile_id="p1",
+        scope=TaskScope(
+            facility_id="facility-a",
+            allowed_origins=("http://127.0.0.1:9001",),
+            allowed_areas=("area-1",),
+            allowed_tools=("dummy.tool",),
+        ),
+        query="check bomba 34",
+    )
+    _, run = repo.create_task_and_run(spec)
+    step = repo.enqueue_step(run.run_id, "dummy.tool", {}, "default_verifier", EffectClass.READ)
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            tool_id="dummy.tool",
+            version="1.0.0",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+            output_schema={"type": "object", "properties": {}, "additionalProperties": True},
+            allowed_origins=("http://127.0.0.1:9001",),
+            effect_class=EffectClass.READ,
+            verifier_name="default_verifier",
+        ),
+        lambda _args, _ctx: {"output": {"ok": True}},
+    )
+    ctx = ToolExecutionContext(
+        task_id=spec.task_id,
+        run_id=run.run_id,
+        step_id=step.step_id,
+        attempt=1,
+        operation_key=step.operation_key,
+        scope=spec.scope,
+        target_origin="http://127.0.0.1:9001",
+        deadline_at=utc_now() + timedelta(seconds=30),
+    )
+    tool_res = await registry.invoke(
+        "dummy.tool",
+        {"password=secret": 1, "Bearer topsecret": 2, "cookie=abc": "set_cookie=xyz"},
+        ctx,
+    )
+    assert tool_res.receipt.redacted_args == {
+        "password=[REDACTED]": 1,
+        "Bearer [REDACTED]": 2,
+        "cookie=[REDACTED]": "set_cookie=[REDACTED]",
+    }
+    assert not contains_unredacted_secret_strict(tool_res.receipt.model_dump())
+    repo.append_receipt(tool_res.receipt)
+    stored = repo.get_run_snapshot(run.run_id).receipts
+    assert len(stored) == 1
+    assert stored[0].redacted_args == {
+        "password=[REDACTED]": 1,
+        "Bearer [REDACTED]": 2,
+        "cookie=[REDACTED]": "set_cookie=[REDACTED]",
+    }
 

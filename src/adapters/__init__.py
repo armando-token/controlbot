@@ -57,6 +57,7 @@ from src.adapters.sessions import (
     TakeoverConflictError,
     TakeoverStateError,
     make_session_id,
+    validate_session_segment,
 )
 from src.adapters.verifier import Verifier
 
@@ -115,4 +116,5 @@ __all__ = [
     "resolve_asset_candidates",
     "run_pump34_flow",
     "scrub_for_receipt",
+    "validate_session_segment",
 ]

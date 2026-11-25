@@ -22,6 +22,7 @@ from src.storage import (
     StorageRepo,
     contains_unredacted_secret_strict,
     open_connection,
+    redact_payload_strict,
     redact_string_strict,
 )
 
@@ -493,3 +494,79 @@ def test_camelcase_query_param_secrets_redacted_and_detected(tmp_path: Path) -> 
     )
     with pytest.raises(ValueError, match="unredacted secret"):
         repo.append_receipt(bad_rcpt)
+
+
+@pytest.mark.n1
+def test_strict_redaction_scrubs_and_detects_secret_dict_keys_and_auth_tokens(
+    tmp_path: Path,
+) -> None:
+    raw_dict: dict[object, object] = {
+        "password=secret": 1,
+        "Bearer topsecret": 2,
+        "api_key=sk-live-999": {"token=xyz": "Bearer innersecret"},
+        ("cookie=abc", 1): "set_cookie=xyz",
+        42: "ok",
+    }
+    assert contains_unredacted_secret_strict(raw_dict) is True
+    assert contains_unredacted_secret_strict({"password=secret": 1}) is True
+    assert contains_unredacted_secret_strict({"Bearer topsecret": 2}) is True
+
+    scrubbed = redact_payload_strict(raw_dict)
+    assert scrubbed == {
+        "password=[REDACTED]": 1,
+        "Bearer [REDACTED]": 2,
+        "api_key=[REDACTED]": {"token=[REDACTED]": "Bearer [REDACTED]"},
+        ("cookie=[REDACTED]", 1): "set_cookie=[REDACTED]",
+        42: "ok",
+    }
+    assert contains_unredacted_secret_strict(scrubbed) is False
+
+    # Colliding secret-bearing keys remain deterministic and leak neither raw key
+    colliding = redact_payload_strict({"password=first": 1, "password=second": 2})
+    assert colliding == {"password=[REDACTED]": 2}
+    assert contains_unredacted_secret_strict(colliding) is False
+
+    # Inline authorization / cookie / header query tokens are scrubbed & detected
+    for raw, expected in (
+        ("authorization=topsecret", "authorization=[REDACTED]"),
+        ("cookie=abc", "cookie=[REDACTED]"),
+        ("cookies=session123", "cookies=[REDACTED]"),
+        ("set_cookie=xyz", "set_cookie=[REDACTED]"),
+        ("set-cookie=xyz", "set-cookie=[REDACTED]"),
+        ("x_api_key=sk1", "x_api_key=[REDACTED]"),
+        ("x-api-key=sk2", "x-api-key=[REDACTED]"),
+        ("id_token=id1", "id_token=[REDACTED]"),
+        ("bearer=tok1", "bearer=[REDACTED]"),
+    ):
+        assert contains_unredacted_secret_strict(raw) is True
+        assert redact_string_strict(raw) == expected
+        assert redact_payload_strict(raw) == expected
+        assert contains_unredacted_secret_strict(expected) is False
+
+    # Benign prose without inline secret=value remains untouched
+    for benign in ("authorization check ok", "cookie jar empty", "author=alice"):
+        assert contains_unredacted_secret_strict(benign) is False
+        assert redact_string_strict(benign) == benign
+
+    # StorageRepo fails closed if an ActionReceipt contains a secret-bearing dict key
+    db_path = tmp_path / "dict_key_redaction.db"
+    clock = FakeClock()
+    repo = StorageRepo(db_path, clock=clock)
+    repo.init_db()
+    task_spec, run = repo.create_task_and_run(_make_task("t-dict-key"))
+    step = repo.enqueue_step(run.run_id, "read_scada", {}, "v", EffectClass.READ)
+    bad_key_rcpt = ActionReceipt(
+        receipt_id="rcpt-bad-key",
+        task_id=task_spec.task_id,
+        run_id=run.run_id,
+        step_id=step.step_id,
+        attempt=1,
+        tool_id="read_scada",
+        redacted_args={"password=secret": 1, "Bearer topsecret": 2},
+        operation_key=step.operation_key,
+        duration_ms=1.0,
+        outcome=ReceiptOutcome.SUCCEEDED,
+        recorded_at=clock(),
+    )
+    with pytest.raises(ValueError, match="unredacted secret"):
+        repo.append_receipt(bad_key_rcpt)

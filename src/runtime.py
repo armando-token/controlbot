@@ -28,9 +28,10 @@ from src.adapters.sessions import (
     SessionOwnershipError,
     SessionTakenOverError,
     make_session_id,
+    validate_session_segment,
 )
 from src.adapters.verifier import Verifier
-from src.contracts.common import InvalidStateTransitionError, utc_now
+from src.contracts.common import InvalidStateTransitionError, PlanValidationError, utc_now
 from src.contracts.enums import BackendMode, is_terminal_status
 from src.contracts.models import Observation, Result, Run, TaskSpec, ToolSpec
 from src.engine.coordinator import Coordinator, CoordinatorConfig, ResultVerifier
@@ -549,6 +550,11 @@ class RuntimeCoordinatorAdapter:
                     )
                 }
             )
+        try:
+            validate_session_segment("user_id", effective_spec.user_id)
+            validate_session_segment("profile_id", effective_spec.profile_id)
+        except ValueError as exc:
+            raise PlanValidationError(str(exc)) from exc
         self._coordinator.validate_backend_mode(effective_spec)
         run = self._coordinator.submit_task(effective_spec)
         self._schedule_run(run.run_id)

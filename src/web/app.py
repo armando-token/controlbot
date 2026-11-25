@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import parse_qs, quote_plus
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
@@ -23,9 +25,11 @@ from src.adapters.sessions import (
 )
 from src.contracts.common import InvalidStateTransitionError, PlanValidationError
 from src.contracts.models import ActionReceipt, Run
+from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.storage.errors import ConflictError, NotFoundError
 from src.storage.redaction import (
     contains_unredacted_secret_strict,
+    is_sensitive_key_strict,
     redact_payload_strict,
 )
 from src.web.protocols import CoordinatorProtocol, SessionManagerProtocol, TaskSnapshot, maybe_await
@@ -181,6 +185,27 @@ def create_app(
     app.state.db_path = str(resolved_db) if resolved_db is not None else None
     app.state.coordinator = coord
     app.state.session_manager = sess_mgr
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        del request
+        encoded = jsonable_encoder(exc.errors())
+        if isinstance(encoded, list):
+            for err in encoded:
+                if isinstance(err, dict):
+                    loc = err.get("loc")
+                    if (
+                        isinstance(loc, list)
+                        and loc
+                        and is_sensitive_key_strict(str(loc[-1]))
+                        and err.get("input") is not None
+                    ):
+                        err["input"] = REDACTED_PLACEHOLDER
+        scrubbed = _scrub_and_verify(encoded, label="validation_error")
+        return JSONResponse(status_code=422, content={"detail": scrubbed})
 
     @app.get("/health")
     async def health() -> JSONResponse:

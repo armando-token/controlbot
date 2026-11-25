@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import uuid
 from collections.abc import Callable, Sequence
@@ -32,7 +33,11 @@ from src.contracts.models import (
 )
 from src.engine.budget import BudgetManager
 from src.engine.loop_detector import LoopDetector, canonical_json_hash
-from src.engine.redaction import redact_payload_strict, redact_string_strict
+from src.engine.redaction import (
+    contains_unredacted_secret_strict,
+    redact_payload_strict,
+    redact_string_strict,
+)
 from src.engine.tool_registry import ToolExecutionContext, ToolExecutionResult, ToolRegistry
 from src.model.http_client import LocalHttpModelClient
 from src.model.protocol import (
@@ -136,11 +141,24 @@ class Coordinator:
                 f"bound model client is {type(self._model_client).__name__}."
             )
 
+    def _validate_task_identifiers(self, task_spec: TaskSpec) -> None:
+        """Fail closed if task/user/profile identifiers contain unredacted secret material."""
+        for field_name, value in (
+            ("task_id", task_spec.task_id),
+            ("user_id", task_spec.user_id),
+            ("profile_id", task_spec.profile_id),
+        ):
+            if contains_unredacted_secret_strict(value):
+                raise PlanValidationError(
+                    f"TaskSpec.{field_name} must not contain unredacted secret material."
+                )
+
     def _now(self) -> datetime:
         return ensure_utc(self._clock())
 
     def submit_task(self, task_spec: TaskSpec, run_id: str | None = None) -> Run:
         """Persist a new TaskSpec and root Run in QUEUED status."""
+        self._validate_task_identifiers(task_spec)
         self.validate_backend_mode(task_spec)
         _, run = self._repo.create_task_and_run(task_spec, run_id=run_id)
         return run
@@ -611,6 +629,71 @@ class Coordinator:
                 else "resumed_after_recovery",
             )
 
+        observations: list[Observation] = list(snapshot.observations)
+        contradictions: list[ContradictionRecord] = []
+        try:
+            return await self._run_loop_body(
+                run_id=run_id,
+                snapshot=snapshot,
+                task_spec=task_spec,
+                task_id=task_id,
+                observations=observations,
+                contradictions=contradictions,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            latest = self._repo.get_run_snapshot(run_id)
+            if is_terminal_status(latest.run.status):
+                if latest.result is not None:
+                    return latest.result
+                return self._build_settled_result(
+                    task_spec=task_spec,
+                    run=latest.run,
+                    answer=f"Run reached terminal status {latest.run.status.value}.",
+                    observations=tuple(observations),
+                    contradictions=tuple(contradictions),
+                )
+            if latest.run.status == TaskStatus.WAITING_FOR_INPUT:
+                if latest.result is not None:
+                    return latest.result
+                return self._build_settled_result(
+                    task_spec=task_spec,
+                    run=latest.run,
+                    answer="Run is waiting for human input.",
+                    observations=tuple(observations),
+                    contradictions=tuple(contradictions),
+                    required_action=latest.run.required_action or "input_required",
+                )
+            safe_err = redact_string_strict(str(exc))
+            self._repo.append_audit_log(
+                task_id=task_id,
+                run_id=run_id,
+                actor="coordinator",
+                action="unexpected_execution_error",
+                decision="deny",
+                detail={"error_type": type(exc).__name__, "error": safe_err},
+            )
+            return self._settle_terminal(
+                task_spec=task_spec,
+                run_id=run_id,
+                target_status=TaskStatus.FAILED,
+                reason="unexpected_execution_error",
+                answer=f"Run failed due to unexpected execution error: {safe_err}",
+                observations=tuple(observations),
+                contradictions=tuple(contradictions),
+            )
+
+    async def _run_loop_body(
+        self,
+        *,
+        run_id: str,
+        snapshot: Any,
+        task_spec: TaskSpec,
+        task_id: str,
+        observations: list[Observation],
+        contradictions: list[ContradictionRecord],
+    ) -> Result:
         pending_human_input = self._repo.consume_pending_human_input(run_id)
         last_human_input: dict[str, Any] | None = pending_human_input
         if last_human_input is None:
@@ -620,8 +703,6 @@ class Coordinator:
                 ):
                     last_human_input = ev.payload["human_input"]
                     break
-        observations: list[Observation] = list(snapshot.observations)
-        contradictions: list[ContradictionRecord] = []
         history: list[dict[str, Any]] = [
             {
                 "tool_id": r.tool_id,
@@ -1262,27 +1343,62 @@ class Coordinator:
                 )
 
             # Step 3: Execute outside DB transaction
-            exec_ctx = ToolExecutionContext(
-                task_id=task_id,
-                run_id=run_id,
-                step_id=leased.step_id,
-                attempt=leased.attempt,
-                operation_key=op_key,
-                scope=loop_snapshot.effective_scope,
-                granted_permissions=self._config.default_granted_permissions,
-                target_origin=target_origin,
-                deadline_at=loop_snapshot.run.deadline_at,
-                session_id=(
-                    self._session_id_resolver(task_spec, tool_id)
-                    if self._session_id_resolver is not None
-                    else None
-                ),
-                idempotency_key=op_key,
-                now=self._now(),
-            )
-            exec_result: ToolExecutionResult = await self._tool_registry.invoke(
-                tool_id, args, exec_ctx
-            )
+            try:
+                exec_ctx = ToolExecutionContext(
+                    task_id=task_id,
+                    run_id=run_id,
+                    step_id=leased.step_id,
+                    attempt=leased.attempt,
+                    operation_key=op_key,
+                    scope=loop_snapshot.effective_scope,
+                    granted_permissions=self._config.default_granted_permissions,
+                    target_origin=target_origin,
+                    deadline_at=loop_snapshot.run.deadline_at,
+                    session_id=(
+                        self._session_id_resolver(task_spec, tool_id)
+                        if self._session_id_resolver is not None
+                        else None
+                    ),
+                    idempotency_key=op_key,
+                    now=self._now(),
+                )
+                exec_result: ToolExecutionResult = await self._tool_registry.invoke(
+                    tool_id, args, exec_ctx
+                )
+            except asyncio.CancelledError:
+                self._repo.reconcile_budget(tool_res.reservation_id, release_only=True)
+                raise
+            except Exception as exc:
+                self._repo.reconcile_budget(tool_res.reservation_id, release_only=True)
+                safe_err = redact_string_strict(str(exc))
+                with contextlib.suppress(Exception):
+                    err_receipt = ActionReceipt(
+                        receipt_id=f"rcpt-{uuid.uuid4().hex[:12]}",
+                        task_id=task_id,
+                        run_id=run_id,
+                        step_id=leased.step_id,
+                        attempt=max(1, leased.attempt),
+                        tool_id=tool_id,
+                        redacted_args=redact_payload_strict(dict(args)),
+                        operation_key=op_key,
+                        observed_before=None,
+                        observed_after=None,
+                        duration_ms=0.0,
+                        evidence_refs=(),
+                        outcome=ReceiptOutcome.FAILED_SEMANTIC,
+                        error_detail=safe_err,
+                        recorded_at=self._now(),
+                    )
+                    self._repo.commit_step_result(
+                        leased.step_id,
+                        leased.lease_generation,
+                        StepStatus.FAILED,
+                        ReceiptOutcome.FAILED_SEMANTIC.value,
+                        err_receipt,
+                        step_output=None,
+                        expected_worker=self._config.coordinator_id,
+                    )
+                raise
 
             # Reconcile tool reservation (1 call consumed)
             post_wall = self._active_wall_seconds(self._repo.get_run_snapshot(run_id))

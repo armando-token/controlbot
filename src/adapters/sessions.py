@@ -87,7 +87,8 @@ class SessionLockState(FrozenModel):
     updated_at: UtcDatetime
 
 
-def _validate_segment(label: str, value: str) -> str:
+def validate_session_segment(label: str, value: str) -> str:
+    """Validate that an identifier segment is safe for profile directories and session IDs."""
     stripped = value.strip()
     if (
         not stripped
@@ -99,6 +100,10 @@ def _validate_segment(label: str, value: str) -> str:
     ):
         raise ValueError(f"Invalid {label} segment for profile path: {value!r}")
     return stripped
+
+
+def _validate_segment(label: str, value: str) -> str:
+    return validate_session_segment(label, value)
 
 
 def make_session_id(user_id: str, profile_id: str, app_id: str) -> str:

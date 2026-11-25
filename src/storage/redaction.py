@@ -21,10 +21,12 @@ from src.contracts.redaction import (
 _CAMEL_BOUNDARY_1 = re.compile(r"([a-z0-9])([A-Z])")
 _CAMEL_BOUNDARY_2 = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _QUERY_SECRET_RE = re.compile(
-    r"(?i)\b(password|passwd|secret|secret_key|secretKey|api_key|apikey|token|"
+    r"(?i)\b(password|passwd|secret|secret_key|secretKey|secret-key|"
+    r"api_key|api-key|apikey|x_api_key|x-api-key|xApiKey|token|"
     r"access_token|accessToken|refresh_token|refreshToken|auth_token|authToken|"
-    r"session_token|sessionToken|csrf_token|csrfToken|client_secret|clientSecret|"
-    r"private_key|privateKey|credential|credentials)"
+    r"session_token|sessionToken|csrf_token|csrfToken|id_token|idToken|"
+    r"client_secret|clientSecret|private_key|privateKey|credential|credentials|"
+    r"authorization|cookie|cookies|set_cookie|set-cookie|setCookie|bearer)"
     r"=(?!\[REDACTED\](?:[\s&;,'\"]|$))([^\s&;,'\"]+)"
 )
 
@@ -54,10 +56,24 @@ def redact_payload_strict(value: Any) -> Any:
     if isinstance(value, Mapping):
         redacted: dict[Any, Any] = {}
         for k, v in value.items():
-            if is_sensitive_key_strict(str(k)):
-                redacted[k] = None if v is None else REDACTED_PLACEHOLDER
+            sensitive_key = is_sensitive_key_strict(str(k))
+            if isinstance(k, str):
+                safe_key: Any = redact_string_strict(k)
+            elif isinstance(k, (tuple, frozenset)):
+                safe_key = redact_payload_strict(k)
+            elif (
+                not isinstance(k, (int, float, bool, type(None)))
+                and contains_unredacted_secret_strict(str(k))
+            ):
+                safe_key = redact_string_strict(str(k))
             else:
-                redacted[k] = redact_payload_strict(v)
+                safe_key = k
+
+            if sensitive_key:
+                scrubbed_value: Any = None if v is None else REDACTED_PLACEHOLDER
+            else:
+                scrubbed_value = redact_payload_strict(v)
+            redacted[safe_key] = scrubbed_value
         return redacted
     if isinstance(value, list):
         return [redact_payload_strict(item) for item in value]
@@ -88,6 +104,13 @@ def contains_unredacted_secret_strict(value: Any) -> bool:
         return True
     if isinstance(value, Mapping):
         for k, v in value.items():
+            if isinstance(k, (str, tuple, frozenset)) and contains_unredacted_secret_strict(k):
+                return True
+            if (
+                not isinstance(k, (str, int, float, bool, type(None), tuple, frozenset))
+                and contains_unredacted_secret_strict(str(k))
+            ):
+                return True
             if is_sensitive_key_strict(str(k)) and _is_non_empty_unredacted(v):
                 return True
             if contains_unredacted_secret_strict(v):

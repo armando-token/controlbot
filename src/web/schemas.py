@@ -5,12 +5,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, ValidationInfo, field_validator
 
+from src.adapters.sessions import validate_session_segment
 from src.contracts.budgets import BudgetConfig
 from src.contracts.common import FrozenModel, HttpOrigin, NonEmptyStr
 from src.contracts.enums import BackendMode
 from src.contracts.models import EvidenceRequirements, TaskScope, TaskSpec
+from src.storage.redaction import contains_unredacted_secret_strict
 
 
 class TaskSubmitRequest(FrozenModel):
@@ -30,6 +32,14 @@ class TaskSubmitRequest(FrozenModel):
     evidence_requirements: EvidenceRequirements = Field(default_factory=EvidenceRequirements)
     backend_mode: BackendMode = BackendMode.EMULATED
     installation_config_path: str | None = None
+
+    @field_validator("user_id", "profile_id", mode="after")
+    @classmethod
+    def _validate_safe_session_segments(cls, value: str, info: ValidationInfo) -> str:
+        field_name = info.field_name or "segment"
+        if contains_unredacted_secret_strict(value):
+            raise ValueError(f"{field_name} must not contain unredacted secret material.")
+        return validate_session_segment(field_name, value)
 
     def to_task_spec(self) -> TaskSpec:
         """Convert validated submit request into a frozen TaskSpec contract."""
