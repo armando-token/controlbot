@@ -933,7 +933,15 @@ class StorageRepo:
                 (now_iso, current_run.task_id),
             )
 
-        result_json = result.model_dump_json() if result is not None else row["result_json"]
+        if result is not None:
+            result_json: str | None = result.model_dump_json()
+        elif (
+            current_run.status == TaskStatus.WAITING_FOR_INPUT
+            and target_status != TaskStatus.WAITING_FOR_INPUT
+        ):
+            result_json = None
+        else:
+            result_json = row["result_json"]
         updated_at_dt = max(now, current_run.updated_at)
         if new_deadline_dt < current_run.created_at:
             new_deadline_dt = current_run.created_at
@@ -1095,6 +1103,26 @@ class StorageRepo:
                 now_iso=now_iso,
             )
 
+    def persist_terminal_result_if_missing(self, run_id: str, result: Result) -> None:
+        """Persist a terminal Result if the run is terminal and lacks a matching Result."""
+        now_iso = _format_dt(self._now())
+        with write_transaction(self._db_path, self._lock) as conn:
+            row = self._load_run_row(conn, run_id)
+            current_run = self._row_to_run(row)
+            if not is_terminal_status(current_run.status):
+                return
+            if result.status != current_run.status:
+                return
+            existing_raw = row["result_json"]
+            if existing_raw is not None:
+                existing = Result.model_validate_json(str(existing_raw))
+                if existing.status == current_run.status:
+                    return
+            conn.execute(
+                "UPDATE runs SET result_json = ?, updated_at = ? WHERE run_id = ?",
+                (result.model_dump_json(), now_iso, run_id),
+            )
+
     def pause_for_input(
         self,
         run_id: str,
@@ -1212,7 +1240,9 @@ class StorageRepo:
                         """
                         UPDATE runs
                         SET status = ?, version = ?, transition_reason = ?,
-                            required_action = NULL, waiting_since = NULL, updated_at = ?
+                            required_action = NULL, waiting_since = NULL,
+                            result_json = NULL, pending_human_input_json = NULL,
+                            updated_at = ?
                         WHERE run_id = ?
                         """,
                         (
@@ -1256,7 +1286,9 @@ class StorageRepo:
                                 """
                                 UPDATE runs
                                 SET status = ?, version = ?, transition_reason = ?,
-                                    required_action = NULL, waiting_since = NULL, updated_at = ?
+                                    required_action = NULL, waiting_since = NULL,
+                                    result_json = NULL, pending_human_input_json = NULL,
+                                    updated_at = ?
                                 WHERE run_id = ?
                                 """,
                                 (
@@ -1336,7 +1368,7 @@ class StorageRepo:
                         """
                         UPDATE runs
                         SET status = ?, version = ?, deadline_at = ?, transition_reason = ?,
-                            required_action = NULL, waiting_since = NULL,
+                            required_action = NULL, waiting_since = NULL, result_json = NULL,
                             pending_human_input_json = ?, updated_at = ?
                         WHERE run_id = ?
                         """,
@@ -3356,7 +3388,9 @@ class StorageRepo:
                         """
                         UPDATE runs
                         SET status = ?, version = ?, transition_reason = ?,
-                            required_action = NULL, waiting_since = NULL, updated_at = ?
+                            required_action = NULL, waiting_since = NULL,
+                            result_json = NULL, pending_human_input_json = NULL,
+                            updated_at = ?
                         WHERE run_id = ?
                         """,
                         (

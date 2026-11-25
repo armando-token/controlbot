@@ -94,11 +94,20 @@ class InMemoryCoordinatorStub:
             reason=reason,
             timestamp=now,
         )
+        if result is not None:
+            next_result: Result | None = result
+        elif (
+            snap.run.status == TaskStatus.WAITING_FOR_INPUT
+            and target_status != TaskStatus.WAITING_FOR_INPUT
+        ):
+            next_result = None
+        else:
+            next_result = snap.result
         self._snapshots[run_id] = snap.model_copy(
             update={
                 "run": updated_run,
                 "transitions": (*snap.transitions, new_transition),
-                "result": snap.result if result is None else result,
+                "result": next_result,
                 "receipts": snap.receipts if receipts is None else receipts,
                 "budget_usage": snap.budget_usage if budget_usage is None else budget_usage,
             }

@@ -380,9 +380,9 @@ class Coordinator:
     ) -> Result:
         snapshot = self._repo.get_run_snapshot(run_id)
         if is_terminal_status(snapshot.run.status):
-            if snapshot.result is not None:
+            if snapshot.result is not None and snapshot.result.status == snapshot.run.status:
                 return snapshot.result
-            return self._build_settled_result(
+            settled = self._build_settled_result(
                 task_spec=task_spec,
                 run=snapshot.run,
                 answer=answer,
@@ -390,6 +390,8 @@ class Coordinator:
                 contradictions=contradictions,
                 partial_info=partial_info,
             )
+            self._repo.persist_terminal_result_if_missing(run_id, settled)
+            return settled
 
         if target_status == TaskStatus.SUCCEEDED and self._repo.list_unknown_steps(run_id):
             allow_partial = task_spec.evidence_requirements.allow_partial_on_source_failure
@@ -438,8 +440,19 @@ class Coordinator:
             )
         except Exception:
             latest = self._repo.get_run_snapshot(run_id)
-            if latest.result is not None:
+            if latest.result is not None and latest.result.status == latest.run.status:
                 return latest.result
+            if is_terminal_status(latest.run.status):
+                settled = self._build_settled_result(
+                    task_spec=task_spec,
+                    run=latest.run,
+                    answer=answer,
+                    observations=observations,
+                    contradictions=contradictions,
+                    partial_info=partial_info,
+                )
+                self._repo.persist_terminal_result_if_missing(run_id, settled)
+                return settled
             raise
         return result
 
@@ -678,17 +691,19 @@ class Coordinator:
         task_id = task_spec.task_id
 
         if is_terminal_status(snapshot.run.status):
-            if snapshot.result is not None:
+            if snapshot.result is not None and snapshot.result.status == snapshot.run.status:
                 return snapshot.result
-            return self._build_settled_result(
+            settled = self._build_settled_result(
                 task_spec=task_spec,
                 run=snapshot.run,
                 answer=f"Run already terminal ({snapshot.run.status.value}).",
                 observations=snapshot.observations,
             )
+            self._repo.persist_terminal_result_if_missing(run_id, settled)
+            return settled
 
         if snapshot.run.status == TaskStatus.WAITING_FOR_INPUT:
-            if snapshot.result is not None:
+            if snapshot.result is not None and snapshot.result.status == snapshot.run.status:
                 return snapshot.result
             return self._build_settled_result(
                 task_spec=task_spec,
@@ -725,17 +740,19 @@ class Coordinator:
         except Exception as exc:
             latest = self._repo.get_run_snapshot(run_id)
             if is_terminal_status(latest.run.status):
-                if latest.result is not None:
+                if latest.result is not None and latest.result.status == latest.run.status:
                     return latest.result
-                return self._build_settled_result(
+                settled = self._build_settled_result(
                     task_spec=task_spec,
                     run=latest.run,
                     answer=f"Run reached terminal status {latest.run.status.value}.",
                     observations=tuple(observations),
                     contradictions=tuple(contradictions),
                 )
+                self._repo.persist_terminal_result_if_missing(run_id, settled)
+                return settled
             if latest.run.status == TaskStatus.WAITING_FOR_INPUT:
-                if latest.result is not None:
+                if latest.result is not None and latest.result.status == latest.run.status:
                     return latest.result
                 return self._build_settled_result(
                     task_spec=task_spec,
@@ -791,11 +808,13 @@ class Coordinator:
         ]
 
         # Restore prior child observations and resume any waiting_for_input children
-        if (
+        restored_from_result = bool(
             not observations
             and snapshot.result is not None
             and snapshot.result.verified_observations
-        ):
+        )
+        if restored_from_result:
+            assert snapshot.result is not None
             observations.extend(snapshot.result.verified_observations)
         if snapshot.child_runs:
             waiting_kids = [
@@ -804,6 +823,12 @@ class Coordinator:
             for c_done in snapshot.child_runs:
                 if c_done.status != TaskStatus.WAITING_FOR_INPUT:
                     c_snap = self._repo.get_run_snapshot(c_done.run_id)
+                    if not restored_from_result:
+                        if c_snap.result is not None:
+                            observations.extend(c_snap.result.verified_observations)
+                            contradictions.extend(c_snap.result.contradictions)
+                        elif c_snap.observations:
+                            observations.extend(c_snap.observations)
                     history.append(
                         {
                             "delegation": c_done.transition_reason or c_done.run_id,
@@ -947,13 +972,20 @@ class Coordinator:
                     contradictions=tuple(contradictions),
                 )
             if is_terminal_status(snapshot.run.status):
-                return self._build_settled_result(
+                if (
+                    isinstance(snapshot.result, Result)
+                    and snapshot.result.status == snapshot.run.status
+                ):
+                    return snapshot.result
+                settled = self._build_settled_result(
                     task_spec=task_spec,
                     run=snapshot.run,
                     answer=f"Run reached terminal status {snapshot.run.status.value}.",
                     observations=tuple(observations),
                     contradictions=tuple(contradictions),
                 )
+                self._repo.persist_terminal_result_if_missing(run_id, settled)
+                return settled
 
             # Execute any pre-queued / recovery-reset PENDING steps before asking the model
             pending_steps = self._repo.list_pending_steps(run_id)
@@ -1847,9 +1879,9 @@ class Coordinator:
                         continue
                     if outcome_kind == "noop":
                         latest = self._repo.get_run_snapshot(run_id)
-                        if latest.result is not None:
+                        if latest.result is not None and latest.result.status == latest.run.status:
                             return latest.result
-                        return self._build_settled_result(
+                        settled = self._build_settled_result(
                             task_spec=task_spec,
                             run=latest.run,
                             answer=(
@@ -1859,6 +1891,9 @@ class Coordinator:
                             observations=tuple(observations),
                             contradictions=tuple(contradictions),
                         )
+                        if is_terminal_status(latest.run.status):
+                            self._repo.persist_terminal_result_if_missing(run_id, settled)
+                        return settled
                     if outcome_kind == "waiting_for_human":
                         paused_snap = self._repo.get_run_snapshot(run_id)
                         req_action = (

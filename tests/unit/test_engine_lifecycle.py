@@ -1526,3 +1526,265 @@ def test_t5_24_delegated_parent_and_children_do_not_double_count_human_wait_seco
         assert snap3.budget_usage.human_wait_seconds_elapsed == pytest.approx(301.0, abs=0.01)
 
     asyncio.run(_run())
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_25_cancel_or_wait_timeout_from_waiting_clears_or_updates_stale_waiting_result(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    import httpx
+    from src.engine.tool_registry import AuthToolError
+    from src.model.emulator import EmulatedTurn
+    from src.model.protocol import (
+        ModelDecision,
+        ModelDelegationRequest,
+        ModelToolCall,
+        ModelUsage,
+    )
+    from src.runtime import RuntimeCoordinatorAdapter
+    from src.web.app import create_app
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    def _build_env(
+        db_name: str,
+        *,
+        clock: FakeClock,
+        auth_state: dict[str, bool],
+        delegate: bool = False,
+    ) -> tuple[StorageRepo, Coordinator, httpx.AsyncClient]:
+        repo = StorageRepo(tmp_path / db_name, clock=clock)
+        repo.init_db()
+        reg = ToolRegistry(clock=clock)
+
+        def _auth_gated_read(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+            del args, ctx
+            if not auth_state.get("ready", False):
+                raise AuthToolError("Session expired for scada")
+            return {"ok": True}
+
+        reg.register(
+            ToolSpec(
+                tool_id="read_scada",
+                version="1.0.0",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                allowed_origins=("https://scada.local",),
+                effect_class=EffectClass.READ,
+                timeout_s=5.0,
+                verifier_name="v",
+            ),
+            _auth_gated_read,
+        )
+
+        def _turn_factory(
+            prompt_ctx: Any, tools: Any, budget_rem: Any
+        ) -> EmulatedTurn:
+            del tools, budget_rem
+            if delegate and prompt_ctx.depth == 0:
+                if any(isinstance(h, dict) and "delegation" in h for h in prompt_ctx.history):
+                    return EmulatedTurn(
+                        decision=ModelDecision(
+                            decision_type="final",
+                            final_answer="Parent complete.",
+                            usage=usage,
+                        )
+                    )
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="delegate",
+                        delegations=(
+                            ModelDelegationRequest(
+                                child_label="scada-child",
+                                query="Read scada",
+                                allowed_tools=("read_scada",),
+                                allowed_origins=("https://scada.local",),
+                            ),
+                        ),
+                        usage=usage,
+                    )
+                )
+            if prompt_ctx.history and prompt_ctx.history[-1].get("outcome") == "succeeded":
+                return EmulatedTurn(
+                    decision=ModelDecision(
+                        decision_type="final",
+                        final_answer="Done.",
+                        usage=usage,
+                    )
+                )
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="read_scada",
+                        args={},
+                        target_origin="https://scada.local",
+                    ),
+                    usage=usage,
+                )
+            )
+
+        coord = Coordinator(repo, EmulatedModelClient(turn_factory=_turn_factory), reg, clock=clock)
+        web_coord = RuntimeCoordinatorAdapter(
+            repo=repo,
+            coordinator=coord,
+            facility_config=None,
+            auto_run=False,
+        )
+        app = create_app(db_path=tmp_path / db_name, coordinator=web_coord)
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+        )
+        return repo, coord, client
+
+    async def _run() -> None:
+        # 1. Pause (including delegated child) -> cancel_task clears stale WAITING_FOR_INPUT result
+        clock1 = FakeClock()
+        repo1, coord1, client1 = _build_env(
+            "t5_25_cancel.db",
+            clock=clock1,
+            auth_state={"ready": False},
+            delegate=True,
+        )
+        try:
+            run1 = coord1.submit_task(_make_task("t5-25-cancel"))
+            paused1 = await coord1.run_until_settled(run1.run_id)
+            assert paused1.status == TaskStatus.WAITING_FOR_INPUT
+            snap1_paused = repo1.get_run_snapshot(run1.run_id)
+            assert snap1_paused.result is not None
+            assert snap1_paused.result.status == TaskStatus.WAITING_FOR_INPUT
+            assert len(snap1_paused.child_runs) == 1
+            child1_id = snap1_paused.child_runs[0].run_id
+            child1_paused_res = repo1.get_run_snapshot(child1_id).result
+            assert child1_paused_res is not None
+            assert child1_paused_res.status == TaskStatus.WAITING_FOR_INPUT
+
+            coord1.cancel_task(run1.run_id, reason="user_aborted")
+            snap1 = repo1.get_run_snapshot(run1.run_id)
+            assert snap1.run.status == TaskStatus.CANCELLED
+            assert snap1.result is None or snap1.result.status == TaskStatus.CANCELLED
+            snap1_child = repo1.get_run_snapshot(child1_id)
+            assert snap1_child.run.status == TaskStatus.CANCELLED
+            assert snap1_child.result is None or snap1_child.result.status == TaskStatus.CANCELLED
+
+            api1 = await client1.get(f"/api/tasks/{run1.run_id}")
+            assert api1.status_code == 200
+            api1_body = api1.json()
+            assert api1_body["status"] == "cancelled"
+            assert (
+                api1_body["result"] is None or api1_body["result"]["status"] == "cancelled"
+            )
+
+            settled1 = await coord1.run_until_settled(run1.run_id)
+            assert settled1.status == TaskStatus.CANCELLED
+            snap1_after = repo1.get_run_snapshot(run1.run_id)
+            assert snap1_after.result is not None
+            assert snap1_after.result.status == TaskStatus.CANCELLED
+        finally:
+            await client1.aclose()
+
+        # 2. Pause -> FakeClock past human_wait_timeout_seconds -> resume_task (BudgetExceededError)
+        clock2 = FakeClock()
+        repo2, coord2, client2 = _build_env(
+            "t5_25_timeout.db",
+            clock=clock2,
+            auth_state={"ready": False},
+            delegate=False,
+        )
+        try:
+            run2 = coord2.submit_task(
+                _make_task("t5-25-timeout", budget=BudgetConfig(human_wait_timeout_seconds=10.0))
+            )
+            paused2 = await coord2.run_until_settled(run2.run_id)
+            assert paused2.status == TaskStatus.WAITING_FOR_INPUT
+            assert repo2.get_run_snapshot(run2.run_id).result is not None
+
+            clock2.advance(15.0)
+            with pytest.raises(BudgetExceededError, match="Human wait timeout exceeded"):
+                coord2.resume_task(run2.run_id, {"reauthenticated": True})
+
+            snap2 = repo2.get_run_snapshot(run2.run_id)
+            assert snap2.run.status == TaskStatus.FAILED
+            assert snap2.result is None or snap2.result.status == TaskStatus.FAILED
+
+            api2 = await client2.get(f"/api/tasks/{run2.run_id}")
+            assert api2.status_code == 200
+            api2_body = api2.json()
+            assert api2_body["status"] == "failed"
+            assert api2_body["result"] is None or api2_body["result"]["status"] == "failed"
+
+            settled2 = await coord2.run_until_settled(run2.run_id)
+            assert settled2.status == TaskStatus.FAILED
+            snap2_after = repo2.get_run_snapshot(run2.run_id)
+            assert snap2_after.result is not None
+            assert snap2_after.result.status == TaskStatus.FAILED
+        finally:
+            await client2.aclose()
+
+        # 3. Pause -> normal resume_task -> before run_until_settled: no stale WAITING_FOR_INPUT
+        clock3 = FakeClock()
+        auth3 = {"ready": False}
+        repo3, coord3, client3 = _build_env(
+            "t5_25_resume.db",
+            clock=clock3,
+            auth_state=auth3,
+            delegate=False,
+        )
+        try:
+            run3 = coord3.submit_task(_make_task("t5-25-resume"))
+            paused3 = await coord3.run_until_settled(run3.run_id)
+            assert paused3.status == TaskStatus.WAITING_FOR_INPUT
+            snap3_paused_res = repo3.get_run_snapshot(run3.run_id).result
+            assert snap3_paused_res is not None
+            assert snap3_paused_res.status == TaskStatus.WAITING_FOR_INPUT
+
+            auth3["ready"] = True
+            resumed3 = coord3.resume_task(run3.run_id, {"reauthenticated": True})
+            assert resumed3.status == TaskStatus.RUNNING
+            snap3_running = repo3.get_run_snapshot(run3.run_id)
+            assert snap3_running.run.status == TaskStatus.RUNNING
+            assert (
+                snap3_running.result is None
+                or snap3_running.result.status != TaskStatus.WAITING_FOR_INPUT
+            )
+
+            api3 = await client3.get(f"/api/tasks/{run3.run_id}")
+            assert api3.status_code == 200
+            api3_body = api3.json()
+            assert api3_body["status"] == "running"
+            assert (
+                api3_body["result"] is None
+                or api3_body["result"]["status"] != "waiting_for_input"
+            )
+
+            settled3 = await coord3.run_until_settled(run3.run_id)
+            assert settled3.status == TaskStatus.SUCCEEDED
+        finally:
+            await client3.aclose()
+
+        # 4. Direct transition_run_status(WAITING_FOR_INPUT -> FAILED, result=None) clears stale
+        clock4 = FakeClock()
+        repo4, coord4, client4 = _build_env(
+            "t5_25_tx.db",
+            clock=clock4,
+            auth_state={"ready": False},
+            delegate=False,
+        )
+        try:
+            run4 = coord4.submit_task(_make_task("t5-25-tx"))
+            paused4 = await coord4.run_until_settled(run4.run_id)
+            assert paused4.status == TaskStatus.WAITING_FOR_INPUT
+            repo4.transition_run_status(run4.run_id, TaskStatus.FAILED, "parent_settled_failed")
+            snap4 = repo4.get_run_snapshot(run4.run_id)
+            assert snap4.run.status == TaskStatus.FAILED
+            assert snap4.result is None
+            settled4 = await coord4.run_until_settled(run4.run_id)
+            assert settled4.status == TaskStatus.FAILED
+        finally:
+            await client4.aclose()
+
+    asyncio.run(_run())
