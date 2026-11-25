@@ -265,6 +265,26 @@ def _create_benchmark_mock_openai_server(
     return app
 
 
+def _trial_detail(
+    ok: bool,
+    success_detail: str,
+    *,
+    status: str,
+    answer: str = "",
+    extra: str = "",
+) -> str:
+    """Return an honest per-trial summary reflecting success or actual failure reason."""
+    if ok:
+        return success_detail
+    parts = [f"Trial failed (status={status})"]
+    if extra:
+        parts.append(extra)
+    clean_answer = " ".join(answer.replace("|", "/").split())
+    if clean_answer:
+        parts.append(clean_answer[:160])
+    return "; ".join(parts)
+
+
 def _make_model_kwargs(
     *,
     mode: BenchmarkMode,
@@ -441,7 +461,12 @@ async def _engine_a01(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Cross-source verified ALM-3401 and WO-3408.",
+        detail=_trial_detail(
+            ok,
+            "Cross-source verified ALM-3401 and WO-3408.",
+            status=result.status.value,
+            answer=result.answer,
+        ),
     )
 
 
@@ -504,8 +529,11 @@ async def _engine_a02(
                 and "area-1" in paused.required_action
                 and "area-2" in paused.required_action
             )
-            runtime.coordinator.resume_task(run.run_id, {"area": "area-1"})
-            done = await runtime.coordinator.run_until_settled(run.run_id)
+            if paused.status == TaskStatus.WAITING_FOR_INPUT:
+                runtime.coordinator.resume_task(run.run_id, {"area": "area-1"})
+                done = await runtime.coordinator.run_until_settled(run.run_id)
+            else:
+                done = paused
     ok = (
         abstained
         and done.status == TaskStatus.SUCCEEDED
@@ -527,7 +555,13 @@ async def _engine_a02(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Abstained on multi-area ambiguity then succeeded scoped to area-1.",
+        detail=_trial_detail(
+            ok,
+            "Abstained on multi-area ambiguity then succeeded scoped to area-1.",
+            status=done.status.value,
+            answer=done.answer,
+            extra=f"paused_status={paused.status.value}",
+        ),
     )
 
 
@@ -591,9 +625,13 @@ async def _engine_a03(
     ok = (
         result.status == TaskStatus.SUCCEEDED
         and "ALM-3405" in result.answer
+        and by_id.get("ALM-OLD-01") is not None
         and by_id["ALM-OLD-01"].authorized_evidence is False
+        and by_id.get("RDG-STALE-01") is not None
         and by_id["RDG-STALE-01"].authorized_evidence is False
+        and by_id.get("RDG-BAD-01") is not None
         and by_id["RDG-BAD-01"].authorized_evidence is False
+        and by_id.get("ALM-3405") is not None
         and by_id["ALM-3405"].authorized_evidence is True
     )
     m = result.execution_metrics
@@ -610,7 +648,12 @@ async def _engine_a03(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Rejected stale/bad/out-of-window records; synthesized ALM-3405.",
+        detail=_trial_detail(
+            ok,
+            "Rejected stale/bad/out-of-window records; synthesized ALM-3405.",
+            status=result.status.value,
+            answer=result.answer,
+        ),
     )
 
 
@@ -688,7 +731,12 @@ async def _engine_a04(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Reported PARTIAL with missing_sources=['scada'] and preserved WO-3408.",
+        detail=_trial_detail(
+            ok,
+            "Reported PARTIAL with missing_sources=['scada'] and preserved WO-3408.",
+            status=result.status.value,
+            answer=result.answer,
+        ),
     )
 
 
@@ -759,7 +807,12 @@ async def _engine_a05(
         model_calls=0,
         total_tokens=0,
         usage_mode="none",
-        detail="Isolated per-(user,profile,app) Playwright contexts & blocked disallowed origin.",
+        detail=_trial_detail(
+            isolated,
+            "Isolated per-(user,profile,app) Playwright contexts & blocked disallowed origin.",
+            status="succeeded" if isolated else "failed",
+            extra=f"isolated={isolated}, blocked_egress={blocked_egress}",
+        ),
     )
 
 
@@ -827,7 +880,13 @@ async def _engine_a06(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail=f"Halted identical_repeat at tool_calls={m.tool_calls}.",
+        detail=_trial_detail(
+            ok,
+            f"Halted identical_repeat at tool_calls={m.tool_calls}.",
+            status=res.status.value,
+            answer=res.answer,
+            extra=f"tool_calls={m.tool_calls}",
+        ),
     )
 
 
@@ -896,7 +955,13 @@ async def _engine_a07(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail=f"Halted alternating_cycle at tool_calls={m.tool_calls}.",
+        detail=_trial_detail(
+            ok,
+            f"Halted alternating_cycle at tool_calls={m.tool_calls}.",
+            status=res.status.value,
+            answer=res.answer,
+            extra=f"tool_calls={m.tool_calls}",
+        ),
     )
 
 
@@ -1079,7 +1144,16 @@ async def _engine_a08(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail=f"Reconciled effect via state lookup; total_applied={applied}, requests={reqs}.",
+        detail=_trial_detail(
+            ok,
+            f"Reconciled effect via state lookup; total_applied={applied}, requests={reqs}.",
+            status=res.status.value,
+            answer=res.answer,
+            extra=(
+                f"reconciled={summary.unknown_steps_reconciled}, "
+                f"total_applied={applied}, requests={reqs}"
+            ),
+        ),
     )
 
 
@@ -1155,7 +1229,13 @@ async def _engine_a09(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Live cancel fenced late tool result and locked terminal CANCELLED state.",
+        detail=_trial_detail(
+            ok,
+            "Live cancel fenced late tool result and locked terminal CANCELLED state.",
+            status=res.status.value,
+            answer=res.answer,
+            extra=f"cancelled={cancelled.status.value}, fenced={fenced}",
+        ),
     )
 
 
@@ -1217,10 +1297,13 @@ async def _engine_a10(
                 paused.status == TaskStatus.WAITING_FOR_INPUT
                 and snap_paused.run.transition_reason == "auth_expired"
             )
-            scada_app.state.scada_state.set_mode("default")
-            scada_app.state.scada_state.set_reference_time(ref)
-            runtime.coordinator.resume_task(run.run_id, {"reauthenticated": True})
-            done = await runtime.coordinator.run_until_settled(run.run_id)
+            if paused.status == TaskStatus.WAITING_FOR_INPUT:
+                scada_app.state.scada_state.set_mode("default")
+                scada_app.state.scada_state.set_reference_time(ref)
+                runtime.coordinator.resume_task(run.run_id, {"reauthenticated": True})
+                done = await runtime.coordinator.run_until_settled(run.run_id)
+            else:
+                done = paused
     ok = paused_ok and done.status == TaskStatus.SUCCEEDED and "ALM-3401" in done.answer
     m = done.execution_metrics
     return ScenarioTrialResult(
@@ -1237,7 +1320,13 @@ async def _engine_a10(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Paused on auth_expired and succeeded after operator re-auth resume.",
+        detail=_trial_detail(
+            ok,
+            "Paused on auth_expired and succeeded after operator re-auth resume.",
+            status=done.status.value,
+            answer=done.answer,
+            extra=f"paused_status={paused.status.value}",
+        ),
     )
 
 
@@ -1315,7 +1404,12 @@ async def _engine_a12(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail="Config-only Facility B portability (SC-77 + CMMS-77, reordered Spanish DOM).",
+        detail=_trial_detail(
+            ok,
+            "Config-only Facility B portability (SC-77 + CMMS-77, reordered Spanish DOM).",
+            status=result.status.value,
+            answer=result.answer,
+        ),
     )
 
 
@@ -1393,7 +1487,13 @@ async def _engine_a13(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail=f"Preserved {len(result.contradictions)} unresolved contradiction(s) as PARTIAL.",
+        detail=_trial_detail(
+            ok,
+            f"Preserved {len(result.contradictions)} unresolved contradiction(s) as PARTIAL.",
+            status=result.status.value,
+            answer=result.answer,
+            extra=f"contradictions={len(result.contradictions)}",
+        ),
     )
 
 
@@ -1517,9 +1617,15 @@ async def _engine_a14(
         model_calls=m.model_calls,
         total_tokens=m.total_tokens,
         usage_mode="estimated" if m.usage_estimated else "actual",
-        detail=(
-            f"Cleaned {summary.expired_reservations_cleaned} expired reservation(s); "
-            "preserved counters across SIGKILL."
+        detail=_trial_detail(
+            ok,
+            (
+                f"Cleaned {summary.expired_reservations_cleaned} expired reservation(s); "
+                "preserved counters across SIGKILL."
+            ),
+            status=res.status.value,
+            answer=res.answer,
+            extra=f"cleaned={summary.expired_reservations_cleaned}",
         ),
     )
 

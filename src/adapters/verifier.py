@@ -56,6 +56,19 @@ def _canonical_asset_id(obs: Observation, config: FacilityConfig) -> str:
     return mapped.asset_id if mapped is not None else obs.asset_id
 
 
+def _resolve_asset_mapping_any_source(
+    obs: Observation, config: FacilityConfig
+) -> AssetMapping | None:
+    """Resolve obs.asset_id to an AssetMapping even if obs.source mismatches source_ids."""
+    mapped = _resolve_asset_mapping(obs, config)
+    if mapped is not None:
+        return mapped
+    for asset in config.assets:
+        if obs.asset_id == asset.asset_id or obs.asset_id in asset.source_ids.values():
+            return asset
+    return None
+
+
 def _matches_asset_query(obs: Observation, query: str, config: FacilityConfig) -> bool:
     needle = query.strip().lower()
     if not needle:
@@ -113,7 +126,7 @@ class Verifier:
 
         effective_units: set[str] | None = set(allowed_units) if allowed_units is not None else None
         if effective_units is None and config is not None:
-            mapped_asset = _resolve_asset_mapping(obs, config)
+            mapped_asset = _resolve_asset_mapping_any_source(obs, config)
             if mapped_asset is not None:
                 record_type = str(obs.metadata.get("record_type", ""))
                 if record_type in mapped_asset.allowed_units:
@@ -180,13 +193,8 @@ class Verifier:
         contradictions: list[ContradictionRecord] = []
 
         # 1. Intra-record contradictions against FacilityConfig canonical assets
-        asset_by_id: dict[str, AssetMapping] = {}
-        for asset in config.assets:
-            asset_by_id[asset.asset_id] = asset
-            for src_id in asset.source_ids.values():
-                asset_by_id.setdefault(src_id, asset)
         for obs in observations:
-            mapped = _resolve_asset_mapping(obs, config) or asset_by_id.get(obs.asset_id)
+            mapped = _resolve_asset_mapping_any_source(obs, config)
             if mapped is not None:
                 valid_labels = {
                     mapped.canonical_label.lower(),
@@ -215,6 +223,64 @@ class Verifier:
                                     asset_id=obs.asset_id,
                                     field="observed_label",
                                     value=obs.observed_label,
+                                    observed_at=obs.observed_at,
+                                ),
+                            ),
+                            unresolved=True,
+                        )
+                    )
+                expected_source_id = mapped.source_ids.get(obs.source)
+                if expected_source_id is not None and obs.asset_id not in (
+                    mapped.asset_id,
+                    expected_source_id,
+                ):
+                    contradictions.append(
+                        ContradictionRecord(
+                            summary=(
+                                f"Source {obs.source!r} reported wrong-source asset_id "
+                                f"{obs.asset_id!r} for {mapped.canonical_label!r} "
+                                f"(expected {expected_source_id!r} or {mapped.asset_id!r})."
+                            ),
+                            claims=(
+                                ContradictionClaim(
+                                    source="facility_config",
+                                    asset_id=mapped.asset_id,
+                                    field="source_asset_id",
+                                    value=expected_source_id,
+                                    observed_at=obs.observed_at,
+                                ),
+                                ContradictionClaim(
+                                    source=obs.source,
+                                    asset_id=obs.asset_id,
+                                    field="asset_id",
+                                    value=obs.asset_id,
+                                    observed_at=obs.observed_at,
+                                ),
+                            ),
+                            unresolved=True,
+                        )
+                    )
+                if obs.area is not None and obs.area != mapped.area:
+                    contradictions.append(
+                        ContradictionRecord(
+                            summary=(
+                                f"Source {obs.source!r} reported asset_id {obs.asset_id!r} "
+                                f"in area {obs.area!r}, conflicting with configured area "
+                                f"{mapped.area!r}."
+                            ),
+                            claims=(
+                                ContradictionClaim(
+                                    source="facility_config",
+                                    asset_id=mapped.asset_id,
+                                    field="area",
+                                    value=mapped.area,
+                                    observed_at=obs.observed_at,
+                                ),
+                                ContradictionClaim(
+                                    source=obs.source,
+                                    asset_id=obs.asset_id,
+                                    field="area",
+                                    value=obs.area,
                                     observed_at=obs.observed_at,
                                 ),
                             ),

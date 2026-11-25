@@ -105,10 +105,14 @@ def test_wrong_source_id_still_triggers_contradiction() -> None:
     )
 
     contradictions = verifier.detect_contradictions([scada_alarm, maint_wrong_src], cfg)
-    assert len(contradictions) == 1
-    assert contradictions[0].unresolved is True
-    assert "SC-77" in contradictions[0].summary
-    assert all(c.asset_id == "SC-77" for c in contradictions[0].claims)
+    assert len(contradictions) >= 1
+    assert all(c.unresolved is True for c in contradictions)
+    assert any("SC-77" in c.summary for c in contradictions)
+    assert any(
+        c.source == "maintenance" and c.asset_id == "SC-77"
+        for rec in contradictions
+        for c in rec.claims
+    )
 
     task = TaskSpec(
         task_id="t-wrong-src",
@@ -123,6 +127,97 @@ def test_wrong_source_id_still_triggers_contradiction() -> None:
         observations=[scada_alarm, maint_wrong_src],
         target_asset_query="bomba 77",
         target_area="area-2",
+    )
+    assert res.status == TaskStatus.PARTIAL
+    assert len(res.contradictions) >= 1
+
+
+@pytest.mark.n1
+def test_solo_wrong_source_id_and_invalid_unit_caught_without_sibling_source() -> None:
+    cfg = load_facility_config(_FACILITY_B_PATH)
+    verifier = Verifier()
+    maint_wrong_src = _make_obs(
+        source="maintenance",
+        asset_id="SC-77",
+        record_type="work_order",
+        record_id="WO-7799",
+        value="Misattributed solo maintenance record",
+        unit="event",
+    )
+
+    contradictions = verifier.detect_contradictions([maint_wrong_src], cfg)
+    assert len(contradictions) == 1
+    assert contradictions[0].unresolved is True
+    assert "SC-77" in contradictions[0].summary
+    assert {c.source for c in contradictions[0].claims} == {"facility_config", "maintenance"}
+
+    task = TaskSpec(
+        task_id="t-solo-wrong-src",
+        user_id="operator_b",
+        profile_id="p1",
+        scope=TaskScope(facility_id="facility-b", allowed_areas=("area-2",), read_only=True),
+        query="Check bomba 77",
+    )
+    res = verifier.verify_and_synthesize(
+        task=task,
+        config=cfg,
+        observations=[maint_wrong_src],
+        target_asset_query="bomba 77",
+        target_area="area-2",
+    )
+    assert res.status == TaskStatus.PARTIAL
+    assert len(res.contradictions) == 1
+
+    # Wrong-source ID with an invalid unit still enforces mapped asset's allowed_units
+    maint_bad_unit = _make_obs(
+        source="maintenance",
+        asset_id="SC-77",
+        record_type="work_order",
+        record_id="WO-7798",
+        value="Bad unit record",
+        unit="psi",
+    )
+    verified_bad = verifier.verify_observation(
+        maint_bad_unit,
+        task.evidence_requirements,
+        config=cfg,
+    )
+    assert verified_bad.authorized_evidence is False
+    assert "unit_mismatch:psi" in verified_bad.metadata.get("rejection_reasons", [])
+
+
+@pytest.mark.n1
+def test_area_mismatch_against_config_triggers_contradiction() -> None:
+    cfg = load_facility_config(_FACILITY_B_PATH)
+    verifier = Verifier()
+    scada_wrong_area = _make_obs(
+        source="scada",
+        asset_id="SC-77",
+        area="area-3",
+        record_type="alarm",
+        record_id="ALM-7799",
+    )
+
+    contradictions = verifier.detect_contradictions([scada_wrong_area], cfg)
+    assert len(contradictions) == 1
+    assert contradictions[0].unresolved is True
+    assert "area-3" in contradictions[0].summary
+    assert "area-2" in contradictions[0].summary
+    assert {c.source for c in contradictions[0].claims} == {"facility_config", "scada"}
+
+    task = TaskSpec(
+        task_id="t-area-mismatch",
+        user_id="operator_b",
+        profile_id="p1",
+        scope=TaskScope(facility_id="facility-b", allowed_areas=("area-3",), read_only=True),
+        query="Check bomba 77",
+    )
+    res = verifier.verify_and_synthesize(
+        task=task,
+        config=cfg,
+        observations=[scada_wrong_area],
+        target_asset_query="bomba 77",
+        target_area="area-3",
     )
     assert res.status == TaskStatus.PARTIAL
     assert len(res.contradictions) == 1

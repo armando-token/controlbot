@@ -11,7 +11,7 @@ from benchmarks.report import (
     aggregate_trials,
     format_markdown_report,
 )
-from benchmarks.runner import run_benchmarks
+from benchmarks.runner import _trial_detail, run_benchmarks
 from benchmarks.scenarios import get_all_scenarios, get_runnable_scenarios
 from src.adapters import OriginNotAllowedError
 
@@ -156,6 +156,7 @@ def test_aggregate_trials_blocking_gates_and_repeat_separation() -> None:
     assert "RuleBasedBaseline" in md
     assert "GrokbotEngine" in md
     assert "Engine LOC Delta" in md
+    assert "Measured Verification Time" in md
 
 
 @pytest.mark.n1
@@ -166,3 +167,35 @@ async def test_local_http_mode_blocks_external_origin_without_fallback() -> None
             scenarios=("A01",),
             llm_origin="https://api.openai.com",
         )
+
+
+@pytest.mark.n1
+async def test_failed_trial_detail_reflects_actual_failure_without_success_string() -> None:
+    assert _trial_detail(True, "ok msg", status="succeeded") == "ok msg"
+    fail_msg = _trial_detail(
+        False,
+        "Cross-source verified ALM-3401 and WO-3408.",
+        status="failed",
+        answer="Local HTTP model unreachable | detail",
+        extra="paused_status=failed",
+    )
+    assert "Trial failed (status=failed)" in fail_msg
+    assert "paused_status=failed" in fail_msg
+    assert "Cross-source verified" not in fail_msg
+    assert "|" not in fail_msg
+
+    # Unreachable loopback LLM fails closed and records failure reason in trial.detail
+    report = await run_benchmarks(
+        mode="local_http",
+        scenarios=("A06",),
+        llm_origin="http://127.0.0.1:9",
+    )
+    engine_trials = [t for t in report.trials if t.system == "grokbot_engine"]
+    assert len(engine_trials) == 1
+    trial = engine_trials[0]
+    assert trial.status == "failed"
+    assert trial.correct is False
+    assert "Trial failed (status=failed)" in trial.detail
+    assert "Halted identical_repeat" not in trial.detail
+    assert report.engine_summary.promotion_eligible is False
+    assert report.provenance.exit_code == 1

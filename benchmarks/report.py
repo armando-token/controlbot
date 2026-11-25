@@ -264,7 +264,7 @@ def format_markdown_report(report: BenchmarkReport) -> str:
                 f"- **Files Changed**: `{', '.join(a12.files_changed)}`",
                 f"- **Engine LOC Delta**: `{a12.engine_loc_delta}`",
                 f"- **Adapter (SCADA/Maint) LOC Delta**: `{a12.adapter_loc_delta}`",
-                f"- **Measured Time**: `{a12.adaptation_time_seconds:.3f}s` "
+                f"- **Measured Verification Time**: `{a12.adaptation_time_seconds:.3f}s` "
                 f"(`{a12.adaptation_hours:.6f}h`) | **Verified**: `{a12.verified_succeeded}`",
             ]
         )
