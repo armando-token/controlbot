@@ -2,15 +2,16 @@
 
 ## Estado verificable y siguiente acción
 - **Estado del producto**: **`flujo con emulador`**
-- **Estado general de cierre M0–M7-T5**: **VERIFICADO en N1 + N2 (Darwin ARM64)**; **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
-- **Siguiente acción ejecutable**: **Capstone Final de M7** sobre `main` (`d0367b69bb90fbe8250035e3712fed00cfe48d81`) y validación **N3** en host Linux destino (`./scripts/verify_n3_linux.sh`).
+- **Estado general de cierre M0–M7**: **M1–M7 COMPLETO Y VERIFICADO en N1 + N2 (Darwin ARM64)** sobre `main` (`4845c82d598c178fe750721d2e735657c2eb4993`); **`M8_CAPSTONE` = `PAUSED / DEFERRED`** por instrucción explícita del usuario (`2026-11-25T21:31:15Z`, blueprints `c7b61f5c` y `5d5e2b7b` preservados para reanudar bajo demanda); **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
+- **Siguiente acción ejecutable**: **Probar el software M1–M7 inmediatamente** (ver **Sección 8: Guía Rápida / Quickstart** abajo), completar **Sentinel Victory Audit** de cierre M1–M7 y ejecutar validación **N3** en host Linux destino (`./scripts/verify_n3_linux.sh`).
 
 ---
 
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas M7-T5 verificado**: `d0367b69bb90fbe8250035e3712fed00cfe48d81` (`fix(m7-t5): resolve all 21 Tier 5 adversarial gaps and add @pytest.mark.tier5 coverage`)
+- **Commit de código y pruebas M7-T5 (R2) verificado**: `4845c82d598c178fe750721d2e735657c2eb4993` (`fix(m7-t5): address R1 reviewer findings (zero-obs FAILED, empty GROKBOT_ALLOWED_ORIGINS, combined awaitable timeout)`)
+- **Commit de backlog/gobernanza más reciente**: `af61d52bec4b8911d22d1404adc36ed376f68a53` (`docs(backlog): mark M7-T5 done and pause/defer M8_CAPSTONE per user request`)
 - **Cadena de commits de hitos en `main`**:
   - `d95e98e` — `chore(m1): initialize repo, diagnostics, frozen contracts, research & ADRs`
   - `ccadffc` — `M1: remediate mypy e2e exclusion, redaction hardening, contract invariants, and doctor checks`
@@ -45,6 +46,9 @@
   - `869ebec` — `fix(m7-t4): share asset_id-aware area resolution in build_industrial_result_verifier`
   - `3c3a577` — `docs(night-report): update NIGHT_REPORT with M7-T4-R2 commit SHA 869ebec and verification counts`
   - `d0367b6` — `fix(m7-t5): resolve all 21 Tier 5 adversarial gaps and add @pytest.mark.tier5 coverage`
+  - `f238ad5` — `docs(night-report): update NIGHT_REPORT and release manifest for M7-T5 commit d0367b6`
+  - `4845c82` — `fix(m7-t5): address R1 reviewer findings (zero-obs FAILED, empty GROKBOT_ALLOWED_ORIGINS, combined awaitable timeout)`
+  - `af61d52` — `docs(backlog): mark M7-T5 done and pause/defer M8_CAPSTONE per user request`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -63,7 +67,8 @@
 | **M4** (Integración, `LocalHttpModelClient`, Takeover, `SIGKILL`, Probe N3/AT-SPI) | `DONE` | `LocalHttpModelClient` con fallback conservador `estimated`, `A10` auth-expiry pause/resume, recuperación real `SIGKILL` (`A08`/`A14`), `make demo` (`ALM-3401` + `WO-3408`) |
 | **M5** (Benchmarks comparativos & Portabilidad Área 2 `A12`) | `DONE` | `lab/configs/facility_b.json` (`SC-77`/`CMMS-77`), `13/13` escenarios `GrokbotEngine` vs `1/13` `RuleBasedBaseline`, `engine_loc_delta=0` en `A12` |
 | **M6** (Fábrica M7 `src/factory/`, Packaging/Rollback M8 `deploy/`, Fixes E2E/M5, Docs) | `DONE` | `src/factory/` (WAL aislado `0o700`/`0o600`, `PolicyGuard`, demo 2 candidatos con rollback verificado), `deploy/` (`install_config.yaml`, `ReleaseManifest` SHA-256, `rollback.py` preservando WAL/perfiles), `make test-offline`, `make test-n3`, 5 fixes de integración |
-| **M7 (E2E Tiers 1–4 + Tier 5)** | `DONE` | Tier 1 (`99/99`), Tier 2 (`99/99`), Tier 3 (`22/22`), Tier 4 (`10/10`, `230/230` acumulado) y Tier 5 Adversarial Hardening (`24/24` `@pytest.mark.tier5` cubriendo `T5-01`..`T5-21`) verificados en `main` (`d0367b6`) |
+| **M7 (E2E Tiers 1–4 + Tier 5)** | `DONE` | Tier 1 (`99/99`), Tier 2 (`99/99`), Tier 3 (`22/22`), Tier 4 (`10/10`, `230/230` acumulado) y Tier 5 Adversarial Hardening (`26/26` `@pytest.mark.tier5` cubriendo `T5-01`..`T5-21` + hallazgos R1) verificados en `main` (`4845c82`) |
+| **M8_CAPSTONE** (`AntigravityCliModelClient`, ArtCraft Office `.xlsx`/`.docx`, 3er portal) | `PAUSED / DEFERRED` | Pausado por instrucción del usuario (`2026-11-25T21:31:15Z`) para probar M1–M7 de inmediato; planos técnicos `c7b61f5c` y `5d5e2b7b` listos para reanudar bajo petición |
 | **N3 Piloto Linux (`B-N3-01..04`)** | `PENDING_N3_LINUX_ENV` | `scripts/verify_n3_linux.sh`, `deploy/grokbot.service`, `deploy/Containerfile`, `deploy/OFFLINE_RUNBOOK.md` listos para host Linux |
 
 ---
@@ -85,7 +90,7 @@
 | **agent-browser** (`vercel-labs/agent-browser`) | `f0a98351` / `v0.44.0` | `Apache-2.0` | Lección documental sobre obsolescencia de refs en DOM dinámico | Dependencia directa |
 | **Browser Use** (`browser-use/browser-use`) | `94784c1f` / `1.0.8` | `MIT` | Referencia de comparación | Descartado por acoplamiento LLM-navegador |
 | **Cua** (`trycua/cua`) | `848e2a56` / `v0.41.12` | `MIT` | Referencia de interfaz Linux desktop `F12` | Dependencia directa |
-| **Munim Computer Use** | `b816c1e5` / `v0.14.2` | `Apache-2.0` | Prioridad AT-SPI sobre coordenadas y separación X11/XWayland vs Wayland | Código externo |
+| **Munim Computer Use** | `b816c1e5` / `0.14.2` | `Apache-2.0` | Prioridad AT-SPI sobre coordenadas y separación X11/XWayland vs Wayland | Código externo |
 | **CUA-JEV** (`ZJU-REAL/CUA-JEV`) | `eb7ce36e` | `Apache-2.0` | Flujo `Observe -> Guard -> Execute -> Independent Verifier` | Dependencias Windows |
 
 ### 3.2 Dependencias incorporadas
@@ -93,14 +98,14 @@
 
 ### 3.3 Resultados medidos (Benchmarks M6 & Fábrica M7)
 - **Benchmark comparativo emparejado (`13` escenarios N1/N2 ejecutables; `A11` = `PENDING_N3_LINUX_ENV`)**:
-   - **Modo `emulated`** (`make bench`, código `d0367b6`):
-     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=410.37ms`, `p95=426.91ms`.
-     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1228.66ms`, `p95=1475.74ms`, `tool_calls=37`, `model_calls=45`, `tokens=3730`, `RAM=81.25 MB`.
-     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.231s`, `verified_succeeded=True`.
-   - **Modo `local_http` contra servidor mock OpenAI en loopback** (`python -m benchmarks.runner --mode local_http --json`):
-     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `model_type="local_http_mock"`, `promotion_eligible=True`, `median=1239.283ms`, `p95=1534.818ms`, `tool_calls=36`, `model_calls=44`, `tokens=3656`, `RAM=80.50 MB`, `A12 verified_succeeded=True`.
+   - **Modo `emulated`** (`make bench`, código `4845c82`):
+     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=412.02ms`, `p95=434.62ms`.
+     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1235.17ms`, `p95=1464.25ms`, `tool_calls=37`, `model_calls=45`, `tokens=3730`, `RAM=81.31 MB`.
+     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.240s`, `verified_succeeded=True`.
+   - **Modo `local_http` contra servidor mock OpenAI en loopback** (`uv run python -m benchmarks.runner --mode local_http --json`):
+     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `model_type="local_http_mock"`, `promotion_eligible=True`, `median=1233.582ms`, `p95=1505.484ms`, `tool_calls=35`, `model_calls=43`, `tokens=3586`, `RAM=81.39 MB`, `A12=1.2336s (verified_succeeded=True)`.
    - **Fail-closed con endpoint local inalcanzable** (`--mode local_http --llm-origin http://127.0.0.1:9 --scenarios A08,A09`):
-     - Fallo rápido (`status="failed"`, `duration=212.28ms` en `A08` y `60.35ms` en `A09`, `exit_code=1`, cero `TimeoutError` y cero fallback silencioso a emulación).
+     - Fallo rápido (`status="failed"`, `exit_code=1`, cero `TimeoutError` y cero fallback silencioso a emulación).
 - **Fábrica de software local M7 (`uv run python -m src.factory.demo --json`)**:
    - **Candidato 1 (`cand-1-index`)**: índice `(canonical_label, area)` sobre repo git lab aislado + `factory.db` WAL aislado -> **`PROMOTED`** (`scan_steps: 100.0 -> 1.0`, `0` confusiones de activo) con `RollbackManifest` y rollback verificado (`HEAD == baseline_commit` y tests post-rollback pasando).
    - **Candidato 2 (`cand-2-skip-area`)**: optimización que omite filtro de `area` -> **`REJECTED`** (`identity_gate_failed`: `wrong_asset_attributions=2`, `area-2=bomba-34-a1` en lugar de `bomba-34-a2`; `final_main_head == promoted_commit` intacto; `LessonRecord` persistido).
@@ -109,12 +114,12 @@
 
 ## 4. Resultados N1, N2, N3 y criterio Linux sin Internet
 
-- **`uv lock --check --offline`**: Exit `0` (`Resolved 41 packages in 4ms`, cero descargas).
+- **`uv lock --check --offline`**: Exit `0` (`Resolved 41 packages in 3ms`, cero descargas).
 - **`make doctor`**: Exit `0` (`n1_ready=True`, `n2_ready=True`, `n3_status=PENDING_N3_LINUX_ENV`).
-- **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`).
+- **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`; `uv run ruff check .` también Exit `0`).
 - **`make typecheck`**: Exit `0` (`Success: no issues found in 100 source files`, `mypy --strict`).
-- **`make test-n1`**: Exit `0` (**`145 passed`**).
-- **`make test-n2`**: Exit `0` (**`47 passed, 2 deselected`**).
+- **`make test-n1`**: Exit `0` (**`146 passed`**).
+- **`make test-n2`**: Exit `0` (**`48 passed, 2 deselected`**).
 - **`make test-acceptance`**: Exit `0` (**`19 passed, 2 deselected`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
 - **`make test-offline`**: Exit `0` (valida `deploy/install_config.yaml`, ejecuta **`26 passed, 20 deselected`** pruebas N1/N2 de `deploy`/loopback/egreso/fábrica + `make test-n3`, e imprime `[PENDING_N3_LINUX_ENV]`).
@@ -123,8 +128,8 @@
 - **`uv run pytest tests/e2e -m tier2 -v`**: Exit `0` (**`99 passed`** en `F01`–`F18`).
 - **`uv run pytest tests/e2e -m tier3 -v`**: Exit `0` (**`22 passed`** en `T3-01`–`T3-22`).
 - **`uv run pytest tests/e2e -m tier4 -v`**: Exit `0` (**`10 passed`** en `T4-01`–`T4-10`; **`230/230`** E2E completo).
-- **`uv run pytest -m tier5 -v`**: Exit `0` (**`24 passed, 421 deselected`** pruebas adversariales de caja blanca `T5-01`–`T5-21`).
-- **`deploy/release_manifest.json`**: regenerado sobre `d0367b6` (`rel-0.1.0-d0367b69-20261125T212718Z`, **`71`** artefactos verificados por SHA-256 con `0` discrepancias, `n3_status=PENDING_N3_LINUX_ENV`).
+- **`uv run pytest -m tier5 -v`**: Exit `0` (**`26 passed, 421 deselected`** pruebas adversariales de caja blanca `T5-01`–`T5-21` + hallazgos R1).
+- **`deploy/release_manifest.json`**: regenerado sobre `4845c82` (`rel-0.1.0-4845c82d-20261125T214840Z`, **`71`** artefactos verificados por SHA-256 con `0` discrepancias, `n3_status=PENDING_N3_LINUX_ENV`).
 - **Criterio Linux sin Internet (`A11`)**:
   - Verificado en N2: `validate_local_model_origin`, `ToolRegistry` y `DeployInstallConfig` bloquean orígenes externos (`https://api.openai.com`, `8.8.8.8`, redirecciones HTTP 3xx) antes de conectar; Playwright aborta subrecursos fuera de allowlist y la UI web no realiza peticiones CDN.
   - Pendiente N3 en Linux: aislamiento kernel `ip netns`/`nftables`/`iptables` e inferencia con pesos locales reales (`PENDING_N3_LINUX_ENV`; automatizado en `scripts/verify_n3_linux.sh` y documentado en `deploy/OFFLINE_RUNBOOK.md`).
@@ -136,12 +141,12 @@
 ### Demos reproducibles
 - **Demo industrial Pump 34 (`make demo`)**:
    - Comando: `make demo` (`uv run python -m src.demo`)
-   - Resultado observado: `Status: succeeded (ok=True)`, `Backend Mode: emulated`, `N3 Env Status: PENDING_N3_LINUX_ENV`, `ALM-3401` + `WO-3408`, `Receipts: 3 (redaction_clean=True)`, `tool_calls=3, model_calls=4, tokens=288`.
+   - Resultado observado: `Run ID: run-f76da026e6ca`, `Status: succeeded (ok=True)`, `Backend Mode: emulated`, `N3 Env Status: PENDING_N3_LINUX_ENV`, `ALM-3401` + `WO-3408`, `Receipts: 3 (redaction_clean=True)`, `tool_calls=3, model_calls=4, tokens=288`.
 - **Demo fábrica local M7**:
    - Comando: `uv run python -m src.factory.demo --json`
    - Resultado observado: Exit `0`, `"ok": true`, `"rollback_verified": true`, `cand-1-index` promovido (`100.0 -> 1.0`), `cand-2-skip-area` rechazado (`wrong_asset_attributions=2`).
-- **Consola Web local**:
-   - Comando: `uv run uvicorn src.web.app:create_app --factory --host 127.0.0.1 --port 8000` (con `GROKBOT_*` para modo runtime real o sin ellas para stub UI).
+- **Consola Web local interactiva**:
+   - Ver **Sección 8 (Quickstart)** para lanzar las 3 apps sintéticas (`lab.scada_app`, `lab.maintenance_app`, `lab.effect_sim`) y la consola web ControlBot (`http://127.0.0.1:8000`).
 
 ### Reproducir los bloqueos y rechazos verificados
 - **Bloqueo de entorno N3 en macOS**:
@@ -156,19 +161,59 @@
 
 ## 6. Horas usadas, recursos observados y riesgo principal
 
-- **Ventana nocturna**: inicio `2026-11-25T09:07:18Z`, cierre M7-T5 `2026-11-25T21:27:18Z` (~`12.33 horas` acumuladas entre M0–M7-T5 manteniendo ejecución continua hasta completar el Capstone Final y la validación Linux N3).
-- **Recursos observados**: Apple M1 (8 cores), `8 GB` RAM; RSS pico medido en benchmarks `~81.25 MB`; VRAM `N/A` (sin servidor LLM local ni GPU Linux en este host).
-- **Riesgo principal**: la ejecución real **N3** en Linux (bloqueo de egreso a nivel kernel `netns`/`iptables`, precisión/latencia/VRAM de un modelo cuantizado real en CPU/GPU local, y sesión AT-SPI/X11/Wayland en vivo) permanece sin validar en hardware Linux hasta disponer del entorno destino.
+- **Ventana nocturna**: inicio `2026-11-25T09:07:18Z`, cierre M7-T5-R2 `2026-11-25T22:03:02Z` (~`12.93 horas` acumuladas entre M0–M7 completando el Megaplan original; `M8_CAPSTONE` pausado/diferido por petición del usuario).
+- **Recursos observados**: Apple M1 (8 cores), `8 GB` RAM; RSS pico medido en benchmarks `~81.39 MB`; VRAM `N/A` (sin servidor LLM local ni GPU Linux en este host).
+- **Riesgo principal**: la ejecución real **N3** en Linux (bloqueo de egreso a nivel kernel `netns`/`iptables`, precisión/latencia/VRAM de un modelo cuantizado real en CPU/GPU local, y sesión AT-SPI/X11/Wayland en vivo) permanece sin validar en hardware Linux (`PENDING_N3_LINUX_ENV`) hasta disponer del entorno destino.
 
 ---
 
 ## 7. Siguiente tarea ejecutable, prerrequisitos y prueba habilitante
 
-- **Siguiente tarea ejecutable inmediata (`B-M7-05` Capstone Final)**:
-   - **Objetivo**: Ejecutar auditoría/integración final del Capstone y congelar entrega sobre `main` (`d0367b6`).
-   - **Prerrequisitos**: Tier 1 (`99/99`), Tier 2 (`99/99`), Tier 3 (`22/22`), Tier 4 (`10/10`, `230/230` E2E), Tier 5 (`24/24` `@pytest.mark.tier5`) y puertas base en `main` (`make check && make test-offline && make test-n3 && make demo && make bench` en Exit `0`).
-   - **Prueba habilitante**: `uv run pytest tests/e2e -v` (`230/230`), `uv run pytest -m tier5 -v` (`24/24`) y puertas Capstone.
+- **Entrega lista para el usuario (M1–M7 completo)**:
+   - **Objetivo**: Probar ControlBot M1–M7 localmente (`make demo`, `make bench`, consola Web + apps `lab/`) y finalizar el Sentinel Victory Audit sobre `main` (`4845c82`). `M8_CAPSTONE` permanece `PAUSED / DEFERRED` (`c7b61f5c`, `5d5e2b7b`) hasta nueva solicitud del usuario.
+   - **Prerrequisitos**: `.venv` + Chromium `1248` instalados (verificados por `make doctor`).
+   - **Prueba habilitante**: `make check && make test-offline && make test-n3 && make demo && make bench` + `uv run pytest tests/e2e -v` (`230/230`) + `uv run pytest -m tier5 -v` (`26/26`).
 - **Siguiente tarea en host Linux destino (`B-N3-01..04`)**:
    - **Objetivo**: Validar N3 completo en Linux sin Internet (`A11` + LLM local real + AT-SPI/X11/Wayland).
    - **Prerrequisitos**: Host Linux provisionado, wheelhouse + Chromium `1248` pre-cacheados, pesos LLM fijados y reglas `netns`/`iptables` activas.
    - **Prueba habilitante**: `./scripts/verify_n3_linux.sh` Exit `0`, `uv run python -m src.n3_probe --strict --json` Exit `0` (`"overall_status": "READY"`) y `make test-n3` pasando `2/2` sin skips.
+
+---
+
+## 8. Guía Rápida de Uso y Verificación (Quickstart)
+
+### 8.1 Verificación automática rápida (todo local, sin descargas)
+```bash
+cd /Users/armandosilva/Projects/Grokbotclon
+
+make check          # doctor + ruff + mypy --strict + unit/integration/acceptance (N1/N2)
+make demo           # Demo completo Pump 34 (SCADA + Maintenance + Playwright + SQLite WAL)
+make bench          # Benchmark comparativo (RuleBasedBaseline vs GrokbotEngine, 13 escenarios)
+make test-offline   # Validación offline deploy/ + loopback/egreso + fábrica M7 (+ estado N3)
+```
+
+### 8.2 Lanzar las aplicaciones de laboratorio + Consola Web de ControlBot
+En terminales separadas desde `/Users/armandosilva/Projects/Grokbotclon`:
+
+1. **Terminal 1 — Lab SCADA (`127.0.0.1:8101`)**:
+   ```bash
+   uv run uvicorn lab.scada_app:create_scada_app --factory --host 127.0.0.1 --port 8101
+   ```
+2. **Terminal 2 — Lab Maintenance (`127.0.0.1:8102`)**:
+   ```bash
+   uv run uvicorn lab.maintenance_app:create_maintenance_app --factory --host 127.0.0.1 --port 8102
+   ```
+3. **Terminal 3 — Lab EffectSim (`127.0.0.1:8103`, opcional para pruebas con efectos)**:
+   ```bash
+   uv run uvicorn lab.effect_sim:create_effect_sim_app --factory --host 127.0.0.1 --port 8103
+   ```
+4. **Terminal 4 — Consola Web ControlBot (`http://127.0.0.1:8000`)**:
+   ```bash
+   GROKBOT_INSTALLATION_CONFIG=lab/configs/facility_a.json \
+   GROKBOT_DB_PATH=var/grokbot_ui.sqlite3 \
+   GROKBOT_PROFILE_ROOT=.browser_profiles/ui \
+   uv run uvicorn src.web.app:create_app --factory --host 127.0.0.1 --port 8000
+   ```
+5. Abrir **`http://127.0.0.1:8000`** en el navegador y enviar una consulta, por ejemplo:
+   - `¿Qué alarma apareció primero en la bomba 34?` (en `allowed_origins`: `http://127.0.0.1:8101,http://127.0.0.1:8102`; sin `allowed_areas` para probar la pausa por ambigüedad multi-área y reanudación manual con `area-1`, o con `allowed_areas`: `area-1` para ejecución directa).
+   - Nota de entorno: en macOS (`Darwin`), `N3` (`netns`/`iptables`, pesos LLM locales y `AT-SPI`) permanece honestamente marcado como `PENDING_N3_LINUX_ENV`.
