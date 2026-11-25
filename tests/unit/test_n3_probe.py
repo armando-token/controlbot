@@ -145,3 +145,23 @@ def test_n3_probe_non_2xx_http_404_server_returns_clean_report() -> None:
     assert llm_check.detail["endpoint_reachable"] is False
     assert llm_check.detail["endpoint_status"] == 404
     assert "HTTP 404" in str(llm_check.detail["probe_note"])
+
+
+@pytest.mark.n1
+def test_deploy_n3_probe_cli_json_and_strict_honesty(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from deploy.n3_probe import main as deploy_n3_main
+
+    rc = deploy_n3_main(["--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["host_os"] == platform.system()
+    assert payload["status"] == payload["overall_status"]
+    assert isinstance(payload["egress_blocked"], bool)
+
+    if platform.system() != "Linux":
+        assert payload["status"] == "PENDING_N3_LINUX_ENV"
+        assert payload["overall_status"] == "PENDING_N3_LINUX_ENV"
+        assert payload["egress_blocked"] is False
+        assert deploy_n3_main(["--strict"]) == 1

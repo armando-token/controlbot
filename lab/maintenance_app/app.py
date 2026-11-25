@@ -577,12 +577,15 @@ def create_maintenance_app(
             )
         sess = _authenticate(maint_session)
         if sess is None:
-            login_url = (
-                "/login?expired=1"
-                if (maint_session is not None or maint_state.fixture_mode == "auth_expired")
-                else "/login"
+            sess_record = maint_state.sessions.get(maint_session) if maint_session else None
+            is_expired = maint_state.fixture_mode == "auth_expired" or (
+                sess_record is not None and sess_record.expired
             )
-            return RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
+            login_url = "/login?expired=1" if is_expired else "/login"
+            resp = RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
+            if maint_session is not None and sess_record is None:
+                resp.delete_cookie("maint_session", path="/")
+            return resp
         rows, allowed = _filter_work_orders(
             maint_state.get_work_orders(),
             sess.areas,

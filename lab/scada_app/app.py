@@ -703,12 +703,15 @@ def create_scada_app(
             )
         sess = _authenticate(scada_session)
         if sess is None:
-            login_url = (
-                "/login?expired=1"
-                if (scada_session is not None or scada_state.fixture_mode == "auth_expired")
-                else "/login"
+            sess_record = scada_state.sessions.get(scada_session) if scada_session else None
+            is_expired = scada_state.fixture_mode == "auth_expired" or (
+                sess_record is not None and sess_record.expired
             )
-            return RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
+            login_url = "/login?expired=1" if is_expired else "/login"
+            resp = RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
+            if scada_session is not None and sess_record is None:
+                resp.delete_cookie("scada_session", path="/")
+            return resp
         rows, allowed = _filter_records(
             scada_state.get_alarms(),
             sess.areas,
@@ -747,12 +750,15 @@ def create_scada_app(
             )
         sess = _authenticate(scada_session)
         if sess is None:
-            login_url = (
-                "/login?expired=1"
-                if (scada_session is not None or scada_state.fixture_mode == "auth_expired")
-                else "/login"
+            sess_record = scada_state.sessions.get(scada_session) if scada_session else None
+            is_expired = scada_state.fixture_mode == "auth_expired" or (
+                sess_record is not None and sess_record.expired
             )
-            return RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
+            login_url = "/login?expired=1" if is_expired else "/login"
+            resp = RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
+            if scada_session is not None and sess_record is None:
+                resp.delete_cookie("scada_session", path="/")
+            return resp
         rows, allowed = _filter_records(
             scada_state.get_readings(),
             sess.areas,

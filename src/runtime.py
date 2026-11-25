@@ -472,6 +472,58 @@ def _infer_effect_operation_key(query: str, run_id: str) -> str:
     return f"op-{run_id}"
 
 
+def _query_mentions_area(low_q: str, norm_q: str, area: str) -> bool:
+    norm_area = re.sub(r"[-_\s]+", " ", area.lower()).strip()
+    compact_area = re.sub(r"[-_\s]+", "", area.lower())
+    return bool(
+        re.search(rf"\b{re.escape(norm_area)}\b", norm_q)
+        or (compact_area and re.search(rf"\b{re.escape(compact_area)}\b", low_q))
+    )
+
+
+def _extract_chosen_area(
+    prompt_ctx: PromptContext,
+    config: FacilityConfig,
+) -> str | None:
+    if len(prompt_ctx.allowed_areas) == 1:
+        return prompt_ctx.allowed_areas[0]
+    if prompt_ctx.human_input:
+        raw_area = prompt_ctx.human_input.get("area") or prompt_ctx.human_input.get("choice")
+        if isinstance(raw_area, str) and raw_area.strip():
+            return raw_area.strip()
+        raw_asset_id = prompt_ctx.human_input.get("asset_id")
+        if isinstance(raw_asset_id, str) and raw_asset_id.strip():
+            target_id = raw_asset_id.strip()
+            for asset in config.assets:
+                if asset.asset_id == target_id or target_id in asset.source_ids.values():
+                    return asset.area
+    if len(prompt_ctx.allowed_areas) >= 2:
+        low_q = prompt_ctx.query.lower()
+        norm_q = re.sub(r"[-_\s]+", " ", low_q)
+        matched_areas = [
+            area for area in prompt_ctx.allowed_areas if _query_mentions_area(low_q, norm_q, area)
+        ]
+        if len(matched_areas) == 1:
+            return matched_areas[0]
+    return None
+
+
+def _tool_already_called_for_area(
+    history: Sequence[dict[str, Any]],
+    tool_id: str,
+    chosen_area: str | None,
+) -> bool:
+    for item in history:
+        if not isinstance(item, dict) or item.get("tool_id") != tool_id:
+            continue
+        if chosen_area is None:
+            return True
+        item_args = item.get("args")
+        if isinstance(item_args, dict) and item_args.get("area") == chosen_area:
+            return True
+    return False
+
+
 def make_industrial_turn_factory(
     config: FacilityConfig,
 ) -> Callable[[PromptContext, Sequence[ToolSpec], BudgetRemaining], EmulatedTurn]:
@@ -494,53 +546,6 @@ def make_industrial_turn_factory(
             for item in prompt_ctx.history
             if isinstance(item, dict) and item.get("tool_id")
         ]
-
-        # Depth=1 child delegation when min_sources >= 2 and both SCADA & Maint are available
-        scada_tools = tuple(
-            tid for tid in ("scada.read_alarms", "scada.read_readings") if tid in tool_map
-        )
-        if (
-            prompt_ctx.depth == 0
-            and prompt_ctx.turn_index == 0
-            and not prompt_ctx.history
-            and prompt_ctx.min_sources >= 2
-            and budget_remaining.depth_remaining >= 1
-            and budget_remaining.active_children_remaining >= 2
-            and scada_tools
-            and "maint.read_work_orders" in tool_map
-        ):
-            scada_origins = tuple(
-                dict.fromkeys(
-                    origin
-                    for tid in scada_tools
-                    for origin in tool_map[tid].allowed_origins
-                )
-            )
-            maint_origins = tuple(tool_map["maint.read_work_orders"].allowed_origins)
-            return EmulatedTurn(
-                decision=ModelDecision(
-                    decision_type="delegate",
-                    delegations=(
-                        ModelDelegationRequest(
-                            child_label="scada-branch",
-                            query=prompt_ctx.query,
-                            allowed_tools=scada_tools,
-                            allowed_origins=scada_origins,
-                            allowed_areas=prompt_ctx.allowed_areas,
-                            read_only=True,
-                        ),
-                        ModelDelegationRequest(
-                            child_label="maint-branch",
-                            query=prompt_ctx.query,
-                            allowed_tools=("maint.read_work_orders",),
-                            allowed_origins=maint_origins,
-                            allowed_areas=prompt_ctx.allowed_areas,
-                            read_only=True,
-                        ),
-                    ),
-                    usage=usage,
-                )
-            )
 
         # Effect tools when explicitly targeted or requested by query
         low_q = prompt_ctx.query.lower()
@@ -609,15 +614,71 @@ def make_industrial_turn_factory(
                     )
                 )
 
-        chosen_area: str | None = None
-        if len(prompt_ctx.allowed_areas) == 1:
-            chosen_area = prompt_ctx.allowed_areas[0]
-        elif prompt_ctx.human_input:
-            raw_area = prompt_ctx.human_input.get("area") or prompt_ctx.human_input.get("choice")
-            if isinstance(raw_area, str) and raw_area.strip():
-                chosen_area = raw_area.strip()
-
+        chosen_area = _extract_chosen_area(prompt_ctx, config)
         asset_query = _infer_asset_query(prompt_ctx.query, config)
+        if (
+            prompt_ctx.depth == 0
+            and chosen_area is None
+            and len(prompt_ctx.allowed_areas) >= 2
+        ):
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="request_input",
+                    required_action=(
+                        f"Ambiguous area scope for {asset_query} across "
+                        f"{', '.join(prompt_ctx.allowed_areas)}; specify target area."
+                    ),
+                    usage=usage,
+                )
+            )
+
+        # Depth=1 child delegation when min_sources >= 2 and both SCADA & Maint are available
+        scada_tools = tuple(
+            tid for tid in ("scada.read_alarms", "scada.read_readings") if tid in tool_map
+        )
+        if (
+            prompt_ctx.depth == 0
+            and prompt_ctx.turn_index == 0
+            and not prompt_ctx.history
+            and prompt_ctx.min_sources >= 2
+            and budget_remaining.depth_remaining >= 1
+            and budget_remaining.active_children_remaining >= 2
+            and scada_tools
+            and "maint.read_work_orders" in tool_map
+        ):
+            scada_origins = tuple(
+                dict.fromkeys(
+                    origin
+                    for tid in scada_tools
+                    for origin in tool_map[tid].allowed_origins
+                )
+            )
+            maint_origins = tuple(tool_map["maint.read_work_orders"].allowed_origins)
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="delegate",
+                    delegations=(
+                        ModelDelegationRequest(
+                            child_label="scada-branch",
+                            query=prompt_ctx.query,
+                            allowed_tools=scada_tools,
+                            allowed_origins=scada_origins,
+                            allowed_areas=prompt_ctx.allowed_areas,
+                            read_only=True,
+                        ),
+                        ModelDelegationRequest(
+                            child_label="maint-branch",
+                            query=prompt_ctx.query,
+                            allowed_tools=("maint.read_work_orders",),
+                            allowed_origins=maint_origins,
+                            allowed_areas=prompt_ctx.allowed_areas,
+                            read_only=True,
+                        ),
+                    ),
+                    usage=usage,
+                )
+            )
+
         has_delegations = any(
             isinstance(item, dict) and "delegation" in item for item in prompt_ctx.history
         )
@@ -635,7 +696,9 @@ def make_industrial_turn_factory(
 
         plan_order = ("scada.read_alarms", "scada.read_readings", "maint.read_work_orders")
         for tool_id in plan_order:
-            if tool_id in tool_map and tool_id not in called_tools:
+            if tool_id in tool_map and not _tool_already_called_for_area(
+                prompt_ctx.history, tool_id, chosen_area
+            ):
                 spec = tool_map[tool_id]
                 args: dict[str, Any] = {"asset": asset_query}
                 if chosen_area is not None:

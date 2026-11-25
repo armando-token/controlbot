@@ -361,3 +361,232 @@ async def test_final_decision_with_empty_or_false_partial_info_settles_succeeded
     run_p = coord_p.submit_task(_make_task("task-real-partial"))
     res_p = await coord_p.run_until_settled(run_p.run_id)
     assert res_p.status == TaskStatus.PARTIAL
+
+
+@pytest.mark.n1
+async def test_coordinator_accumulates_human_inputs_chronologically_across_resumes(
+    tmp_path: Path,
+) -> None:
+    from collections.abc import Sequence
+
+    from src.model.protocol import (
+        BudgetRemaining,
+        ModelDecision,
+        ModelToolCall,
+        ModelUsage,
+        PromptContext,
+    )
+
+    seen_prompt_inputs: list[dict[str, Any] | None] = []
+    seen_verifier_input: list[dict[str, Any] | None] = []
+
+    class _MultiPauseClient:
+        async def decide(
+            self,
+            prompt_ctx: PromptContext,
+            tools: Sequence[ToolSpec],
+            budget_remaining: BudgetRemaining,
+        ) -> ModelDecision:
+            del tools, budget_remaining
+            seen_prompt_inputs.append(
+                dict(prompt_ctx.human_input) if prompt_ctx.human_input is not None else None
+            )
+            usage = ModelUsage(
+                prompt_tokens=10,
+                completion_tokens=10,
+                total_tokens=20,
+                usage_mode="actual",
+            )
+            if prompt_ctx.human_input is None:
+                return ModelDecision(
+                    decision_type="request_input",
+                    required_action="Select target area.",
+                    usage=usage,
+                )
+            if not prompt_ctx.human_input.get("reauthenticated"):
+                return ModelDecision(
+                    decision_type="request_input",
+                    required_action="Reauthenticate session.",
+                    usage=usage,
+                )
+            if not prompt_ctx.history:
+                return ModelDecision(
+                    decision_type="tool_call",
+                    tool_call=ModelToolCall(
+                        tool_id="read_scada",
+                        args={"asset": "pump-34", "area": prompt_ctx.human_input["area"]},
+                        target_origin="https://scada.local",
+                        completion_verifier="scada_verifier",
+                        rationale="Query clarified area.",
+                    ),
+                    usage=usage,
+                )
+            return ModelDecision(
+                decision_type="final",
+                final_answer="Done.",
+                usage=usage,
+            )
+
+    def _capture_verifier(
+        task_spec: TaskSpec,
+        run_id: str,
+        observations: tuple[Any, ...],
+        history: Sequence[dict[str, Any]],
+        candidate: Result,
+        last_human_input: dict[str, Any] | None,
+    ) -> Result:
+        del task_spec, run_id, observations, history
+        seen_verifier_input.append(
+            dict(last_human_input) if last_human_input is not None else None
+        )
+        return candidate
+
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "multi_resume.db", clock=clock)
+    repo.init_db()
+    reg = ToolRegistry(clock=clock)
+    _register_scada_tool(reg)
+    coord = Coordinator(
+        repo,
+        _MultiPauseClient(),
+        reg,
+        clock=clock,
+        result_verifier=_capture_verifier,
+    )
+    run = coord.submit_task(_make_task("task-multi-resume"))
+
+    res1 = await coord.run_until_settled(run.run_id)
+    assert res1.status == TaskStatus.WAITING_FOR_INPUT
+
+    coord.resume_task(run.run_id, {"area": "area-1", "note": "first"})
+    res2 = await coord.run_until_settled(run.run_id)
+    assert res2.status == TaskStatus.WAITING_FOR_INPUT
+
+    coord.resume_task(run.run_id, {"reauthenticated": True, "note": "second"})
+    res3 = await coord.run_until_settled(run.run_id)
+    assert res3.status == TaskStatus.SUCCEEDED
+
+    expected = {"area": "area-1", "reauthenticated": True, "note": "second"}
+    assert seen_prompt_inputs == [None, {"area": "area-1", "note": "first"}, expected, expected]
+    assert seen_verifier_input == [expected]
+
+
+@pytest.mark.n1
+def test_make_industrial_turn_factory_pre_tool_disambiguation_and_area_requery() -> None:
+    from src.adapters.config import load_facility_config
+    from src.adapters.maintenance import get_maintenance_tool_specs
+    from src.adapters.scada import get_scada_tool_specs
+    from src.model.protocol import BudgetRemaining, ModelDecision, PromptContext
+    from src.runtime import make_industrial_turn_factory
+
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    turn_factory = make_industrial_turn_factory(cfg)
+    tools = [
+        *get_scada_tool_specs((cfg.apps["scada"].origin,)).values(),
+        *get_maintenance_tool_specs((cfg.apps["maintenance"].origin,)).values(),
+    ]
+    budget = BudgetRemaining(
+        active_children_remaining=2,
+        depth_remaining=1,
+        tool_calls_remaining=16,
+        model_calls_remaining=8,
+        wall_seconds_remaining=120.0,
+        tokens_remaining=24000,
+    )
+
+    # 1. Pre-tool disambiguation when >=2 areas allowed and no area chosen yet
+    pause_turn = turn_factory(
+        PromptContext(
+            task_id="t-ambig",
+            run_id="r-ambig",
+            depth=0,
+            query="Check bomba 34",
+            facility_id="facility-a",
+            allowed_areas=("area-1", "area-2"),
+            history=(),
+            observations=(),
+            human_input=None,
+            turn_index=0,
+        ),
+        tools,
+        budget,
+    )
+    assert isinstance(pause_turn.decision, ModelDecision)
+    assert pause_turn.decision.decision_type == "request_input"
+    req_action = pause_turn.decision.required_action or ""
+    assert "area-1" in req_action and "area-2" in req_action
+
+    # 2. If chosen_area is set and prior tool call lacked area, re-query with area
+    requery_turn = turn_factory(
+        PromptContext(
+            task_id="t-ambig",
+            run_id="r-ambig",
+            depth=0,
+            query="Check bomba 34",
+            facility_id="facility-a",
+            allowed_areas=("area-1", "area-2"),
+            history=({"tool_id": "scada.read_alarms", "args": {"asset": "bomba 34"}},),
+            observations=(),
+            human_input={"area": "area-1", "reauthenticated": True},
+            turn_index=1,
+        ),
+        tools,
+        budget,
+    )
+    assert isinstance(requery_turn.decision, ModelDecision)
+    assert requery_turn.decision.decision_type == "tool_call"
+    assert requery_turn.decision.tool_call is not None
+    assert requery_turn.decision.tool_call.tool_id == "scada.read_alarms"
+    assert requery_turn.decision.tool_call.args.get("area") == "area-1"
+
+    # 3. Once all 3 tools ran for chosen_area, proceed to final
+    final_turn = turn_factory(
+        PromptContext(
+            task_id="t-ambig",
+            run_id="r-ambig",
+            depth=0,
+            query="Check bomba 34",
+            facility_id="facility-a",
+            allowed_areas=("area-1", "area-2"),
+            history=(
+                {"tool_id": "scada.read_alarms", "args": {"asset": "bomba 34", "area": "area-1"}},
+                {
+                    "tool_id": "scada.read_readings",
+                    "args": {"asset": "bomba 34", "area": "area-1"},
+                },
+                {
+                    "tool_id": "maint.read_work_orders",
+                    "args": {"asset": "bomba 34", "area": "area-1"},
+                },
+            ),
+            observations=(),
+            human_input={"area": "area-1", "reauthenticated": True},
+            turn_index=4,
+        ),
+        tools,
+        budget,
+    )
+    assert isinstance(final_turn.decision, ModelDecision)
+    assert final_turn.decision.decision_type == "final"
+
+    # 4. Unambiguous area mention in query ("Area 2" vs "area-2", "area-3") resolves without pause
+    explicit_turn = turn_factory(
+        PromptContext(
+            task_id="t-area2-explicit",
+            run_id="r-area2-explicit",
+            depth=0,
+            query="¿Qué alarma apareció primero en Area 2?",
+            facility_id="facility-b",
+            allowed_areas=("area-2", "area-3"),
+            history=(),
+            observations=(),
+            human_input=None,
+            turn_index=0,
+        ),
+        tools,
+        budget,
+    )
+    assert isinstance(explicit_turn.decision, ModelDecision)
+    assert explicit_turn.decision.decision_type == "tool_call"
+    assert explicit_turn.decision.tool_call is not None
+    assert explicit_turn.decision.tool_call.args.get("area") == "area-2"

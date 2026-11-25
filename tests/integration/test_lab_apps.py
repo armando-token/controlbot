@@ -232,3 +232,42 @@ def test_facility_a_config_loads_with_origin_overrides() -> None:
     matches = resolve_asset_candidates(cfg, "Pump 34")
     assert len(matches) == 1
     assert matches[0].asset_id == "bomba-34-a1"
+
+
+@pytest.mark.n2
+async def test_lab_apps_distinguish_unknown_restart_cookie_from_expired_session() -> None:
+    scada_app = create_scada_app(fixture_mode="default")
+    maint_app = create_maintenance_app(fixture_mode="contradictory")
+
+    async with (
+        run_asgi_server(scada_app) as scada_origin,
+        run_asgi_server(maint_app) as maint_origin,
+        httpx.AsyncClient(
+            base_url=scada_origin,
+            cookies={"scada_session": "stale-unknown-cookie"},
+        ) as scada_client,
+        httpx.AsyncClient(
+            base_url=maint_origin,
+            cookies={"maint_session": "stale-unknown-cookie"},
+        ) as maint_client,
+    ):
+        for route in ("/alarms", "/readings"):
+            resp = await scada_client.get(route, follow_redirects=False)
+            assert resp.status_code == 303
+            assert resp.headers["location"] == "/login"
+            assert "scada_session=" in resp.headers.get("set-cookie", "")
+
+        m_resp = await maint_client.get("/work-orders", follow_redirects=False)
+        assert m_resp.status_code == 303
+        assert m_resp.headers["location"] == "/login"
+        assert "maint_session=" in m_resp.headers.get("set-cookie", "")
+
+        # Explicit expire_all_sessions still redirects to /login?expired=1
+        await maint_client.post(
+            "/login",
+            json={"username": "maint_a1", "password": "maint-pass-a1"},
+        )
+        maint_app.state.maintenance_state.expire_all_sessions()
+        expired_m = await maint_client.get("/work-orders", follow_redirects=False)
+        assert expired_m.status_code == 303
+        assert expired_m.headers["location"] == "/login?expired=1"

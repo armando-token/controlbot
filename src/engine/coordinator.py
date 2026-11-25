@@ -56,6 +56,25 @@ from src.storage.errors import (
 from src.storage.repo import StepExecutionDetails, StorageRepo
 
 
+def _collect_human_inputs(
+    events: Sequence[Any],
+    pending_human_input: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Accumulate human_input payloads chronologically and overlay pending_human_input."""
+    merged: dict[str, Any] = {}
+    found = False
+    for ev in events:
+        if getattr(ev, "event_type", None) == "human_input_received":
+            payload = getattr(ev, "payload", None)
+            if isinstance(payload, dict) and isinstance(payload.get("human_input"), dict):
+                merged.update(payload["human_input"])
+                found = True
+    if pending_human_input is not None:
+        merged.update(pending_human_input)
+        found = True
+    return merged if found else None
+
+
 class CoordinatorConfig(FrozenModel):
     """Runtime parameters for Coordinator."""
 
@@ -702,17 +721,14 @@ class Coordinator:
         contradictions: list[ContradictionRecord],
     ) -> Result:
         pending_human_input = self._repo.consume_pending_human_input(run_id)
-        last_human_input: dict[str, Any] | None = pending_human_input
-        if last_human_input is None:
-            for ev in reversed(snapshot.events):
-                if ev.event_type == "human_input_received" and isinstance(
-                    ev.payload.get("human_input"), dict
-                ):
-                    last_human_input = ev.payload["human_input"]
-                    break
+        last_human_input: dict[str, Any] | None = _collect_human_inputs(
+            snapshot.events,
+            pending_human_input,
+        )
         history: list[dict[str, Any]] = [
             {
                 "tool_id": r.tool_id,
+                "args": r.redacted_args,
                 "outcome": r.outcome.value,
                 "observed_after": r.observed_after,
                 "error": r.error_detail,
@@ -826,8 +842,8 @@ class Coordinator:
             safe_query = redact_string_strict(task_spec.query)
             safe_history = tuple(redact_payload_strict(item) for item in history)
             safe_human = (
-                redact_payload_strict(pending_human_input)
-                if pending_human_input is not None
+                redact_payload_strict(last_human_input)
+                if last_human_input is not None
                 else None
             )
             prompt_ctx = PromptContext(
