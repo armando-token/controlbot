@@ -1,0 +1,60 @@
+[project]
+name = "grokbotclon"
+version = "0.1.0"
+description = "Local modular industrial agent engine with verifiable contracts, SQLite WAL state, and isolated lab execution"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.9,<3.0",
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "httpx>=0.27,<1.0",
+    "jinja2>=3.1,<4.0",
+    "playwright==1.64.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "ruff>=0.6,<1.0",
+    "mypy>=1.11,<2.0",
+]
+
+[project.scripts]
+grokbot-doctor = "src.doctor:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "n1: deterministic unit tests with controlled clock and emulated model",
+    "n2: local multi-process, SQLite WAL, Playwright, and synthetic lab integration tests",
+    "n3: Linux local LLM and outbound-blocked network acceptance tests",
+    "acceptance: Megaplan A01-A14 acceptance oracle tests",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["tests/e2e"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "."
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]

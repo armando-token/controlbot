@@ -1,0 +1,32 @@
+# Python / uv / tools
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Runtime state / SQLite / Browser / Logs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+var/
+artifacts/
+logs/
+*.log
+.browser_profiles/
+
+# Secrets / OS / Scratch
+.env
+.env.*
+.DS_Store
+.agents/
+tmp/
