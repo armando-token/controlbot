@@ -1151,8 +1151,8 @@ class StorageRepo:
                         UPDATE task_budgets
                         SET human_wait_seconds_elapsed = ?,
                             active_children = CASE
-                                WHEN ? > 0 THEN MAX(0, active_children - 1)
-                                ELSE active_children
+                                WHEN ? = 0 THEN 0
+                                ELSE MAX(0, active_children - 1)
                             END,
                             updated_at = ?
                         WHERE task_id = ?
@@ -1189,6 +1189,53 @@ class StorageRepo:
                         },
                         created_at_iso=now_iso,
                     )
+                    if current_run.depth == 0:
+                        placeholders = ", ".join("?" for _ in _NON_TERMINAL_STATUS_VALUES)
+                        descendants = conn.execute(
+                            f"""
+                            SELECT run_id, status, version
+                            FROM runs
+                            WHERE task_id = ? AND run_id != ? AND status IN ({placeholders})
+                            """,
+                            (current_run.task_id, run_id, *_NON_TERMINAL_STATUS_VALUES),
+                        ).fetchall()
+                        for desc in descendants:
+                            desc_run_id = str(desc["run_id"])
+                            desc_status = str(desc["status"])
+                            desc_version = int(desc["version"]) + 1
+                            conn.execute(
+                                """
+                                UPDATE runs
+                                SET status = ?, version = ?, transition_reason = ?,
+                                    required_action = NULL, waiting_since = NULL, updated_at = ?
+                                WHERE run_id = ?
+                                """,
+                                (
+                                    TaskStatus.FAILED.value,
+                                    desc_version,
+                                    "parent_human_wait_timeout_exceeded",
+                                    now_iso,
+                                    desc_run_id,
+                                ),
+                            )
+                            self._insert_event(
+                                conn,
+                                task_id=current_run.task_id,
+                                run_id=desc_run_id,
+                                step_id=None,
+                                event_type="run_transition",
+                                from_status=desc_status,
+                                to_status=TaskStatus.FAILED.value,
+                                reason="parent_human_wait_timeout_exceeded",
+                                payload={
+                                    "parent_run_id": run_id,
+                                    "human_wait_seconds_elapsed": new_human_wait,
+                                    "human_wait_timeout_seconds": (
+                                        budget_cfg.human_wait_timeout_seconds
+                                    ),
+                                },
+                                created_at_iso=now_iso,
+                            )
                     self._insert_audit(
                         conn,
                         task_id=current_run.task_id,

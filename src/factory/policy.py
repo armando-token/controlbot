@@ -868,6 +868,9 @@ class PolicyGuard:
         normalized = posixpath.normpath(raw)
         if normalized in ("", ".") or normalized.startswith("/") or ".." in normalized.split("/"):
             return True
+        parts_folded = [_norm_fold(part) for part in normalized.split("/") if part]
+        if any(part in {".git", ".gitmodules", ".gitattributes"} for part in parts_folded):
+            return True
         norm_folded = _norm_fold(normalized)
         for prefix in self._immutable_prefixes:
             raw_prefix = prefix.replace("\\", "/")

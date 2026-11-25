@@ -1228,3 +1228,109 @@ def test_t5_20_verifier_preserves_partial_scada_tool_failure_and_query_area() ->
     )
     assert res_area.status == TaskStatus.SUCCEEDED
     assert all(o.area == "area-1" for o in res_area.verified_observations)
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_23_wait_timeout_on_parent_resume_fails_waiting_children_and_clears_active_children(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from src.engine.tool_registry import AuthToolError
+    from src.model.emulator import EmulatedTurn
+    from src.model.protocol import (
+        ModelDecision,
+        ModelDelegationRequest,
+        ModelToolCall,
+        ModelUsage,
+    )
+
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "t5_23.db", clock=clock)
+    repo.init_db()
+    reg = ToolRegistry(clock=clock)
+
+    def _auth_gated_read(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+        del args, ctx
+        raise AuthToolError("Session expired for scada")
+
+    reg.register(
+        ToolSpec(
+            tool_id="read_scada",
+            version="1.0.0",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            allowed_origins=("https://scada.local",),
+            effect_class=EffectClass.READ,
+            timeout_s=5.0,
+            verifier_name="v",
+        ),
+        _auth_gated_read,
+    )
+
+    usage = ModelUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    def _turn_factory(
+        prompt_ctx: Any, tools: Any, budget_rem: Any
+    ) -> EmulatedTurn:
+        del tools, budget_rem
+        if prompt_ctx.depth == 0:
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="delegate",
+                    delegations=(
+                        ModelDelegationRequest(
+                            child_label="scada-child",
+                            query="Read scada",
+                            allowed_tools=("read_scada",),
+                            allowed_origins=("https://scada.local",),
+                        ),
+                    ),
+                    usage=usage,
+                )
+            )
+        return EmulatedTurn(
+            decision=ModelDecision(
+                decision_type="tool_call",
+                tool_call=ModelToolCall(
+                    tool_id="read_scada",
+                    args={},
+                    target_origin="https://scada.local",
+                ),
+                usage=usage,
+            )
+        )
+
+    async def _run() -> None:
+        coord = Coordinator(repo, EmulatedModelClient(turn_factory=_turn_factory), reg, clock=clock)
+        task = _make_task("t5-23", budget=BudgetConfig(human_wait_timeout_seconds=1.0))
+        run = coord.submit_task(task)
+        paused = await coord.run_until_settled(run.run_id)
+        assert paused.status == TaskStatus.WAITING_FOR_INPUT
+
+        snap_before = repo.get_run_snapshot(run.run_id)
+        assert len(snap_before.child_runs) == 1
+        assert snap_before.child_runs[0].status == TaskStatus.WAITING_FOR_INPUT
+        assert snap_before.budget_usage.active_children == 1
+
+        clock.advance(2.0)
+        with pytest.raises(BudgetExceededError, match="Human wait timeout exceeded"):
+            coord.resume_task(run.run_id, {"choice": "ok"})
+
+        snap_after = repo.get_run_snapshot(run.run_id)
+        assert snap_after.run.status == TaskStatus.FAILED
+        assert snap_after.run.transition_reason == "human_wait_timeout_exceeded"
+        assert len(snap_after.child_runs) == 1
+        assert snap_after.child_runs[0].status == TaskStatus.FAILED
+        assert snap_after.child_runs[0].transition_reason == "parent_human_wait_timeout_exceeded"
+        assert snap_after.child_runs[0].required_action is None
+        assert snap_after.budget_usage.active_children == 0
+
+        await coord.recover_inflight_runs()
+        snap_recovered = repo.get_run_snapshot(run.run_id)
+        assert snap_recovered.run.status == TaskStatus.FAILED
+        assert snap_recovered.child_runs[0].status == TaskStatus.FAILED
+        assert snap_recovered.budget_usage.active_children == 0
+
+    asyncio.run(_run())

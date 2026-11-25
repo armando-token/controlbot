@@ -2659,3 +2659,158 @@ def test_t5_18_isolation_guard_rejects_profile_markers_in_repo_path(
                 tmp_path / "clean_factory.db",
                 bad_repo,
             )
+
+
+@pytest.mark.tier5
+@pytest.mark.n1
+def test_t5_22_factory_and_policy_guard_block_git_internals(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from src.factory.engine import _ensure_no_symlink_components
+
+    guard = PolicyGuard()
+    for bad_path in (
+        ".git/config",
+        ".git/hooks/post-commit",
+        ".GIT/config",
+        "a/.git/hooks/pre-commit",
+        ".gitmodules",
+        ".gitattributes",
+    ):
+        with pytest.raises(PolicyImmutabilityError, match="POLICY_IMMUTABILITY_VIOLATION"):
+            guard.check_candidate_paths([bad_path])
+
+    lab_repo = tmp_path / "lab_repo_t5_22"
+    base_sha = _init_git_repo(lab_repo)
+    db_path = tmp_path / "factory_t5_22.db"
+
+    for bad_path in (
+        ".git/config",
+        ".GIT/hooks/post-commit",
+        "sub/.git/config",
+        ".gitmodules",
+        ".gitattributes",
+    ):
+        with pytest.raises(PolicyImmutabilityError, match="POLICY_IMMUTABILITY_VIOLATION"):
+            _ensure_no_symlink_components(lab_repo, bad_path)
+
+    # evaluate-patch CLI rejects .git/config and .git/hooks/post-commit
+    for idx, patch_text in enumerate(
+        (
+            "diff --git a/.git/config b/.git/config\n"
+            "--- a/.git/config\n"
+            "+++ b/.git/config\n"
+            "@@ -1 +1,2 @@\n"
+            " [core]\n"
+            "+\tfsmonitor = /tmp/evil\n",
+            "diff --git a/.git/hooks/post-commit b/.git/hooks/post-commit\n"
+            "new file mode 100755\n"
+            "--- /dev/null\n"
+            "+++ b/.git/hooks/post-commit\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+#!/bin/sh\n"
+            "+echo pwned\n",
+        )
+    ):
+        patch_file = tmp_path / f"t5_22_{idx}.patch"
+        patch_file.write_text(patch_text, encoding="utf-8")
+        rc = factory_cli_main(
+            [
+                "evaluate-patch",
+                "--repo",
+                str(lab_repo),
+                "--db",
+                str(db_path),
+                "--patch",
+                str(patch_file),
+                "--json",
+            ]
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 1
+        assert payload["status"] == "REJECTED"
+        assert payload["violation"] == "POLICY_IMMUTABILITY_VIOLATION"
+
+    # FactoryEngine.run_candidate_cycle blocks .git/config and .git/hooks/post-commit pre-write
+    store = FactoryStore(db_path)
+    engine = FactoryEngine(lab_repo, store, base_branch="main")
+    store.add_backlog_item(
+        BacklogItem(
+            item_id="B-GIT-RCE",
+            title="Git internal tamper attempt",
+            priority=1,
+            hypothesis="Attempt .git/config fsmonitor or hook injection",
+            target_metric="failures",
+            baseline_repro_cmd="pytest -q",
+            max_attempts=5,
+        )
+    )
+
+    git_config_path = lab_repo / ".git" / "config"
+    orig_git_config = git_config_path.read_text(encoding="utf-8")
+    marker_file = tmp_path / "pwned_marker.txt"
+
+    cand_cfg = CandidatePatch(
+        candidate_id="cand-git-cfg",
+        item_id="B-GIT-RCE",
+        branch_name="factory/git-cfg",
+        hypothesis="Inject fsmonitor in .git/config",
+        target_metric="failures",
+        proposal_hash="git-cfg-1",
+        files_to_modify={
+            ".git/config": orig_git_config.replace(
+                "[core]\n",
+                f"[core]\n\tfsmonitor = touch {marker_file} #\n",
+            )
+        },
+    )
+    with pytest.raises((PolicyImmutabilityError, IsolationBoundaryError)):
+        engine.run_candidate_cycle(cand_cfg)
+
+    assert git_config_path.read_text(encoding="utf-8") == orig_git_config
+    assert not marker_file.exists()
+
+    cand_hook = CandidatePatch(
+        candidate_id="cand-git-hook",
+        item_id="B-GIT-RCE",
+        branch_name="factory/git-hook",
+        hypothesis="Inject post-commit hook",
+        target_metric="failures",
+        proposal_hash="git-hook-1",
+        files_to_modify={
+            ".git/hooks/post-commit": f"#!/bin/sh\ntouch {marker_file}\n",
+        },
+    )
+    with pytest.raises((PolicyImmutabilityError, IsolationBoundaryError)):
+        engine.run_candidate_cycle(cand_hook)
+
+    assert not (lab_repo / ".git" / "hooks" / "post-commit").exists()
+    assert not marker_file.exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "main"
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == base_sha
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(lab_repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == ""
+    )

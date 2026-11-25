@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import posixpath
@@ -33,7 +34,7 @@ from src.factory.models import (
     LessonRecord,
     RollbackManifest,
 )
-from src.factory.policy import IsolationGuard, PolicyGuard
+from src.factory.policy import IsolationGuard, PolicyGuard, _norm_fold
 
 
 class EvalResult(FrozenModel):
@@ -56,6 +57,10 @@ def _sha256_or_missing(path: Path | None) -> str:
 
 
 def _ensure_no_symlink_components(repo_path: Path, rel_path: str) -> Path:
+    if "\x00" in rel_path:
+        raise IsolationBoundaryError(
+            f"ISOLATION_BOUNDARY_VIOLATION: blocked file path with null byte: {rel_path!r}"
+        )
     raw_norm = posixpath.normpath(rel_path.strip().replace("\\", "/"))
     if (
         not raw_norm
@@ -66,8 +71,14 @@ def _ensure_no_symlink_components(repo_path: Path, rel_path: str) -> Path:
         raise IsolationBoundaryError(
             f"ISOLATION_BOUNDARY_VIOLATION: blocked file path escaping repo: {rel_path}"
         )
+    parts = [part for part in Path(raw_norm).parts if part]
+    if any(_norm_fold(part) in {".git", ".gitmodules", ".gitattributes"} for part in parts):
+        raise PolicyImmutabilityError(
+            f"POLICY_IMMUTABILITY_VIOLATION: blocked git-internal path {rel_path!r}.",
+            offending_paths=(rel_path,),
+        )
     cur = repo_path
-    for part in Path(raw_norm).parts:
+    for part in parts:
         cur = cur / part
         if cur.is_symlink():
             raise PolicyImmutabilityError(
@@ -566,9 +577,9 @@ class FactoryEngine:
                 budget=self._store.get_budget(self._budget_id),
             )
         except Exception:
-            cur_branch = _run_git(self._repo_path, ["rev-parse", "--abbrev-ref", "HEAD"])
-            if cur_branch != self._base_branch:
-                _run_git(self._repo_path, ["checkout", "-f", self._base_branch])
+            with contextlib.suppress(FactoryError):
+                _run_git(self._repo_path, ["reset", "--hard", base_commit])
+            _run_git(self._repo_path, ["checkout", "-f", self._base_branch])
             raise
 
     def audit_branch(
