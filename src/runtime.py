@@ -7,7 +7,7 @@ import contextlib
 import json
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -407,9 +407,12 @@ def build_industrial_result_verifier(
         if len(task_spec.scope.allowed_areas) == 1:
             target_area = task_spec.scope.allowed_areas[0]
         elif last_human_input:
-            raw_area = last_human_input.get("area") or last_human_input.get("choice")
-            if isinstance(raw_area, str) and raw_area.strip():
-                target_area = raw_area.strip()
+            resolved_area = _resolve_area_from_human_input(last_human_input, config)
+            if resolved_area is not None and (
+                not task_spec.scope.allowed_areas
+                or resolved_area in task_spec.scope.allowed_areas
+            ):
+                target_area = resolved_area
 
         filtered_obs = (
             tuple(obs for obs in observations if obs.area == target_area)
@@ -481,22 +484,33 @@ def _query_mentions_area(low_q: str, norm_q: str, area: str) -> bool:
     )
 
 
+def _resolve_area_from_human_input(
+    human_input: Mapping[str, Any] | None,
+    config: FacilityConfig,
+) -> str | None:
+    if not human_input:
+        return None
+    raw_area = human_input.get("area") or human_input.get("choice")
+    if isinstance(raw_area, str) and raw_area.strip():
+        return raw_area.strip()
+    raw_asset_id = human_input.get("asset_id")
+    if isinstance(raw_asset_id, str) and raw_asset_id.strip():
+        target_id = raw_asset_id.strip()
+        for asset in config.assets:
+            if asset.asset_id == target_id or target_id in asset.source_ids.values():
+                return asset.area
+    return None
+
+
 def _extract_chosen_area(
     prompt_ctx: PromptContext,
     config: FacilityConfig,
 ) -> str | None:
     if len(prompt_ctx.allowed_areas) == 1:
         return prompt_ctx.allowed_areas[0]
-    if prompt_ctx.human_input:
-        raw_area = prompt_ctx.human_input.get("area") or prompt_ctx.human_input.get("choice")
-        if isinstance(raw_area, str) and raw_area.strip():
-            return raw_area.strip()
-        raw_asset_id = prompt_ctx.human_input.get("asset_id")
-        if isinstance(raw_asset_id, str) and raw_asset_id.strip():
-            target_id = raw_asset_id.strip()
-            for asset in config.assets:
-                if asset.asset_id == target_id or target_id in asset.source_ids.values():
-                    return asset.area
+    resolved_area = _resolve_area_from_human_input(prompt_ctx.human_input, config)
+    if resolved_area is not None:
+        return resolved_area
     if len(prompt_ctx.allowed_areas) >= 2:
         low_q = prompt_ctx.query.lower()
         norm_q = re.sub(r"[-_\s]+", " ", low_q)

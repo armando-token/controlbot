@@ -591,3 +591,335 @@ def test_make_industrial_turn_factory_area_resolution_and_requery() -> None:
     assert explicit_turn.decision.decision_type == "tool_call"
     assert explicit_turn.decision.tool_call is not None
     assert explicit_turn.decision.tool_call.args.get("area") == "area-2"
+
+
+@pytest.mark.n1
+async def test_disambiguation_resume_with_asset_id_only_succeeds_on_area_1(tmp_path: Path) -> None:
+    from src.adapters.config import load_facility_config
+    from src.adapters.maintenance import get_maintenance_tool_specs
+    from src.adapters.scada import get_scada_tool_specs
+    from src.contracts.enums import DataQuality
+    from src.contracts.models import Observation
+    from src.engine.coordinator import CoordinatorConfig
+    from src.engine.tool_registry import PermissionToolError
+    from src.runtime import build_industrial_result_verifier, make_industrial_turn_factory
+
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    clock = FakeClock()
+    repo = StorageRepo(tmp_path / "asset_id_resume.db", clock=clock)
+    repo.init_db()
+    reg = ToolRegistry(clock=clock)
+
+    scada_specs = get_scada_tool_specs((cfg.apps["scada"].origin,))
+    maint_specs = get_maintenance_tool_specs((cfg.apps["maintenance"].origin,))
+    obs_time = clock() - timedelta(minutes=5)
+
+    def _make_obs(
+        *,
+        source: str,
+        asset_id: str,
+        area: str,
+        value: str,
+        unit: str,
+        record_type: str,
+    ) -> Observation:
+        return Observation(
+            source=source,
+            session_id=f"user-1:prof-1:{source}",
+            asset_id=asset_id,
+            observed_label="bomba 34",
+            value=value,
+            unit=unit,
+            source_time=obs_time,
+            observed_at=clock(),
+            quality=DataQuality.GOOD,
+            authorized_evidence=True,
+            area=area,
+            metadata={"record_type": record_type, "record_id": f"{source}-{asset_id}"},
+        )
+
+    def _scada_alarms_handler(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+        area = args.get("area")
+        if ctx.scope.allowed_areas and area is not None and area not in ctx.scope.allowed_areas:
+            raise PermissionToolError(f"Area {area!r} outside allowed_areas.")
+        all_obs = [
+            _make_obs(
+                source="scada",
+                asset_id="bomba-34-a1",
+                area="area-1",
+                value="HIGH_VIBRATION",
+                unit="alarm_code",
+                record_type="alarm",
+            ),
+            _make_obs(
+                source="scada",
+                asset_id="bomba-34-a2",
+                area="area-2",
+                value="LOW_PRESSURE",
+                unit="alarm_code",
+                record_type="alarm",
+            ),
+        ]
+        selected = [o for o in all_obs if area is None or o.area == area]
+        return {
+            "output": {
+                "source": "scada",
+                "count": len(selected),
+                "records": [o.model_dump(mode="json") for o in selected],
+            },
+            "observations": selected,
+        }
+
+    def _scada_readings_handler(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+        area = args.get("area")
+        if ctx.scope.allowed_areas and area is not None and area not in ctx.scope.allowed_areas:
+            raise PermissionToolError(f"Area {area!r} outside allowed_areas.")
+        all_obs = [
+            _make_obs(
+                source="scada",
+                asset_id="bomba-34-a1",
+                area="area-1",
+                value="8.4",
+                unit="mm/s",
+                record_type="reading",
+            ),
+            _make_obs(
+                source="scada",
+                asset_id="bomba-34-a2",
+                area="area-2",
+                value="3.1",
+                unit="mm/s",
+                record_type="reading",
+            ),
+        ]
+        selected = [o for o in all_obs if area is None or o.area == area]
+        return {
+            "output": {
+                "source": "scada",
+                "count": len(selected),
+                "records": [o.model_dump(mode="json") for o in selected],
+            },
+            "observations": selected,
+        }
+
+    def _maint_wo_handler(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+        area = args.get("area")
+        if ctx.scope.allowed_areas and area is not None and area not in ctx.scope.allowed_areas:
+            raise PermissionToolError(f"Area {area!r} outside allowed_areas.")
+        all_obs = [
+            _make_obs(
+                source="maintenance",
+                asset_id="bomba-34-a1",
+                area="area-1",
+                value="Bearing replacement scheduled",
+                unit="event",
+                record_type="work_order",
+            ),
+            _make_obs(
+                source="maintenance",
+                asset_id="bomba-34-a2",
+                area="area-2",
+                value="Seal inspection completed",
+                unit="event",
+                record_type="work_order",
+            ),
+        ]
+        selected = [o for o in all_obs if area is None or o.area == area]
+        return {
+            "output": {
+                "source": "maintenance",
+                "count": len(selected),
+                "records": [o.model_dump(mode="json") for o in selected],
+            },
+            "observations": selected,
+        }
+
+    reg.register(scada_specs["scada.read_alarms"], _scada_alarms_handler, is_poller=True)
+    reg.register(scada_specs["scada.read_readings"], _scada_readings_handler, is_poller=True)
+    reg.register(maint_specs["maint.read_work_orders"], _maint_wo_handler, is_poller=True)
+
+    coord = Coordinator(
+        repo,
+        EmulatedModelClient(turn_factory=make_industrial_turn_factory(cfg)),
+        reg,
+        config=CoordinatorConfig(default_granted_permissions=("scada:read", "maint:read")),
+        clock=clock,
+        result_verifier=build_industrial_result_verifier(cfg, reference_time_fn=clock),
+    )
+    task = TaskSpec(
+        task_id="task-asset-id-resume",
+        user_id="operator_ro",
+        profile_id="prof-1",
+        scope=TaskScope(
+            facility_id="facility-a",
+            allowed_origins=(cfg.apps["scada"].origin, cfg.apps["maintenance"].origin),
+            allowed_areas=("area-1", "area-2"),
+            allowed_tools=("scada.read_alarms", "scada.read_readings", "maint.read_work_orders"),
+            read_only=True,
+        ),
+        query="¿Qué alarma apareció primero en la bomba 34?",
+    )
+
+    run = coord.submit_task(task)
+    res1 = await coord.run_until_settled(run.run_id)
+    assert res1.status == TaskStatus.WAITING_FOR_INPUT
+    assert res1.required_action is not None
+    assert "specify area or asset_id" in res1.required_action
+    assert res1.verified_observations == ()
+    assert res1.execution_metrics.model_calls == 4
+
+    # Resume specifying ONLY asset_id (without "area"), as instructed by Verifier.detect_ambiguity
+    coord.resume_task(run.run_id, {"asset_id": "bomba-34-a1"})
+    res2 = await coord.run_until_settled(run.run_id)
+    assert res2.status == TaskStatus.SUCCEEDED
+    assert len(res2.verified_observations) == 6
+    assert {
+        str(obs.metadata.get("record_type")) for obs in res2.verified_observations
+    } == {"alarm", "reading", "work_order"}
+    assert all(
+        obs.area == "area-1" and obs.asset_id == "bomba-34-a1"
+        for obs in res2.verified_observations
+    )
+    assert res2.execution_metrics.model_calls == 8
+    assert res2.execution_metrics.tool_calls == 6
+
+
+@pytest.mark.n1
+def test_resolve_area_from_human_input_choice_source_ids_and_scope_guard() -> None:
+    from src.adapters.config import load_facility_config
+    from src.contracts.enums import DataQuality
+    from src.contracts.models import ExecutionMetrics, Observation
+    from src.runtime import _resolve_area_from_human_input, build_industrial_result_verifier
+
+    cfg_a = load_facility_config(Path("lab/configs/facility_a.json"))
+    cfg_b = load_facility_config(Path("lab/configs/facility_b.json"))
+
+    assert _resolve_area_from_human_input(None, cfg_a) is None
+    assert _resolve_area_from_human_input({}, cfg_a) is None
+    assert _resolve_area_from_human_input({"area": " area-1 "}, cfg_a) == "area-1"
+    assert _resolve_area_from_human_input({"choice": "area-2"}, cfg_a) == "area-2"
+    assert _resolve_area_from_human_input({"asset_id": "bomba-34-a1"}, cfg_a) == "area-1"
+    assert _resolve_area_from_human_input({"area": "   ", "asset_id": "bomba-34-a1"}, cfg_a) == (
+        "area-1"
+    )
+    assert _resolve_area_from_human_input({"asset_id": "SC-77"}, cfg_b) == "area-2"
+    assert _resolve_area_from_human_input({"asset_id": "CMMS-77"}, cfg_b) == "area-2"
+    assert _resolve_area_from_human_input({"asset_id": "unknown-asset"}, cfg_b) is None
+
+    now = FakeClock()()
+    verifier_b = build_industrial_result_verifier(cfg_b, reference_time_fn=lambda: now)
+    task_b = TaskSpec(
+        task_id="t-b-source-id",
+        user_id="operator_ro",
+        profile_id="prof-1",
+        scope=TaskScope(
+            facility_id="facility-b",
+            allowed_origins=(cfg_b.apps["scada"].origin, cfg_b.apps["maintenance"].origin),
+            allowed_areas=("area-2", "area-3"),
+            allowed_tools=("scada.read_alarms", "maint.read_work_orders"),
+            read_only=True,
+        ),
+        query="Check bomba 77",
+    )
+    obs_b2_scada = Observation(
+        source="scada",
+        session_id="u:p:scada",
+        asset_id="SC-77",
+        observed_label="bomba 77",
+        value="HIGH_TEMP",
+        unit="alarm_code",
+        source_time=now - timedelta(minutes=2),
+        observed_at=now,
+        quality=DataQuality.GOOD,
+        authorized_evidence=True,
+        area="area-2",
+        metadata={"record_type": "alarm"},
+    )
+    obs_b2_maint = Observation(
+        source="maintenance",
+        session_id="u:p:maintenance",
+        asset_id="CMMS-77",
+        observed_label="bomba 77",
+        value="Valve checked",
+        unit="event",
+        source_time=now - timedelta(minutes=1),
+        observed_at=now,
+        quality=DataQuality.GOOD,
+        authorized_evidence=True,
+        area="area-2",
+        metadata={"record_type": "work_order"},
+    )
+    obs_b3 = Observation(
+        source="scada",
+        session_id="u:p:scada",
+        asset_id="bomba-77-b3",
+        observed_label="bomba 77",
+        value="OK",
+        unit="alarm_code",
+        source_time=now - timedelta(minutes=2),
+        observed_at=now,
+        quality=DataQuality.GOOD,
+        authorized_evidence=True,
+        area="area-3",
+        metadata={"record_type": "alarm"},
+    )
+    candidate_b = Result(
+        task_id=task_b.task_id,
+        run_id="run-b",
+        status=TaskStatus.SUCCEEDED,
+        answer="ok",
+        execution_metrics=ExecutionMetrics(),
+    )
+    history_b = [{"tool_id": "scada.read_alarms", "outcome": "succeeded"}]
+
+    # source_id ("SC-77") resolves area-2 cleanly in verifier
+    res_source_id = verifier_b(
+        task_b,
+        "run-b",
+        (obs_b2_scada, obs_b2_maint, obs_b3),
+        history_b,
+        candidate_b,
+        {"asset_id": "SC-77"},
+    )
+    assert res_source_id.status == TaskStatus.SUCCEEDED
+    assert all(o.area == "area-2" for o in res_source_id.verified_observations)
+
+    # choice ("area-2") resolves area-2 cleanly in verifier
+    res_choice = verifier_b(
+        task_b,
+        "run-b",
+        (obs_b2_scada, obs_b2_maint, obs_b3),
+        history_b,
+        candidate_b,
+        {"choice": "area-2"},
+    )
+    assert res_choice.status == TaskStatus.SUCCEEDED
+    assert all(o.area == "area-2" for o in res_choice.verified_observations)
+
+    # Out-of-scope area in human_input ("area-99") cannot hijack target_area
+    res_out_of_scope = verifier_b(
+        task_b,
+        "run-b",
+        (obs_b2_scada, obs_b2_maint, obs_b3),
+        history_b,
+        candidate_b,
+        {"area": "area-99"},
+    )
+    assert res_out_of_scope.status == TaskStatus.WAITING_FOR_INPUT
+
+    # Single-area task ignores human_input attempting to switch to another area
+    task_single_area = task_b.model_copy(
+        update={
+            "scope": task_b.scope.model_copy(update={"allowed_areas": ("area-2",)}),
+        }
+    )
+    res_single = verifier_b(
+        task_single_area,
+        "run-b",
+        (obs_b2_scada, obs_b2_maint, obs_b3),
+        history_b,
+        candidate_b,
+        {"area": "area-3"},
+    )
+    assert res_single.status == TaskStatus.SUCCEEDED
+    assert all(o.area == "area-2" for o in res_single.verified_observations)
