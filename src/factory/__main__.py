@@ -21,7 +21,7 @@ from src.factory.policy import (
     POLICY_IMMUTABILITY_VIOLATION,
     IsolationGuard,
     PolicyGuard,
-    parse_unified_patch,
+    parse_unified_patch_details,
 )
 
 
@@ -493,13 +493,22 @@ def _handle_evaluate_patch(args: argparse.Namespace) -> int:
     touched: list[str] = []
     guard = PolicyGuard(forbidden_paths=[*forbidden_dbs, *forbidden_creds])
     try:
-        touched, added_lines, symlink_added_targets = parse_unified_patch(patch_text)
+        parsed = parse_unified_patch_details(patch_text)
+        touched = parsed.touched_paths
         guard.check_candidate_paths(touched)
         exact_tokens, basename_patterns, forbidden_resolved, forbidden_names = (
             guard.check_repo_symlinks(repo_path, touched)
         )
+        renamed_symlinks = guard.collect_renamed_symlink_targets(
+            repo_path,
+            parsed.renamed_pairs,
+            touched_paths=touched,
+        )
+        all_symlink_targets = list(
+            dict.fromkeys([*parsed.symlink_added_targets, *renamed_symlinks])
+        )
         guard.check_added_lines(
-            added_lines,
+            parsed.added_lines,
             touched_paths=touched,
             repo_path=repo_path,
             extra_search_dirs=[patch_path.resolve().parent, Path.cwd()],
@@ -507,7 +516,8 @@ def _handle_evaluate_patch(args: argparse.Namespace) -> int:
             basename_patterns=basename_patterns,
             forbidden_resolved=forbidden_resolved,
             forbidden_names=forbidden_names,
-            symlink_added_targets=symlink_added_targets,
+            symlink_added_targets=all_symlink_targets,
+            strip_p1_symlink_links=False,
         )
     except (PolicyImmutabilityError, IsolationBoundaryError) as exc:
         violation_code = (

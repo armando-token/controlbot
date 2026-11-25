@@ -6,8 +6,11 @@ import contextlib
 import os
 import posixpath
 import re
+import stat
 import subprocess
+import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from src.factory.errors import IsolationBoundaryError, PolicyImmutabilityError
@@ -48,6 +51,38 @@ _ISOLATION_BREACH_PATTERNS: tuple[re.Pattern[str], ...] = (
 _SKIP_WALK_DIRS: frozenset[str] = frozenset(
     {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules"}
 )
+
+
+def _norm_fold(value: str) -> str:
+    """Normalize Unicode (NFC + casefold) for case/normalization-insensitive matching."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", value).casefold())
+
+
+def _p1_candidates(path_str: str) -> tuple[str, ...]:
+    """Return raw, slash-normalized, and -p1-stripped path candidates (`git apply`/`patch`)."""
+    cleaned = path_str.strip().replace("\\", "/")
+    if not cleaned:
+        return (path_str,)
+    norm = posixpath.normpath(cleaned)
+    candidates: list[str] = [path_str]
+    for cand in (cleaned, norm):
+        if cand not in candidates:
+            candidates.append(cand)
+        if "/" in cand:
+            stripped = cand.split("/", 1)[1]
+            if stripped and stripped not in candidates:
+                candidates.append(stripped)
+    return tuple(candidates)
+
+
+@dataclass(frozen=True)
+class ParsedPatch:
+    """Structured extraction from a unified/git diff patch."""
+
+    touched_paths: list[str]
+    added_lines: list[str]
+    symlink_added_targets: list[tuple[str, str]]
+    renamed_pairs: list[tuple[str, str]]
 
 
 def _extract_path_candidates_from_line(line: str) -> list[str]:
@@ -142,7 +177,7 @@ def _unquote_git_path(token: str) -> str:
     return stripped
 
 
-def _parse_diff_git_line(line: str) -> tuple[str, str]:
+def _parse_diff_git_line_details(line: str) -> tuple[str, str, bool, str | None]:
     rest = line[len("diff --git ") :]
     if not rest.strip():
         raise PolicyImmutabilityError(
@@ -196,20 +231,28 @@ def _parse_diff_git_line(line: str) -> tuple[str, str]:
             m = re.match(r"^a/(.+?) b/(.+)$", trimmed)
             if m:
                 left_raw, right_raw = f"a/{m.group(1)}", f"b/{m.group(2)}"
-            elif len(trimmed) % 2 == 1:
-                mid = len(trimmed) // 2
-                if trimmed[mid] == " " and trimmed[:mid] == trimmed[mid + 1 :]:
-                    left_raw = right_raw = trimmed[:mid]
+            else:
+                m_custom = re.match(r"^([^/\s]+/)(.+?) ([^/\s]+/)\2$", trimmed)
+                if m_custom:
+                    left_raw = f"{m_custom.group(1)}{m_custom.group(2)}"
+                    right_raw = f"{m_custom.group(3)}{m_custom.group(2)}"
+                elif len(trimmed) % 2 == 1:
+                    mid = len(trimmed) // 2
+                    if trimmed[mid] == " " and trimmed[:mid] == trimmed[mid + 1 :]:
+                        left_raw = right_raw = trimmed[:mid]
+                    else:
+                        raise PolicyImmutabilityError(
+                            f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git "
+                            f"header {line!r}."
+                        )
                 else:
                     raise PolicyImmutabilityError(
                         f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
                     )
-            else:
-                raise PolicyImmutabilityError(
-                    f"{POLICY_IMMUTABILITY_VIOLATION}: unparseable diff --git header {line!r}."
-                )
 
-    if left_raw.startswith("a/") and right_raw.startswith("b/"):
+    had_standard_ab = left_raw.startswith("a/") and right_raw.startswith("b/")
+    right_prefix = f"{right_raw.split('/', 1)[0]}/" if "/" in right_raw else None
+    if had_standard_ab:
         left, right = left_raw[2:], right_raw[2:]
     else:
         left = (
@@ -227,10 +270,17 @@ def _parse_diff_git_line(line: str) -> tuple[str, str]:
         raise PolicyImmutabilityError(
             f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff --git header {line!r}."
         )
+    return left, right, had_standard_ab, right_prefix
+
+
+def _parse_diff_git_line(line: str) -> tuple[str, str]:
+    left, right, _, _ = _parse_diff_git_line_details(line)
     return left, right
 
 
-def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> str | None:
+def _parse_minus_plus_header_details(
+    line: str, header_prefix: str, git_prefix: str
+) -> tuple[str | None, bool]:
     rest = line[len(header_prefix) :]
     if rest.startswith('"'):
         raw, end_idx = _consume_quoted_git_token(rest, 0)
@@ -243,27 +293,32 @@ def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> 
         raw = rest.split("\t", 1)[0].strip()
 
     if raw == "/dev/null":
-        return None
+        return None, False
     if not raw:
         raise PolicyImmutabilityError(
             f"{POLICY_IMMUTABILITY_VIOLATION}: empty path in diff header {line!r}."
         )
-    if raw.startswith(git_prefix):
+    had_git_prefix = raw.startswith(git_prefix)
+    if had_git_prefix:
         raw = raw[len(git_prefix) :]
     if not raw:
         raise PolicyImmutabilityError(
             f"{POLICY_IMMUTABILITY_VIOLATION}: empty path after prefix in diff header {line!r}."
         )
-    return raw
+    return raw, had_git_prefix
 
 
-def parse_unified_patch(
-    patch_text: str,
-) -> tuple[list[str], list[str], list[tuple[str, str]]]:
-    """Parse git/unified diff path headers, added lines, and 120000 symlink targets."""
+def _parse_minus_plus_header(line: str, header_prefix: str, git_prefix: str) -> str | None:
+    parsed, _ = _parse_minus_plus_header_details(line, header_prefix, git_prefix)
+    return parsed
+
+
+def parse_unified_patch_details(patch_text: str) -> ParsedPatch:
+    """Parse git/unified diff path headers, added lines, 120000 targets, and renames."""
     touched: list[str] = []
     added_lines: list[str] = []
     symlink_added_targets: list[tuple[str, str]] = []
+    renamed_pairs: list[tuple[str, str]] = []
 
     def _add_touched(path_str: str) -> None:
         if path_str != "/dev/null" and path_str not in touched:
@@ -273,16 +328,57 @@ def parse_unified_patch(
     old_rem = 0
     new_rem = 0
     current_is_symlink = False
+    current_non_symlink_mode = False
+    current_symlink_target_added = False
     current_section_paths: list[str] = []
+    current_rename_from: str | None = None
+    current_rename_to: str | None = None
+    current_has_diff_git = False
+    current_had_standard_ab = False
+    current_right_prefix: str | None = None
+    current_plus_had_b_prefix: bool | None = None
+
+    def _flush_section() -> None:
+        if (
+            current_rename_from is not None
+            and current_rename_to is not None
+            and not current_symlink_target_added
+            and not current_non_symlink_mode
+        ):
+            pair = (current_rename_from, current_rename_to)
+            if pair not in renamed_pairs:
+                renamed_pairs.append(pair)
+            if "/" in current_rename_to and (
+                not current_has_diff_git
+                or (
+                    not current_had_standard_ab
+                    and current_right_prefix is not None
+                    and current_rename_to.startswith(current_right_prefix)
+                )
+            ):
+                stripped_dst = current_rename_to.split("/", 1)[1]
+                if stripped_dst:
+                    stripped_pair = (current_rename_from, stripped_dst)
+                    if stripped_pair not in renamed_pairs:
+                        renamed_pairs.append(stripped_pair)
 
     for line in patch_text.splitlines():
         if line.startswith("diff --git "):
+            _flush_section()
             in_hunk = False
             old_rem = 0
             new_rem = 0
             current_is_symlink = False
+            current_non_symlink_mode = False
+            current_symlink_target_added = False
             current_section_paths = []
-            left, right = _parse_diff_git_line(line)
+            current_rename_from = None
+            current_rename_to = None
+            current_plus_had_b_prefix = None
+            left, right, current_had_standard_ab, current_right_prefix = (
+                _parse_diff_git_line_details(line)
+            )
+            current_has_diff_git = True
             _add_touched(left)
             _add_touched(right)
             current_section_paths.extend([left, right])
@@ -306,6 +402,16 @@ def parse_unified_patch(
                 if current_is_symlink:
                     link_rel = current_section_paths[-1] if current_section_paths else ""
                     symlink_added_targets.append((link_rel, added))
+                    already_b_stripped = (
+                        current_plus_had_b_prefix
+                        if current_plus_had_b_prefix is not None
+                        else current_had_standard_ab
+                    )
+                    if not already_b_stripped and "/" in link_rel:
+                        stripped_link = link_rel.split("/", 1)[1]
+                        if stripped_link:
+                            symlink_added_targets.append((stripped_link, added))
+                    current_symlink_target_added = True
                 new_rem -= 1
             elif line.startswith("-"):
                 old_rem -= 1
@@ -331,9 +437,15 @@ def parse_unified_patch(
             )
         ):
             current_is_symlink = True
+            current_non_symlink_mode = False
+            continue
+        if line.startswith(("new mode ", "new file mode ")):
+            current_is_symlink = False
+            current_non_symlink_mode = True
             continue
         if line.startswith("index ") and line.rstrip().endswith(" 120000"):
             current_is_symlink = True
+            current_non_symlink_mode = False
             continue
 
         if line.startswith("--- "):
@@ -344,10 +456,11 @@ def parse_unified_patch(
             continue
 
         if line.startswith("+++ "):
-            p = _parse_minus_plus_header(line, "+++ ", "b/")
+            p, had_b = _parse_minus_plus_header_details(line, "+++ ", "b/")
             if p is not None:
                 _add_touched(p)
                 current_section_paths.append(p)
+                current_plus_had_b_prefix = had_b
             continue
 
         matched_meta = False
@@ -365,6 +478,10 @@ def parse_unified_patch(
                     )
                 _add_touched(unquoted)
                 current_section_paths.append(unquoted)
+                if meta_hdr in ("rename from ", "copy from "):
+                    current_rename_from = unquoted
+                else:
+                    current_rename_to = unquoted
                 matched_meta = True
                 break
         if matched_meta:
@@ -373,12 +490,27 @@ def parse_unified_patch(
         if line.startswith("+") and not line.startswith("+++"):
             added_lines.append(line[1:])
 
+    _flush_section()
+
     if patch_text.strip() and not touched:
         raise PolicyImmutabilityError(
             f"{POLICY_IMMUTABILITY_VIOLATION}: non-empty patch yielded zero touched paths."
         )
 
-    return touched, added_lines, symlink_added_targets
+    return ParsedPatch(
+        touched_paths=touched,
+        added_lines=added_lines,
+        symlink_added_targets=symlink_added_targets,
+        renamed_pairs=renamed_pairs,
+    )
+
+
+def parse_unified_patch(
+    patch_text: str,
+) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Parse git/unified diff path headers, added lines, and 120000 symlink targets."""
+    parsed = parse_unified_patch_details(patch_text)
+    return parsed.touched_paths, parsed.added_lines, parsed.symlink_added_targets
 
 
 class PolicyGuard:
@@ -474,13 +606,14 @@ class PolicyGuard:
                     exact_tokens.append(res_str)
 
             name = Path(item).name
-            name_folded = name.casefold()
+            name_nfc = unicodedata.normalize("NFC", name)
+            name_folded = _norm_fold(name)
             if cls._is_explicit_forbidden_basename(item, name) and name_folded not in {
-                existing.casefold() for existing in seen_names
+                _norm_fold(existing) for existing in seen_names
             }:
                 seen_names.add(name)
                 pat = re.compile(
-                    rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.])",
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(name_nfc)}(?![A-Za-z0-9_.])",
                     re.IGNORECASE,
                 )
                 basename_patterns.append((name, pat))
@@ -498,17 +631,17 @@ class PolicyGuard:
         normalized = posixpath.normpath(raw)
         if normalized in ("", ".") or normalized.startswith("/") or ".." in normalized.split("/"):
             return True
-        norm_folded = normalized.casefold()
+        norm_folded = _norm_fold(normalized)
         for prefix in self._immutable_prefixes:
             raw_prefix = prefix.replace("\\", "/")
             clean_prefix = posixpath.normpath(raw_prefix)
             if clean_prefix in ("", "."):
                 continue
-            prefix_folded = clean_prefix.casefold()
+            prefix_folded = _norm_fold(clean_prefix)
             if norm_folded == prefix_folded or norm_folded.startswith(f"{prefix_folded}/"):
                 return True
         filename = Path(normalized).name
-        if _IMMUTABLE_NAME_RE.search(filename) or _IMMUTABLE_NAME_RE.search(filename.casefold()):
+        if _IMMUTABLE_NAME_RE.search(filename) or _IMMUTABLE_NAME_RE.search(_norm_fold(filename)):
             return True
         return bool(_IMMUTABLE_NAME_RE.search(normalized) or _IMMUTABLE_NAME_RE.search(norm_folded))
 
@@ -516,18 +649,26 @@ class PolicyGuard:
         norm = posixpath.normpath(rel_path.strip().replace("\\", "/"))
         if norm in ("", ".") or norm.startswith("/") or ".." in norm.split("/"):
             return True
-        norm_folded = norm.casefold()
+        norm_folded = _norm_fold(norm)
         for prefix in self._immutable_prefixes:
             clean_prefix = posixpath.normpath(prefix.replace("\\", "/"))
             if clean_prefix in ("", "."):
                 continue
-            prefix_folded = clean_prefix.casefold()
+            prefix_folded = _norm_fold(clean_prefix)
             if prefix_folded == norm_folded or prefix_folded.startswith(f"{norm_folded}/"):
                 return True
         return False
 
     def check_candidate_paths(self, paths: Sequence[str]) -> None:
-        offending = tuple(sorted({p for p in paths if self.is_immutable_path(p)}))
+        offending = tuple(
+            sorted(
+                {
+                    p
+                    for p in paths
+                    if any(self.is_immutable_path(cand) for cand in _p1_candidates(p))
+                }
+            )
+        )
         if offending:
             raise PolicyImmutabilityError(
                 f"{POLICY_IMMUTABILITY_VIOLATION}: candidate patch attempted to modify "
@@ -544,9 +685,9 @@ class PolicyGuard:
     ) -> str | None:
         if resolved_target in forbidden_resolved:
             return str(resolved_target)
-        resolved_folded = str(resolved_target).casefold()
+        resolved_folded = _norm_fold(str(resolved_target))
         for forb_res in forbidden_resolved:
-            forb_folded = str(forb_res).casefold()
+            forb_folded = _norm_fold(str(forb_res))
             if resolved_folded == forb_folded:
                 return str(resolved_target)
             with contextlib.suppress(OSError, ValueError):
@@ -555,15 +696,15 @@ class PolicyGuard:
             forb_prefix = forb_folded.rstrip("/")
             if forb_prefix and resolved_folded.startswith(f"{forb_prefix}/"):
                 return str(forb_res)
-        forbidden_names_folded = {n.casefold() for n in forbidden_names}
+        forbidden_names_folded = {_norm_fold(n) for n in forbidden_names}
         if (
             resolved_target.name in forbidden_names
-            or resolved_target.name.casefold() in forbidden_names_folded
+            or _norm_fold(resolved_target.name) in forbidden_names_folded
         ):
             return resolved_target.name
         if raw_target:
             raw_name = Path(raw_target).name
-            if raw_name in forbidden_names or raw_name.casefold() in forbidden_names_folded:
+            if raw_name in forbidden_names or _norm_fold(raw_name) in forbidden_names_folded:
                 return raw_name
         return None
 
@@ -592,8 +733,15 @@ class PolicyGuard:
             self._build_forbidden_matchers([*self._raw_forbidden_paths, *extra_forbidden_paths])
         )
 
-        # 1. Inspect touched paths, all parent directory components, and full resolved targets
-        for rel_p in touched_paths:
+        # 1. Inspect touched paths, -p1-stripped candidates, parent components, and resolved targets
+        expanded_touched: list[str] = []
+        seen_touched: set[str] = set()
+        for raw_p in touched_paths:
+            for cand in _p1_candidates(raw_p):
+                if cand not in seen_touched:
+                    seen_touched.add(cand)
+                    expanded_touched.append(cand)
+        for rel_p in expanded_touched:
             norm_p = posixpath.normpath(rel_p.strip().replace("\\", "/"))
             cur = resolved_repo
             for part in Path(norm_p).parts:
@@ -708,15 +856,16 @@ class PolicyGuard:
                                 if tok not in seen_exact:
                                     seen_exact.add(tok)
                                     extra_exact.append(tok)
-                            if entry.name and entry.name.casefold() not in {
-                                n.casefold() for n in seen_names
+                            if entry.name and _norm_fold(entry.name) not in {
+                                _norm_fold(n) for n in seen_names
                             }:
                                 seen_names.add(entry.name)
+                                entry_nfc = unicodedata.normalize("NFC", entry.name)
                                 extra_patterns.append(
                                     (
                                         entry.name,
                                         re.compile(
-                                            rf"(?<![A-Za-z0-9_.-]){re.escape(entry.name)}"
+                                            rf"(?<![A-Za-z0-9_.-]){re.escape(entry_nfc)}"
                                             r"(?![A-Za-z0-9_.])",
                                             re.IGNORECASE,
                                         ),
@@ -724,6 +873,87 @@ class PolicyGuard:
                                 )
 
         return tuple(extra_exact), tuple(extra_patterns), forbidden_resolved, forbidden_names
+
+    def collect_renamed_symlink_targets(
+        self,
+        repo_path: Path,
+        renamed_pairs: Sequence[tuple[str, str]],
+        *,
+        touched_paths: Sequence[str] = (),
+    ) -> list[tuple[str, str]]:
+        """Read symlink targets from repo_path for rename/copy pairs lacking explicit hunks."""
+        if not renamed_pairs:
+            return []
+        try:
+            resolved_repo = repo_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PolicyImmutabilityError(
+                f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable repository path "
+                f"{repo_path!r} ({exc}).",
+                offending_paths=tuple(touched_paths),
+            ) from exc
+
+        discovered: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for src_rel, dst_rel in renamed_pairs:
+            for src_cand in _p1_candidates(src_rel):
+                norm_src = posixpath.normpath(src_cand.strip().replace("\\", "/"))
+                if (
+                    not norm_src
+                    or norm_src == "."
+                    or norm_src.startswith("/")
+                    or ".." in norm_src.split("/")
+                ):
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: invalid rename source path {src_rel!r}.",
+                        offending_paths=tuple(touched_paths) or (src_rel, dst_rel),
+                    )
+                src_path = resolved_repo / norm_src
+                try:
+                    parent_res = src_path.parent.resolve()
+                except (OSError, RuntimeError) as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable rename source "
+                        f"{src_rel!r} ({exc}).",
+                        offending_paths=tuple(touched_paths) or (src_rel, dst_rel),
+                    ) from exc
+                if not parent_res.is_relative_to(resolved_repo):
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: rename source {src_rel!r} "
+                        "escapes repository.",
+                        offending_paths=tuple(touched_paths) or (src_rel, dst_rel),
+                    )
+                try:
+                    st = os.lstat(src_path)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                except OSError as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unreadable rename source "
+                        f"{src_rel!r} ({exc}).",
+                        offending_paths=tuple(touched_paths) or (src_rel, dst_rel),
+                    ) from exc
+                if not stat.S_ISLNK(st.st_mode):
+                    continue
+                try:
+                    target_str = os.readlink(src_path)
+                except (OSError, RuntimeError) as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unreadable symlink rename source "
+                        f"{src_rel!r} ({exc}).",
+                        offending_paths=tuple(touched_paths) or (src_rel, dst_rel),
+                    ) from exc
+                if not target_str.strip():
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: empty symlink target on rename "
+                        f"source {src_rel!r}.",
+                        offending_paths=tuple(touched_paths) or (src_rel, dst_rel),
+                    )
+                pair = (dst_rel, target_str)
+                if pair not in seen:
+                    seen.add(pair)
+                    discovered.append(pair)
+        return discovered
 
     def check_added_lines(
         self,
@@ -737,6 +967,7 @@ class PolicyGuard:
         forbidden_resolved: set[Path] | None = None,
         forbidden_names: set[str] | None = None,
         symlink_added_targets: Sequence[tuple[str, str]] = (),
+        strip_p1_symlink_links: bool = True,
     ) -> None:
         """Inspect added diff lines for policy bypasses, isolation breaches, or symlinks."""
         resolved_repo: Path | None = None
@@ -769,97 +1000,124 @@ class PolicyGuard:
             cleaned_target = target_str.strip().replace("\\", "/")
             if not cleaned_target:
                 continue
-            if cleaned_target.startswith("/") or ".." in cleaned_target.split("/"):
-                with contextlib.suppress(OSError, RuntimeError):
-                    t_res = (
-                        (resolved_repo / Path(norm_link).parent / cleaned_target).resolve()
-                        if resolved_repo is not None and not cleaned_target.startswith("/")
-                        else Path(cleaned_target).resolve()
+
+            link_candidates: list[str] = [norm_link]
+            if strip_p1_symlink_links and "/" in norm_link:
+                stripped_link = norm_link.split("/", 1)[1]
+                if stripped_link and stripped_link not in link_candidates:
+                    link_candidates.append(stripped_link)
+
+            for cand_link in link_candidates:
+                if (
+                    not cand_link
+                    or cand_link == "."
+                    or cand_link.startswith("/")
+                    or ".." in cand_link.split("/")
+                ):
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: invalid symlink path {link_rel!r}.",
+                        offending_paths=tuple(touched_paths) or (link_rel,),
                     )
+                if cleaned_target.startswith("/") or ".." in cleaned_target.split("/"):
+                    with contextlib.suppress(OSError, RuntimeError):
+                        t_res = (
+                            (resolved_repo / Path(cand_link).parent / cleaned_target).resolve()
+                            if resolved_repo is not None and not cleaned_target.startswith("/")
+                            else Path(cleaned_target).resolve()
+                        )
+                        forb_hit = self._matches_forbidden_target(
+                            t_res, cleaned_target, forb_res, forb_names
+                        )
+                        if forb_hit is not None:
+                            raise IsolationBoundaryError(
+                                f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink patch "
+                                f"{link_rel!r} pointing to forbidden path ({forb_hit})."
+                            )
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch creates escaping symlink "
+                        f"{link_rel!r} -> {cleaned_target!r}.",
+                        offending_paths=tuple(touched_paths) or (link_rel,),
+                    )
+
+                link_parent_rel = posixpath.dirname(cand_link)
+                lexical_target_rel = posixpath.normpath(
+                    posixpath.join(link_parent_rel, cleaned_target)
+                    if link_parent_rel
+                    else cleaned_target
+                )
+                if lexical_target_rel.startswith("/") or ".." in lexical_target_rel.split("/"):
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch creates escaping symlink "
+                        f"{link_rel!r} -> {cleaned_target!r}.",
+                        offending_paths=tuple(touched_paths) or (link_rel,),
+                    )
+                forb_lex_hit = self._matches_forbidden_target(
+                    Path(lexical_target_rel), cleaned_target, forb_res, forb_names
+                )
+                if forb_lex_hit is not None:
+                    raise IsolationBoundaryError(
+                        f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink patch "
+                        f"{link_rel!r} pointing to forbidden path ({forb_lex_hit})."
+                    )
+                if self.is_immutable_path(lexical_target_rel) or self._is_immutable_ancestor(
+                    lexical_target_rel
+                ):
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
+                        f"targets immutable path or ancestor {lexical_target_rel!r}.",
+                        offending_paths=tuple(touched_paths) or (link_rel,),
+                    )
+
+                if resolved_repo is not None:
+                    link_parent = (resolved_repo / cand_link).parent
+                    try:
+                        resolved_target = (link_parent / cleaned_target).resolve()
+                    except (OSError, RuntimeError) as exc:
+                        raise PolicyImmutabilityError(
+                            f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable symlink patch "
+                            f"{link_rel!r} ({exc}).",
+                            offending_paths=tuple(touched_paths) or (link_rel,),
+                        ) from exc
                     forb_hit = self._matches_forbidden_target(
-                        t_res, cleaned_target, forb_res, forb_names
+                        resolved_target, cleaned_target, forb_res, forb_names
                     )
                     if forb_hit is not None:
                         raise IsolationBoundaryError(
                             f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink patch "
                             f"{link_rel!r} pointing to forbidden path ({forb_hit})."
                         )
-                raise PolicyImmutabilityError(
-                    f"{POLICY_IMMUTABILITY_VIOLATION}: patch creates escaping symlink "
-                    f"{link_rel!r} -> {cleaned_target!r}.",
-                    offending_paths=tuple(touched_paths) or (link_rel,),
-                )
+                    if not resolved_target.is_relative_to(resolved_repo):
+                        raise PolicyImmutabilityError(
+                            f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
+                            f"escapes repository.",
+                            offending_paths=tuple(touched_paths) or (link_rel,),
+                        )
+                    target_rel = resolved_target.relative_to(resolved_repo).as_posix()
+                    if self.is_immutable_path(target_rel) or self._is_immutable_ancestor(
+                        target_rel
+                    ):
+                        raise PolicyImmutabilityError(
+                            f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
+                            f"targets immutable path or ancestor {target_rel!r}.",
+                            offending_paths=tuple(touched_paths) or (link_rel,),
+                        )
 
-            link_parent_rel = posixpath.dirname(norm_link)
-            lexical_target_rel = posixpath.normpath(
-                posixpath.join(link_parent_rel, cleaned_target)
-                if link_parent_rel
-                else cleaned_target
-            )
-            if lexical_target_rel.startswith("/") or ".." in lexical_target_rel.split("/"):
-                raise PolicyImmutabilityError(
-                    f"{POLICY_IMMUTABILITY_VIOLATION}: patch creates escaping symlink "
-                    f"{link_rel!r} -> {cleaned_target!r}.",
-                    offending_paths=tuple(touched_paths) or (link_rel,),
-                )
-            forb_lex_hit = self._matches_forbidden_target(
-                Path(lexical_target_rel), cleaned_target, forb_res, forb_names
-            )
-            if forb_lex_hit is not None:
-                raise IsolationBoundaryError(
-                    f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink patch "
-                    f"{link_rel!r} pointing to forbidden path ({forb_lex_hit})."
-                )
-            if self.is_immutable_path(lexical_target_rel) or self._is_immutable_ancestor(
-                lexical_target_rel
-            ):
-                raise PolicyImmutabilityError(
-                    f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
-                    f"targets immutable path or ancestor {lexical_target_rel!r}.",
-                    offending_paths=tuple(touched_paths) or (link_rel,),
-                )
-
-            if resolved_repo is not None:
-                link_parent = (resolved_repo / norm_link).parent
-                try:
-                    resolved_target = (link_parent / cleaned_target).resolve()
-                except (OSError, RuntimeError) as exc:
-                    raise PolicyImmutabilityError(
-                        f"{POLICY_IMMUTABILITY_VIOLATION}: unresolvable symlink patch "
-                        f"{link_rel!r} ({exc}).",
-                        offending_paths=tuple(touched_paths) or (link_rel,),
-                    ) from exc
-                forb_hit = self._matches_forbidden_target(
-                    resolved_target, cleaned_target, forb_res, forb_names
-                )
-                if forb_hit is not None:
-                    raise IsolationBoundaryError(
-                        f"{ISOLATION_BOUNDARY_VIOLATION}: blocked symlink patch "
-                        f"{link_rel!r} pointing to forbidden path ({forb_hit})."
-                    )
-                if not resolved_target.is_relative_to(resolved_repo):
-                    raise PolicyImmutabilityError(
-                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
-                        f"escapes repository.",
-                        offending_paths=tuple(touched_paths) or (link_rel,),
-                    )
-                target_rel = resolved_target.relative_to(resolved_repo).as_posix()
-                if self.is_immutable_path(target_rel) or self._is_immutable_ancestor(target_rel):
-                    raise PolicyImmutabilityError(
-                        f"{POLICY_IMMUTABILITY_VIOLATION}: patch symlink {link_rel!r} "
-                        f"targets immutable path or ancestor {target_rel!r}.",
-                        offending_paths=tuple(touched_paths) or (link_rel,),
-                    )
-
-            added_symlinks_exact[norm_link] = lexical_target_rel
-            added_symlinks_folded[norm_link.casefold()] = lexical_target_rel
+                added_symlinks_exact[cand_link] = lexical_target_rel
+                added_symlinks_folded[_norm_fold(cand_link)] = lexical_target_rel
 
         if added_symlinks_exact and touched_paths:
+            expanded_touched: list[str] = []
+            seen_cand: set[str] = set()
+            for orig_path in touched_paths:
+                for cand in _p1_candidates(orig_path):
+                    if cand not in seen_cand:
+                        seen_cand.add(cand)
+                        expanded_touched.append(cand)
             resolved_touched: list[str] = []
             max_hops = max(16, len(added_symlinks_exact) * 2 + 4)
-            for orig_path in touched_paths:
+            for orig_path in expanded_touched:
                 cur_path = posixpath.normpath(orig_path.strip().replace("\\", "/"))
-                seen_paths: set[str] = {cur_path.casefold()}
+                seen_paths: set[str] = {_norm_fold(cur_path)}
                 completed = False
                 for _ in range(max_hops):
                     parts = cur_path.split("/")
@@ -868,13 +1126,13 @@ class PolicyGuard:
                         prefix = "/".join(parts[:idx])
                         target_base = added_symlinks_exact.get(prefix)
                         if target_base is None:
-                            target_base = added_symlinks_folded.get(prefix.casefold())
+                            target_base = added_symlinks_folded.get(_norm_fold(prefix))
                         if target_base is not None:
                             remainder = "/".join(parts[idx:])
                             next_path = posixpath.normpath(
                                 f"{target_base}/{remainder}" if remainder else target_base
                             )
-                            next_folded = next_path.casefold()
+                            next_folded = _norm_fold(next_path)
                             if next_folded in seen_paths:
                                 raise PolicyImmutabilityError(
                                     f"{POLICY_IMMUTABILITY_VIOLATION}: circular symlink patch "
@@ -936,15 +1194,17 @@ class PolicyGuard:
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden runtime DB or credential boundary ({pat.pattern})."
                     )
-            added_folded = added.casefold()
+            added_folded = _norm_fold(added)
+            added_nfc = unicodedata.normalize("NFC", added)
+            added_nfd = unicodedata.normalize("NFD", added)
             for tok in exact_tokens:
-                if tok in added or tok.casefold() in added_folded:
+                if tok in added or _norm_fold(tok) in added_folded:
                     raise IsolationBoundaryError(
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden runtime DB or credential path ({tok})."
                     )
             for name, pat in basename_patterns:
-                if pat.search(added):
+                if pat.search(added) or pat.search(added_nfc) or pat.search(added_nfd):
                     raise IsolationBoundaryError(
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden filename ({name})."
@@ -974,6 +1234,91 @@ class PolicyGuard:
                                     f"referencing symlink {cand_tok!r} -> {forb_hit}."
                                 )
 
+    def _collect_git_tree_symlink_targets(
+        self,
+        repo_path: Path,
+        candidate_ref: str,
+        touched_paths: Sequence[str],
+    ) -> list[tuple[str, str]]:
+        """Inspect candidate_ref git tree for 120000 symlink entries among touched_paths."""
+        unique_paths = list(dict.fromkeys(p for p in touched_paths if p and p != "/dev/null"))
+        if not unique_paths:
+            return []
+
+        discovered: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        chunk_size = 200
+        for offset in range(0, len(unique_paths), chunk_size):
+            batch = unique_paths[offset : offset + chunk_size]
+            tree_proc = subprocess.run(
+                ["git", "-C", str(repo_path), "ls-tree", "-z", candidate_ref, "--", *batch],
+                capture_output=True,
+                check=False,
+            )
+            if tree_proc.returncode != 0:
+                err_msg = tree_proc.stderr.decode("utf-8", errors="replace").strip()
+                raise PolicyImmutabilityError(
+                    f"{POLICY_IMMUTABILITY_VIOLATION}: unable to inspect git tree "
+                    f"on {candidate_ref!r} ({err_msg}).",
+                    offending_paths=tuple(touched_paths),
+                )
+            for raw_entry in tree_proc.stdout.split(b"\x00"):
+                if not raw_entry:
+                    continue
+                if b"\t" not in raw_entry:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: malformed git ls-tree entry.",
+                        offending_paths=tuple(touched_paths),
+                    )
+                meta_bytes, path_bytes = raw_entry.split(b"\t", 1)
+                meta_parts = meta_bytes.decode("ascii", errors="strict").split()
+                if len(meta_parts) != 3:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: malformed git ls-tree metadata.",
+                        offending_paths=tuple(touched_paths),
+                    )
+                mode, obj_type, oid = meta_parts
+                if mode != "120000" or obj_type != "blob":
+                    continue
+                try:
+                    entry_path = path_bytes.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: non-UTF-8 symlink path in git tree.",
+                        offending_paths=tuple(touched_paths),
+                    ) from exc
+                blob_proc = subprocess.run(
+                    ["git", "-C", str(repo_path), "cat-file", "blob", oid],
+                    capture_output=True,
+                    check=False,
+                )
+                if blob_proc.returncode != 0:
+                    err_msg = blob_proc.stderr.decode("utf-8", errors="replace").strip()
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: unable to read symlink blob "
+                        f"for {entry_path!r} ({err_msg}).",
+                        offending_paths=tuple(touched_paths),
+                    )
+                try:
+                    target_str = blob_proc.stdout.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: non-UTF-8 symlink target "
+                        f"for {entry_path!r}.",
+                        offending_paths=tuple(touched_paths),
+                    ) from exc
+                if not target_str.strip():
+                    raise PolicyImmutabilityError(
+                        f"{POLICY_IMMUTABILITY_VIOLATION}: empty symlink target "
+                        f"for {entry_path!r}.",
+                        offending_paths=tuple(touched_paths),
+                    )
+                pair = (entry_path, target_str)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    discovered.append(pair)
+        return discovered
+
     def inspect_git_diff(
         self,
         repo_path: Path,
@@ -984,7 +1329,16 @@ class PolicyGuard:
     ) -> None:
         """Inspect git diff between base_ref and candidate_ref; fail closed on any violation."""
         names_proc = subprocess.run(
-            ["git", "-C", str(repo_path), "diff", "--name-only", f"{base_ref}..{candidate_ref}"],
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--name-only",
+                f"{base_ref}..{candidate_ref}",
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -1003,7 +1357,18 @@ class PolicyGuard:
         )
 
         patch_proc = subprocess.run(
-            ["git", "-C", str(repo_path), "diff", "-U0", f"{base_ref}..{candidate_ref}"],
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "-c",
+                "diff.mnemonicPrefix=false",
+                "diff",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "-U0",
+                f"{base_ref}..{candidate_ref}",
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -1014,20 +1379,23 @@ class PolicyGuard:
                 f"({patch_proc.stderr.strip()})."
             )
 
-        parsed_touched, added_lines, symlink_added_targets = parse_unified_patch(
-            patch_proc.stdout
-        )
-        touched_paths = list(dict.fromkeys([*changed_paths, *parsed_touched]))
+        parsed = parse_unified_patch_details(patch_proc.stdout)
+        touched_paths = list(dict.fromkeys([*changed_paths, *parsed.touched_paths]))
         self.check_candidate_paths(touched_paths)
+        tree_symlinks = self._collect_git_tree_symlink_targets(
+            repo_path, candidate_ref, touched_paths
+        )
+        all_symlinks = list(dict.fromkeys([*parsed.symlink_added_targets, *tree_symlinks]))
         self.check_added_lines(
-            added_lines,
+            parsed.added_lines,
             touched_paths=touched_paths,
             repo_path=repo_path,
             exact_tokens=exact_tokens,
             basename_patterns=basename_patterns,
             forbidden_resolved=forbidden_resolved,
             forbidden_names=forbidden_names,
-            symlink_added_targets=symlink_added_targets,
+            symlink_added_targets=all_symlinks,
+            strip_p1_symlink_links=False,
         )
 
 
