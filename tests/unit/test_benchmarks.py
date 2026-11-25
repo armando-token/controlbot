@@ -9,6 +9,7 @@ from benchmarks.report import (
     ProvenanceMetadata,
     ScenarioTrialResult,
     aggregate_trials,
+    evaluate_promotion_gate,
     format_markdown_report,
 )
 from benchmarks.runner import _trial_detail, run_benchmarks
@@ -199,3 +200,52 @@ async def test_failed_trial_detail_reflects_actual_failure_without_success_strin
     assert "Halted identical_repeat" not in trial.detail
     assert report.engine_summary.promotion_eligible is False
     assert report.provenance.exit_code == 1
+
+
+@pytest.mark.n1
+def test_evaluate_promotion_gate_recomputes_violations_from_metrics() -> None:
+    baseline_sys: dict[str, object] = {
+        "name": "baseline",
+        "role": "baseline",
+        "correct_count": 4,
+        "total_count": 12,
+    }
+    candidate_sys: dict[str, object] = {
+        "name": "grokbot_engine",
+        "role": "candidate",
+        "correct_count": 12,
+        "total_count": 12,
+        "unauthorized_actions": 0,
+        "disallowed_egress": 0,
+        "session_isolation_violations": 0,
+        "effect_duplications": 0,
+        "wrong_asset_attributions": 0,
+    }
+    valid_report: dict[str, object] = {
+        "scenario_count": 12,
+        "cases": [{"scenario_id": f"S{idx:02d}"} for idx in range(1, 13)],
+        "systems": [baseline_sys, candidate_sys],
+        "promotion_passed": False,
+    }
+    res_ok = evaluate_promotion_gate(valid_report)
+    assert res_ok["promotion_passed"] is True
+    assert res_ok["blocking_violations"] == []
+
+    bad_report: dict[str, object] = {
+        **valid_report,
+        "promotion_passed": True,
+        "systems": [baseline_sys, {**candidate_sys, "wrong_asset_attributions": 1}],
+    }
+    res_bad = evaluate_promotion_gate(bad_report)
+    assert res_bad["promotion_passed"] is False
+    assert any("wrong_asset_attributions" in v for v in res_bad["blocking_violations"])
+
+    few_report: dict[str, object] = {
+        **valid_report,
+        "scenario_count": 5,
+        "cases": [{"scenario_id": f"S{idx:02d}"} for idx in range(1, 6)],
+        "promotion_passed": True,
+    }
+    res_few = evaluate_promotion_gate(few_report)
+    assert res_few["promotion_passed"] is False
+    assert any("< 12" in v for v in res_few["blocking_violations"])

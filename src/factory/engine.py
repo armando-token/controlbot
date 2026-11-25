@@ -104,7 +104,9 @@ class FactoryEngine:
     ) -> None:
         self._repo_path = Path(repo_path).resolve()
         self._store = store
-        self._policy_guard = policy_guard or PolicyGuard()
+        self._policy_guard = policy_guard or PolicyGuard(
+            forbidden_paths=[*forbidden_db_paths, *forbidden_credential_paths]
+        )
         self._owner = owner
         self._base_branch = base_branch
         self._uv_lock_path = uv_lock_path

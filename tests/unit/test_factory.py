@@ -532,3 +532,69 @@ def test_factory_migration_resume_and_audit_log_completeness(tmp_path: Path) -> 
     rc = factory_cli_main(["resume", "--db", str(db_path), "--repo", str(lab_repo), "--json"])
     assert rc == 0
     assert store.get_budget().attempts_used == 2
+
+
+@pytest.mark.n1
+def test_factory_cli_run_empty_backlog_and_force_fail_pause_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lab_repo = tmp_path / "lab_repo"
+    _init_git_repo(lab_repo)
+    base_head = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    empty_backlog = tmp_path / "empty_backlog.json"
+    empty_backlog.write_text("[]", encoding="utf-8")
+    db1 = tmp_path / "factory_empty.db"
+    out1 = tmp_path / "out_empty"
+    rc_empty = factory_cli_main(
+        [
+            "run",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db1),
+            "--output-dir",
+            str(out1),
+            "--backlog",
+            str(empty_backlog),
+            "--json",
+        ]
+    )
+    assert rc_empty == 0
+    summary1 = json.loads((out1 / "factory_run_summary.json").read_text(encoding="utf-8"))
+    assert summary1["status"] == "paused_empty_backlog"
+
+    db2 = tmp_path / "factory_exhaust.db"
+    out2 = tmp_path / "out_exhaust"
+    monkeypatch.setenv("GROKBOT_FACTORY_FORCE_FAIL", "1")
+    rc_exhaust = factory_cli_main(
+        [
+            "run",
+            "--repo",
+            str(lab_repo),
+            "--db",
+            str(db2),
+            "--output-dir",
+            str(out2),
+            "--max-attempts",
+            "2",
+            "--json",
+        ]
+    )
+    assert rc_exhaust == 0
+    summary2 = json.loads((out2 / "factory_run_summary.json").read_text(encoding="utf-8"))
+    assert "paused" in summary2["status"]
+    assert FactoryStore(db2).get_budget().attempts_used == 2
+    head_after = subprocess.run(
+        ["git", "-C", str(lab_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after == base_head

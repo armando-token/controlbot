@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import subprocess
@@ -50,8 +51,31 @@ class PolicyGuard:
         self,
         *,
         extra_immutable_prefixes: Sequence[str] = (),
+        forbidden_paths: Sequence[Path | str] = (),
     ) -> None:
         self._immutable_prefixes = (*IMMUTABLE_PATH_PREFIXES, *extra_immutable_prefixes)
+        self._forbidden_paths: tuple[str, ...] = self._normalize_forbidden_paths(forbidden_paths)
+
+    @staticmethod
+    def _normalize_forbidden_paths(forbidden_paths: Sequence[Path | str]) -> tuple[str, ...]:
+        raw_items: list[str] = [str(p).strip() for p in forbidden_paths if str(p).strip()]
+        env_raw = os.environ.get("GROKBOT_FORBIDDEN_PATHS", "").strip()
+        if env_raw:
+            raw_items.extend(part.strip() for part in env_raw.split(",") if part.strip())
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            candidates = [item]
+            with contextlib.suppress(OSError):
+                candidates.append(str(Path(item).resolve()))
+            name = Path(item).name
+            if len(name) >= 12:
+                candidates.append(name)
+            for cand in candidates:
+                if cand and cand not in seen:
+                    seen.add(cand)
+                    tokens.append(cand)
+        return tuple(tokens)
 
     def is_immutable_path(self, rel_path: str) -> bool:
         normalized = rel_path.replace("\\", "/").lstrip("./")
@@ -81,8 +105,13 @@ class PolicyGuard:
         repo_path: Path,
         base_ref: str,
         candidate_ref: str,
+        *,
+        extra_forbidden_paths: Sequence[Path | str] = (),
     ) -> None:
         """Inspect git diff between base_ref and candidate_ref; fail closed on any violation."""
+        forbidden_tokens = self._forbidden_paths + self._normalize_forbidden_paths(
+            extra_forbidden_paths
+        )
         names_proc = subprocess.run(
             ["git", "-C", str(repo_path), "diff", "--name-only", f"{base_ref}..{candidate_ref}"],
             capture_output=True,
@@ -125,6 +154,12 @@ class PolicyGuard:
                     raise IsolationBoundaryError(
                         f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
                         f"forbidden runtime DB or credential boundary ({pat.pattern})."
+                    )
+            for forbidden in forbidden_tokens:
+                if forbidden in added:
+                    raise IsolationBoundaryError(
+                        f"{ISOLATION_BOUNDARY_VIOLATION}: blocked candidate diff referencing "
+                        f"forbidden runtime DB or credential path ({forbidden})."
                     )
 
 

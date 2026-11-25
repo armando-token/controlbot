@@ -772,16 +772,22 @@ def build_runtime(
 
     if model_client is not None:
         active_model: ModelClient = model_client
+        emulated_model_for_emulated_tasks: ModelClient | None = None
     elif backend_mode == BackendMode.LOCAL_HTTP:
         active_model = build_model_client(
             BackendMode.LOCAL_HTTP,
             local_http_config=local_http_config,
+        )
+        emulated_model_for_emulated_tasks = EmulatedModelClient(
+            mode="custom",
+            turn_factory=make_industrial_turn_factory(facility_config),
         )
     else:
         active_model = EmulatedModelClient(
             mode="custom",
             turn_factory=make_industrial_turn_factory(facility_config),
         )
+        emulated_model_for_emulated_tasks = None
 
     if backend_mode == BackendMode.LOCAL_HTTP and not isinstance(
         active_model, LocalHttpModelClient
@@ -835,6 +841,7 @@ def build_runtime(
         session_id_resolver=_session_id_for_tool,
         result_verifier=result_verifier,
         permission_revalidator=_permission_revalidator,
+        emulated_model_client=emulated_model_for_emulated_tasks,
     )
     web_coordinator = RuntimeCoordinatorAdapter(
         repo=repo,

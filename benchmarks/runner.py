@@ -68,6 +68,7 @@ from benchmarks.report import (
     ProvenanceMetadata,
     ScenarioTrialResult,
     aggregate_trials,
+    evaluate_promotion_gate,
     format_markdown_report,
 )
 from benchmarks.scenarios import (
@@ -1921,11 +1922,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Model ID reported in local_http mode.",
     )
     parser.add_argument(
+        "--evaluate-gate",
+        default="",
+        help="Path to an existing benchmark JSON report to evaluate against the promotion gate.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print JSON report to stdout instead of Markdown summary.",
     )
     args = parser.parse_args(argv)
+
+    if args.evaluate_gate.strip():
+        gate_result = evaluate_promotion_gate(Path(args.evaluate_gate.strip()))
+        print(json.dumps(gate_result, indent=2))
+        return 0 if gate_result["promotion_passed"] else 1
 
     selected = (
         [s.strip() for s in args.scenarios.split(",") if s.strip()]

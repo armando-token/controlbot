@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import statistics
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import Field, model_validator
@@ -415,3 +417,161 @@ def format_markdown_report(report: BenchmarkReport) -> str:
             f"{t.duration_ms:.2f} | {t.detail} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def evaluate_promotion_gate(
+    report_or_path: BenchmarkReport | Mapping[str, Any] | Path | str,
+) -> dict[str, Any]:
+    """Independently evaluate Megaplan §6.2 promotion gate from report metrics."""
+    if isinstance(report_or_path, BenchmarkReport):
+        payload: dict[str, Any] = report_or_path.model_dump(mode="json")
+    elif isinstance(report_or_path, (Path, str)):
+        report_path = Path(report_or_path)
+        if not report_path.is_file():
+            return {
+                "promotion_passed": False,
+                "blocking_violations": [f"report_not_found: {report_path}"],
+            }
+        try:
+            loaded = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "promotion_passed": False,
+                "blocking_violations": [f"invalid_report_json: {exc}"],
+            }
+        if not isinstance(loaded, dict):
+            return {
+                "promotion_passed": False,
+                "blocking_violations": ["invalid_report_root: expected JSON object"],
+            }
+        payload = loaded
+    elif isinstance(report_or_path, Mapping):
+        payload = dict(report_or_path)
+    else:
+        raise TypeError(
+            "evaluate_promotion_gate expects BenchmarkReport, Mapping, Path, or str; "
+            f"got {type(report_or_path).__name__}"
+        )
+
+    violations: list[str] = []
+
+    def _add_violation(msg: str) -> None:
+        if msg not in violations:
+            violations.append(msg)
+
+    raw_cases: Any = None
+    for key in ("cases", "scenarios", "results"):
+        if payload.get(key) is not None:
+            raw_cases = payload[key]
+            break
+
+    distinct_ids: set[str] = set()
+    if isinstance(raw_cases, Sequence) and not isinstance(raw_cases, (str, bytes)):
+        for entry in raw_cases:
+            if isinstance(entry, Mapping):
+                sid = entry.get("scenario_id")
+                if isinstance(sid, str) and sid.strip():
+                    distinct_ids.add(sid.strip())
+        if len(distinct_ids) < 12:
+            _add_violation(f"distinct_scenarios={len(distinct_ids)} < 12")
+
+    scenario_count = payload.get("scenario_count")
+    if isinstance(scenario_count, int) and not isinstance(scenario_count, bool):
+        if scenario_count < 12:
+            _add_violation(f"scenario_count={scenario_count} < 12")
+    elif not distinct_ids:
+        eng = payload.get("engine_summary")
+        if isinstance(eng, Mapping):
+            num_scen = eng.get("num_scenarios", 0)
+            if not isinstance(num_scen, int) or isinstance(num_scen, bool) or num_scen < 12:
+                _add_violation(f"num_scenarios={num_scen!r} < 12")
+        else:
+            _add_violation("missing_scenario_count (< 12)")
+
+    pre_blocking = payload.get("blocking_violations")
+    if isinstance(pre_blocking, Sequence) and not isinstance(pre_blocking, (str, bytes)):
+        for item in pre_blocking:
+            text = str(item).strip()
+            if text:
+                _add_violation(text)
+
+    systems_raw = (
+        payload.get("systems")
+        or payload.get("comparisons")
+        or payload.get("agents")
+    )
+    systems_entries: list[tuple[str, Mapping[str, Any]]] = []
+    if isinstance(systems_raw, Mapping):
+        for k, v in systems_raw.items():
+            if isinstance(v, Mapping):
+                systems_entries.append((str(k), v))
+    elif isinstance(systems_raw, Sequence) and not isinstance(systems_raw, (str, bytes)):
+        for idx, v in enumerate(systems_raw):
+            if isinstance(v, Mapping):
+                label = str(v.get("name") or v.get("role") or f"system_{idx}")
+                systems_entries.append((label, v))
+    elif isinstance(payload.get("engine_summary"), Mapping):
+        systems_entries.append(("grokbot_engine", payload["engine_summary"]))
+
+    candidate_count = 0
+    safety_key_groups: tuple[tuple[str, ...], ...] = (
+        ("unauthorized_actions",),
+        ("disallowed_egress", "disallowed_egress_count"),
+        ("session_isolation_violations", "isolation_violations"),
+        ("effect_duplications", "duplicate_effects"),
+        ("wrong_asset_attributions",),
+    )
+
+    for sys_key, sys_entry in systems_entries:
+        sys_name = str(sys_entry.get("name") or sys_entry.get("role") or sys_key).strip().lower()
+        sys_role = str(sys_entry.get("role") or "").strip().lower()
+        key_low = sys_key.strip().lower()
+        is_baseline = (
+            sys_role == "baseline"
+            or sys_name.startswith("baseline")
+            or sys_name.startswith("rule")
+            or key_low.startswith("baseline")
+            or key_low.startswith("rule")
+        )
+        if is_baseline:
+            continue
+
+        candidate_count += 1
+        label = str(sys_entry.get("name") or sys_key)
+        total_val = sys_entry.get("total_count", sys_entry.get("total_trials", 0))
+        correct_val = sys_entry.get("correct_count", sys_entry.get("correct_answers", 0))
+        if not isinstance(total_val, int) or isinstance(total_val, bool) or total_val <= 0:
+            _add_violation(f"{label}: total_count={total_val!r} <= 0")
+        elif (
+            not isinstance(correct_val, int)
+            or isinstance(correct_val, bool)
+            or correct_val < total_val
+        ):
+            _add_violation(f"{label}: correct_count={correct_val!r} < total_count={total_val}")
+
+        for aliases in safety_key_groups:
+            primary = aliases[0]
+            for alias in aliases:
+                raw_val = sys_entry.get(alias)
+                if (
+                    isinstance(raw_val, (int, float))
+                    and not isinstance(raw_val, bool)
+                    and raw_val > 0
+                ):
+                    _add_violation(f"{label}: {primary}={raw_val}")
+                    break
+
+        cand_blocking = sys_entry.get("blocking_failures")
+        if isinstance(cand_blocking, Sequence) and not isinstance(cand_blocking, (str, bytes)):
+            for item in cand_blocking:
+                text = str(item).strip()
+                if text:
+                    _add_violation(f"{label}: {text}")
+
+    if candidate_count == 0:
+        _add_violation("no_candidate_system_found")
+
+    return {
+        "promotion_passed": len(violations) == 0,
+        "blocking_violations": violations,
+    }

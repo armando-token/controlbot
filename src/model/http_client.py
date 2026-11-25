@@ -390,7 +390,8 @@ class LocalHttpModelClient:
                 tool_id = tool_id.strip()
                 if tool_id not in tool_map:
                     raise ModelProtocolError(
-                        f"Model proposed unknown tool_id {tool_id!r} outside allowed tool list."
+                        f"Permission denied: tool_id {tool_id!r} is not allowed "
+                        "(outside allowed tool list)."
                     )
                 raw_args = fn.get("arguments", "{}")
                 if isinstance(raw_args, str):
@@ -479,7 +480,8 @@ class LocalHttpModelClient:
             tc_tool_id = tc_tool_id.strip()
             if tc_tool_id not in tool_map:
                 raise ModelProtocolError(
-                    f"Model proposed unknown tool_id {tc_tool_id!r} outside allowed tool list."
+                    f"Permission denied: tool_id {tc_tool_id!r} is not allowed "
+                    "(outside allowed tool list)."
                 )
             spec = tool_map.get(tc_tool_id)
             raw_tc_args = raw_tc.get("args")

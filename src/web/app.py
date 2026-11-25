@@ -127,7 +127,7 @@ def _load_configured_origins_from_path(
     *,
     origin_overrides: dict[str, str],
 ) -> set[str]:
-    from deploy.config import load_deploy_config
+    from deploy.config import DeployConfigError, load_deploy_config
 
     from src.adapters.config import load_facility_config
 
@@ -137,23 +137,52 @@ def _load_configured_origins_from_path(
         if repo_candidate.exists():
             path = repo_candidate
     if not path.exists():
-        raise FileNotFoundError(f"Installation config not found: {raw_path}")
+        raise FileNotFoundError(
+            f"Invalid installation_config_path {raw_path!r}: config file not found."
+        )
 
     is_deploy_cfg = path.suffix.lower() in {".yaml", ".yml"}
     if not is_deploy_cfg and path.suffix.lower() == ".json":
-        raw_obj = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw_obj = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Malformed JSON in installation_config_path {raw_path!r}: {exc.msg}"
+            ) from exc
         if isinstance(raw_obj, dict) and "apps" not in raw_obj and "allowed_origins" in raw_obj:
             is_deploy_cfg = True
 
-    if is_deploy_cfg:
-        deploy_cfg = load_deploy_config(path, verify_facility=True, repo_root=_REPO_ROOT)
-        origins = set(deploy_cfg.allowed_origins)
-        origins.update(origin_overrides.values())
-        return origins
+    try:
+        if is_deploy_cfg:
+            deploy_cfg = load_deploy_config(path, verify_facility=True, repo_root=_REPO_ROOT)
+            origins = set(deploy_cfg.allowed_origins)
+            origins.update(origin_overrides.values())
+            return origins
 
-    facility_cfg = load_facility_config(path, origin_overrides=origin_overrides or None)
+        facility_cfg = load_facility_config(path, origin_overrides=origin_overrides or None)
+    except ValidationError as exc:
+        fields = [
+            ".".join(str(part) for part in err.get("loc", ())) or "root"
+            for err in exc.errors()
+        ]
+        raise ValueError(
+            f"Invalid installation_config_path {raw_path!r}: "
+            f"malformed config fields ({', '.join(fields)})."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Malformed JSON in installation_config_path {raw_path!r}: {exc.msg}"
+        ) from exc
+    except DeployConfigError as exc:
+        raise ValueError(
+            f"Invalid installation_config_path {raw_path!r}: malformed deployment config."
+        ) from exc
+
     if not facility_cfg.apps:
-        raise ValueError(f"Facility config {raw_path!r} defines zero configured app origins.")
+        raise ValueError(
+            f"Invalid installation_config_path {raw_path!r}: "
+            "defines zero configured app origins."
+        )
     return {app_cfg.origin for app_cfg in facility_cfg.apps.values()}
 
 

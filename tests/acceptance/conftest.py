@@ -125,3 +125,25 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
         raise
+
+
+def pytest_terminal_summary(
+    terminalreporter: Any,
+    exitstatus: int,
+    config: pytest.Config,
+) -> None:
+    del exitstatus, config
+    if platform.system() != "Linux":
+        pending_n3 = [
+            rec["test_id"]
+            for rec in _SESSION_RECORDS.values()
+            if rec.get("observed") == "skipped: PENDING_N3_LINUX_ENV"
+        ]
+        if pending_n3:
+            terminalreporter.write_sep(
+                "-",
+                f"N3 Readiness: PENDING_N3_LINUX_ENV "
+                f"({len(pending_n3)} skipped on {platform.system()})",
+            )
+            for test_id in pending_n3:
+                terminalreporter.write_line(f"PENDING_N3_LINUX_ENV: {test_id}")

@@ -12,6 +12,7 @@ from benchmarks.report import (
     ScenarioTrialResult,
     SystemAggregateMetrics,
     aggregate_trials,
+    evaluate_promotion_gate,
     format_markdown_report,
 )
 from benchmarks.scenarios import (
@@ -34,6 +35,7 @@ __all__ = [
     "ScenarioTrialResult",
     "SystemAggregateMetrics",
     "aggregate_trials",
+    "evaluate_promotion_gate",
     "format_markdown_report",
     "get_all_scenarios",
     "get_runnable_scenarios",

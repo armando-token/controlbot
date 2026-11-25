@@ -44,6 +44,7 @@ from src.model.protocol import (
     ModelClient,
     ModelDecision,
     ModelDelegationRequest,
+    ModelProtocolError,
     PromptContext,
     TransientModelError,
 )
@@ -106,9 +107,11 @@ class Coordinator:
         session_id_resolver: SessionIdResolver | None = None,
         result_verifier: ResultVerifier | None = None,
         permission_revalidator: PermissionRevalidator | None = None,
+        emulated_model_client: ModelClient | None = None,
     ) -> None:
         self._repo = repo
         self._model_client = model_client
+        self._emulated_model_client = emulated_model_client
         self._tool_registry = tool_registry
         self._config = config or CoordinatorConfig()
         self._loop_detector = loop_detector or LoopDetector()
@@ -890,8 +893,16 @@ class Coordinator:
             )
 
             # Step 3 (outside SQLite tx): invoke model client
+            active_model_client = (
+                self._emulated_model_client
+                if (
+                    task_spec.backend_mode == BackendMode.EMULATED
+                    and self._emulated_model_client is not None
+                )
+                else self._model_client
+            )
             try:
-                decision = await self._model_client.decide(
+                decision = await active_model_client.decide(
                     prompt_ctx, visible_tools, budget_remaining
                 )
             except TransientModelError as exc:
@@ -921,6 +932,31 @@ class Coordinator:
                 raise
             except Exception as exc:
                 self._repo.reconcile_budget(model_res.reservation_id, release_only=True)
+                if isinstance(exc, ModelProtocolError) and (
+                    "outside allowed tool list" in str(exc)
+                ):
+                    policy_reason = (
+                        "read_only_policy_denied"
+                        if task_spec.scope.read_only
+                        else "permission_denied"
+                    )
+                    self._repo.append_audit_log(
+                        task_id=task_id,
+                        run_id=run_id,
+                        actor="coordinator",
+                        action="tool_permission_denied",
+                        decision="deny",
+                        detail={"reason": policy_reason, "error": str(exc)},
+                    )
+                    return self._settle_terminal(
+                        task_spec=task_spec,
+                        run_id=run_id,
+                        target_status=TaskStatus.FAILED,
+                        reason=policy_reason,
+                        answer=f"Permission denied: {exc}",
+                        observations=tuple(observations),
+                        contradictions=tuple(contradictions),
+                    )
                 return self._settle_terminal(
                     task_spec=task_spec,
                     run_id=run_id,

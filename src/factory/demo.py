@@ -14,6 +14,7 @@ from typing import Any
 
 from src.factory.db import FactoryStore
 from src.factory.engine import EvalResult, FactoryEngine, rollback_from_manifest
+from src.factory.errors import DuplicateProposalError
 from src.factory.models import BacklogItem, CandidatePatch, CycleBudget, compute_proposal_hash
 
 _PLANT_LOOKUP_BASELINE = '''"""Synthetic isolated plant asset lookup module for M7 factory demo."""
@@ -248,6 +249,8 @@ def _init_lab_repo(repo_dir: Path, *, uv_lock_source: Path | None) -> str:
 
 def _evaluate_lab_repo(repo_dir: Path) -> EvalResult:
     module_path = repo_dir / "plant_lookup.py"
+    if not module_path.exists():
+        return EvalResult(passed=False, metric=None, detail="plant_lookup.py not present")
     mod_name = "lab_plant_lookup_eval"
     spec = importlib.util.spec_from_file_location(mod_name, module_path)
     if spec is None or spec.loader is None:
@@ -279,14 +282,57 @@ def _evaluate_lab_repo(repo_dir: Path) -> EvalResult:
         sys.modules.pop(mod_name, None)
 
 
+def _is_existing_git_repo(repo_dir: Path) -> bool:
+    if not repo_dir.exists() or not (repo_dir / ".git").exists():
+        return False
+    proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def _detect_base_branch(repo_dir: Path) -> str:
+    cur = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    cur_branch = cur.stdout.strip()
+    if (
+        cur.returncode == 0
+        and cur_branch
+        and cur_branch != "HEAD"
+        and not cur_branch.startswith("factory/")
+    ):
+        return cur_branch
+    for candidate_branch in ("main", "master"):
+        chk = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", candidate_branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0:
+            return candidate_branch
+    return "HEAD"
+
+
 def run_factory_demo(
     *,
     workspace_dir: Path | None = None,
     repo_dir: Path | None = None,
     db_path: Path | None = None,
     output_dir: Path | None = None,
+    candidate: str = "all",
 ) -> dict[str, Any]:
-    """Run the 2-candidate M7 software factory demo (1 promoted + rollback, 1 rejected)."""
+    """Run the M7 software factory demo (candidate='all', '1', or '2')."""
+    if candidate not in {"all", "1", "2"}:
+        raise ValueError(f"Unsupported demo candidate selector: {candidate!r}")
+
     temp_ctx: tempfile.TemporaryDirectory[str] | None = None
     if workspace_dir is None and (repo_dir is None or db_path is None):
         temp_ctx = tempfile.TemporaryDirectory(prefix="grokbot_factory_demo_")
@@ -301,54 +347,63 @@ def run_factory_demo(
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         repo_root_lock = Path(__file__).resolve().parent.parent.parent / "uv.lock"
-        baseline_commit = _init_lab_repo(lab_repo, uv_lock_source=repo_root_lock)
+        existing_repo = _is_existing_git_repo(lab_repo)
+
+        if candidate == "all" or not existing_repo:
+            baseline_commit = _init_lab_repo(lab_repo, uv_lock_source=repo_root_lock)
+            base_branch = "main"
+        else:
+            base_branch = _detect_base_branch(lab_repo)
+            baseline_commit = subprocess.run(
+                ["git", "-C", str(lab_repo), "rev-parse", base_branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
 
         store = FactoryStore(factory_db)
+        uv_lock_candidate = lab_repo / "uv.lock"
         engine = FactoryEngine(
             lab_repo,
             store,
+            base_branch=base_branch,
             budget=CycleBudget(max_cycles=4, max_attempts=4, max_wall_seconds=120.0),
-            uv_lock_path=lab_repo / "uv.lock",
+            uv_lock_path=uv_lock_candidate if uv_lock_candidate.exists() else repo_root_lock,
             artifacts_dir=artifacts_dir,
         )
 
-        item1 = store.add_backlog_item(
-            BacklogItem(
-                item_id="B-FAC-01",
-                title="Index plant asset lookup by (canonical_label, area)",
-                priority=1,
-                hypothesis=(
-                    "O(1) (canonical_label, area) index reduces scan steps "
-                    "without losing disambiguation."
-                ),
-                target_metric="scan_steps",
-                baseline_repro_cmd="pytest -q",
-                max_attempts=2,
-            )
+        item1_def = BacklogItem(
+            item_id="B-FAC-01",
+            title="Index plant asset lookup by (canonical_label, area)",
+            priority=1,
+            hypothesis=(
+                "O(1) (canonical_label, area) index reduces scan steps "
+                "without losing disambiguation."
+            ),
+            target_metric="scan_steps",
+            baseline_repro_cmd="pytest -q",
+            max_attempts=2,
         )
-        item2 = store.add_backlog_item(
-            BacklogItem(
-                item_id="B-FAC-02",
-                title="Fast-path asset lookup skipping area filter",
-                priority=2,
-                hypothesis="Returning first label match skips area scan and reduces lookup steps.",
-                target_metric="scan_steps",
-                baseline_repro_cmd="pytest -q",
-                max_attempts=2,
-            )
+        item2_def = BacklogItem(
+            item_id="B-FAC-02",
+            title="Fast-path asset lookup skipping area filter",
+            priority=2,
+            hypothesis="Returning first label match skips area scan and reduces lookup steps.",
+            target_metric="scan_steps",
+            baseline_repro_cmd="pytest -q",
+            max_attempts=2,
         )
 
-        # Candidate 1: Accepted optimization
         cand1_files = {"plant_lookup.py": _CAND1_PLANT_LOOKUP}
         cand1 = CandidatePatch(
             candidate_id="cand-1-index",
-            item_id=item1.item_id,
+            item_id=item1_def.item_id,
             branch_name="factory/cand-1-index",
-            hypothesis=item1.hypothesis,
-            target_metric=item1.target_metric,
+            hypothesis=item1_def.hypothesis,
+            target_metric=item1_def.target_metric,
             proposal_hash=compute_proposal_hash(
-                item_id=item1.item_id,
-                target_metric=item1.target_metric,
+                item_id=item1_def.item_id,
+                target_metric=item1_def.target_metric,
                 files_to_modify=cand1_files,
                 repro_test_path="tests/test_repro_cand1.py",
                 repro_test_content=_CAND1_REPRO_TEST,
@@ -357,6 +412,107 @@ def run_factory_demo(
             repro_test_path="tests/test_repro_cand1.py",
             repro_test_content=_CAND1_REPRO_TEST,
         )
+        cand2_files = {"plant_lookup.py": _CAND2_ASSET_CONFUSING}
+        cand2 = CandidatePatch(
+            candidate_id="cand-2-skip-area",
+            item_id=item2_def.item_id,
+            branch_name="factory/cand-2-skip-area",
+            hypothesis=item2_def.hypothesis,
+            target_metric=item2_def.target_metric,
+            proposal_hash=compute_proposal_hash(
+                item_id=item2_def.item_id,
+                target_metric=item2_def.target_metric,
+                files_to_modify=cand2_files,
+            ),
+            files_to_modify=cand2_files,
+            repro_test_path="tests/test_plant_lookup.py",
+        )
+
+        if candidate == "1":
+            if store.get_backlog_item(item1_def.item_id) is None:
+                store.add_backlog_item(item1_def)
+            manifest_path = artifacts_dir / "rollback_cand1.json"
+            res1 = engine.run_candidate_cycle(
+                cand1,
+                evaluator=_evaluate_lab_repo,
+                manifest_out=manifest_path,
+            )
+            final_head = subprocess.run(
+                ["git", "-C", str(lab_repo), "rev-parse", base_branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            lessons = [lesson.model_dump(mode="json") for lesson in store.list_lessons()]
+            return {
+                "ok": res1.status.value == "promoted",
+                "candidate": "1",
+                "baseline_commit": baseline_commit,
+                "promoted_commit": res1.candidate_commit,
+                "final_main_head": final_head,
+                "factory_db_path": str(factory_db),
+                "isolation_verified": True,
+                "manifest_path": str(manifest_path),
+                "candidate_1": res1.model_dump(mode="json"),
+                "lessons": lessons,
+            }
+
+        if candidate == "2":
+            if store.get_backlog_item(item2_def.item_id) is None:
+                store.add_backlog_item(item2_def)
+            try:
+                res2 = engine.run_candidate_cycle(cand2, evaluator=_evaluate_lab_repo)
+            except DuplicateProposalError as exc:
+                final_head = subprocess.run(
+                    ["git", "-C", str(lab_repo), "rev-parse", base_branch],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                lessons = [lesson.model_dump(mode="json") for lesson in store.list_lessons()]
+                return {
+                    "ok": True,
+                    "candidate": "2",
+                    "status": "skipped_duplicate_rejected",
+                    "skipped": True,
+                    "duplicate": True,
+                    "already_rejected": True,
+                    "reason": str(exc),
+                    "baseline_commit": baseline_commit,
+                    "final_main_head": final_head,
+                    "factory_db_path": str(factory_db),
+                    "isolation_verified": True,
+                    "candidate_2": {
+                        "candidate_id": cand2.candidate_id,
+                        "status": "skipped_duplicate_rejected",
+                        "reason": str(exc),
+                    },
+                    "lessons": lessons,
+                }
+            final_head = subprocess.run(
+                ["git", "-C", str(lab_repo), "rev-parse", base_branch],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            lessons = [lesson.model_dump(mode="json") for lesson in store.list_lessons()]
+            return {
+                "ok": res2.status.value == "rejected" and final_head == baseline_commit,
+                "candidate": "2",
+                "status": res2.status.value,
+                "baseline_commit": baseline_commit,
+                "final_main_head": final_head,
+                "factory_db_path": str(factory_db),
+                "isolation_verified": True,
+                "candidate_2": res2.model_dump(mode="json"),
+                "lessons": lessons,
+            }
+
+        item1 = store.add_backlog_item(item1_def)
+        item2 = store.add_backlog_item(item2_def)
+        del item1, item2
+
+        # Candidate 1: Accepted optimization
         manifest_path = artifacts_dir / "rollback_cand1.json"
         res1 = engine.run_candidate_cycle(
             cand1,
@@ -403,21 +559,6 @@ def run_factory_demo(
         )
 
         # Candidate 2: Rejected asset-confusing optimization
-        cand2_files = {"plant_lookup.py": _CAND2_ASSET_CONFUSING}
-        cand2 = CandidatePatch(
-            candidate_id="cand-2-skip-area",
-            item_id=item2.item_id,
-            branch_name="factory/cand-2-skip-area",
-            hypothesis=item2.hypothesis,
-            target_metric=item2.target_metric,
-            proposal_hash=compute_proposal_hash(
-                item_id=item2.item_id,
-                target_metric=item2.target_metric,
-                files_to_modify=cand2_files,
-            ),
-            files_to_modify=cand2_files,
-            repro_test_path="tests/test_plant_lookup.py",
-        )
         res2 = engine.run_candidate_cycle(cand2, evaluator=_evaluate_lab_repo)
         final_main_head = subprocess.run(
             ["git", "-C", str(lab_repo), "rev-parse", "main"],
@@ -454,34 +595,66 @@ def run_factory_demo(
 
 
 def _format_human_demo(summary: dict[str, Any]) -> str:
-    c1 = summary["candidate_1"]
-    c2 = summary["candidate_2"]
+    c1 = summary.get("candidate_1")
+    c2 = summary.get("candidate_2")
     lines = [
         "=== Grokbot-clon M7 Local Software Factory Demo ===",
         f"Overall OK         : {summary['ok']}",
         f"Isolation Verified : {summary['isolation_verified']}",
-        f"Rollback Verified  : {summary['rollback_verified']}",
+        f"Rollback Verified  : {summary.get('rollback_verified', 'N/A')}",
         f"Baseline Commit    : {summary['baseline_commit'][:12]}",
-        f"Promoted Commit    : {str(summary['promoted_commit'])[:12]}",
+        f"Promoted Commit    : {str(summary.get('promoted_commit'))[:12]}",
         f"Final Main HEAD    : {summary['final_main_head'][:12]}",
-        "",
-        f"Candidate 1 ({c1['candidate_id']}): {c1['status'].upper()}",
-        f"  Metric : {c1['baseline_metric']} -> {c1['candidate_metric']}",
-        f"  Reason : {c1['reason']}",
-        "",
-        f"Candidate 2 ({c2['candidate_id']}): {c2['status'].upper()}",
-        f"  Reason : {c2['reason']}",
-        f"Lessons Recorded   : {len(summary['lessons'])}",
     ]
+    if isinstance(c1, dict):
+        lines.extend(
+            [
+                "",
+                f"Candidate 1 ({c1['candidate_id']}): {str(c1['status']).upper()}",
+                f"  Metric : {c1.get('baseline_metric')} -> {c1.get('candidate_metric')}",
+                f"  Reason : {c1.get('reason')}",
+            ]
+        )
+    if isinstance(c2, dict):
+        lines.extend(
+            [
+                "",
+                f"Candidate 2 ({c2['candidate_id']}): {str(c2['status']).upper()}",
+                f"  Reason : {c2.get('reason')}",
+            ]
+        )
+    lines.append(f"Lessons Recorded   : {len(summary['lessons'])}")
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `python -m src.factory.demo`."""
     parser = argparse.ArgumentParser(description="Run Grokbot-clon M7 software factory demo.")
-    parser.add_argument("--repo", default=None, help="Optional isolated lab git repo dir.")
-    parser.add_argument("--db", default=None, help="Optional isolated factory SQLite DB path.")
-    parser.add_argument("--output-dir", default=None, help="Optional artifact output directory.")
+    parser.add_argument(
+        "--repo",
+        default=os.environ.get("GROKBOT_FACTORY_REPO") or None,
+        help="Optional isolated lab git repo dir.",
+    )
+    parser.add_argument(
+        "--db",
+        "--factory-db",
+        dest="db",
+        default=os.environ.get("GROKBOT_FACTORY_DB") or None,
+        help="Optional isolated factory SQLite DB path.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "--out",
+        dest="output_dir",
+        default=os.environ.get("GROKBOT_FACTORY_OUT") or None,
+        help="Optional artifact output directory.",
+    )
+    parser.add_argument(
+        "--candidate",
+        choices=("all", "1", "2"),
+        default=os.environ.get("GROKBOT_FACTORY_CANDIDATE") or "all",
+        help="Candidate selector: all, 1, or 2 (default: all).",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     args = parser.parse_args(argv)
 
@@ -489,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
         repo_dir=Path(args.repo) if args.repo else None,
         db_path=Path(args.db) if args.db else None,
         output_dir=Path(args.output_dir) if args.output_dir else None,
+        candidate=args.candidate,
     )
     if args.json:
         print(json.dumps(summary, indent=2, default=str))
