@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Grokbotclon Operator Dashboard{% endblock %}
+{% block content %}
+<h1 data-testid="dashboard-title">Local Operator Observability Console</h1>
+
+{% if error_message %}
+<div role="alert" class="banner banner-danger" data-testid="error-banner">{{ error_message }}</div>
+{% endif %}
+
+<section aria-labelledby="submit-heading">
+  <h2 id="submit-heading">Submit Industrial Task</h2>
+  <form method="post" action="/ui/tasks" aria-label="Submit Task Form">
+    <label for="query">Task Query</label>
+    <textarea id="query" name="query" rows="2" required placeholder="e.g. Check bomba 34 alarms and latest maintenance intervention"></textarea>
+    <label for="facility_id">Facility ID</label>
+    <input id="facility_id" name="facility_id" type="text" value="facility-a" required>
+    <label for="user_id">User ID</label>
+    <input id="user_id" name="user_id" type="text" value="operator" required>
+    <label for="profile_id">Profile ID</label>
+    <input id="profile_id" name="profile_id" type="text" value="default" required>
+    <label for="allowed_areas">Allowed Areas (comma-separated, optional)</label>
+    <input id="allowed_areas" name="allowed_areas" type="text" value="area-1">
+    <label for="allowed_origins">Allowed Origins (comma-separated, optional)</label>
+    <input id="allowed_origins" name="allowed_origins" type="text" value="" placeholder="http://127.0.0.1:8101,http://127.0.0.1:8102">
+    <div>
+      <button type="submit">Submit Task</button>
+    </div>
+  </form>
+</section>
+
+<section aria-labelledby="runs-heading">
+  <h2 id="runs-heading">Task Runs</h2>
+  {% if snapshots %}
+  <table aria-label="Task Runs">
+    <thead>
+      <tr>
+        <th>Run ID</th>
+        <th>Query</th>
+        <th>Status</th>
+        <th>Last Transition</th>
+        <th>Transition Reason</th>
+        <th>Tool Calls</th>
+        <th>Tokens</th>
+        <th>Details</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for snap in snapshots %}
+      <tr data-run-id="{{ snap.run.run_id }}">
+        <td><a href="/tasks/{{ snap.run.run_id }}">{{ snap.run.run_id }}</a></td>
+        <td>{{ snap.task.query }}</td>
+        <td data-testid="run-status-{{ snap.run.run_id }}">{{ snap.run.status }}</td>
+        <td>
+          {% if snap.transitions %}
+            {{ snap.transitions[-1].from_status if snap.transitions[-1].from_status else "none" }} &rarr; {{ snap.transitions[-1].to_status }}
+          {% else %}
+            none
+          {% endif %}
+        </td>
+        <td>{{ snap.run.transition_reason }}</td>
+        <td>{{ snap.budget_usage.tool_calls_used }} / {{ snap.budget_config.max_tool_calls }}</td>
+        <td>{{ snap.budget_usage.total_tokens_used }} / {{ snap.budget_config.max_total_tokens }}{% if snap.budget_usage.usage_estimated %} (est){% endif %}</td>
+        <td><a href="/tasks/{{ snap.run.run_id }}">Inspect</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No task runs submitted yet.</p>
+  {% endif %}
+</section>
+
+<section aria-labelledby="sessions-heading">
+  <h2 id="sessions-heading">Isolated Browser Sessions &amp; Human Takeover</h2>
+  {% if sessions %}
+  <table aria-label="Browser Sessions">
+    <thead>
+      <tr>
+        <th>Session ID</th>
+        <th>User</th>
+        <th>Profile</th>
+        <th>App</th>
+        <th>Active Lease</th>
+        <th>Takeover Active</th>
+        <th>Takeover Owner</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for sess in sessions %}
+      <tr data-session-id="{{ sess.session_id }}">
+        <td><code>{{ sess.session_id }}</code></td>
+        <td>{{ sess.user_id }}</td>
+        <td>{{ sess.profile_id }}</td>
+        <td>{{ sess.app_id }}</td>
+        <td>{{ sess.active_lease }}</td>
+        <td>{{ sess.takeover_active }}</td>
+        <td>{{ sess.takeover_owner or "-" }}</td>
+        <td>
+          {% if not sess.takeover_active %}
+          <form method="post" action="/ui/sessions/{{ sess.session_id }}/takeover" style="display:inline;">
+            <input type="hidden" name="owner" value="operator">
+            <input type="hidden" name="reason" value="manual_intervention">
+            <button type="submit">Takeover</button>
+          </form>
+          {% else %}
+          <form method="post" action="/ui/sessions/{{ sess.session_id }}/release" style="display:inline;">
+            <input type="hidden" name="owner" value="{{ sess.takeover_owner or 'operator' }}">
+            <button type="submit">Release</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No active Playwright browser sessions registered.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -9,26 +9,25 @@ test-n1:
 	$(UV) run pytest tests/unit -m "not n2 and not n3"
 
 test:
-	@echo "[M1_SCOPE] Running N1 unit suite; N2/N3 suites pending M3/M4."
-	$(MAKE) test-n1
+	$(MAKE) test-n1 && $(MAKE) test-n2 && $(MAKE) test-acceptance
 
 lint:
-	$(UV) run ruff check src tests
+	$(UV) run ruff check src lab tests/unit tests/integration tests/acceptance
 
 typecheck:
-	$(UV) run mypy src tests
+	$(UV) run mypy src lab tests/unit tests/integration tests/acceptance
 
 check:
 	$(MAKE) doctor && $(MAKE) lint && $(MAKE) typecheck && $(MAKE) test
 
 test-n2:
-	@echo "[NOT_IMPLEMENTED: M3] N2 integration tests require lab/ and src/adapters/." && exit 2
+	$(UV) run pytest tests/integration -m "n2 and not n3" -v
 
 test-acceptance:
-	@echo "[NOT_IMPLEMENTED: M4] Acceptance suite A01-A14 scheduled for M4." && exit 2
+	$(UV) run pytest tests/acceptance -m "acceptance and not n3" -v
 
 demo:
-	@echo "[NOT_IMPLEMENTED: M4] Pump 34 end-to-end demo scheduled for M4." && exit 2
+	$(UV) run python -m src.demo
 
 test-offline:
 	@echo "[PENDING_N3_LINUX_ENV: M6] Offline Linux/LAN test harness scheduled for M6 (requires Linux network isolation)." && exit 2

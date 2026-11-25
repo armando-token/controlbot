@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}Run {{ snapshot.run.run_id }} - Grokbotclon{% endblock %}
+{% block content %}
+<h1 data-testid="run-detail-title">Task Run: {{ snapshot.run.run_id }}</h1>
+
+{% if error_message %}
+<div role="alert" class="banner banner-danger">{{ error_message }}</div>
+{% endif %}
+
+<section aria-labelledby="overview-heading">
+  <h2 id="overview-heading">Lifecycle &amp; Status</h2>
+  <p><strong>Task ID:</strong> <code>{{ snapshot.task.task_id }}</code></p>
+  <p><strong>Query:</strong> {{ snapshot.task.query }}</p>
+  <p><strong>Status:</strong> <span data-testid="task-status">{{ snapshot.run.status }}</span></p>
+  <p><strong>Transition Reason:</strong> <span data-testid="transition-reason">{{ snapshot.run.transition_reason }}</span></p>
+  <p>
+    <strong>Last Transition:</strong>
+    {% if snapshot.transitions %}
+      <span data-testid="last-transition">{{ snapshot.transitions[-1].from_status if snapshot.transitions[-1].from_status else "none" }} -> {{ snapshot.transitions[-1].to_status }} ({{ snapshot.transitions[-1].reason }})</span>
+    {% else %}
+      none
+    {% endif %}
+  </p>
+  {% if snapshot.run.required_action %}
+  <div class="banner banner-warn" data-testid="required-action-banner">
+    <strong>Required Action:</strong> {{ snapshot.run.required_action }}
+  </div>
+  {% endif %}
+
+  {% if snapshot.run.status in ("queued", "running", "waiting_for_input", "recovering") %}
+  <form method="post" action="/ui/tasks/{{ snapshot.run.run_id }}/cancel" style="display:inline;">
+    <input type="hidden" name="reason" value="cancelled_by_operator">
+    <button type="submit">Cancel Run</button>
+  </form>
+  {% endif %}
+
+  {% if snapshot.run.status == "waiting_for_input" %}
+  <form method="post" action="/ui/tasks/{{ snapshot.run.run_id }}/resume" aria-label="Resume Task Form">
+    <label for="choice">Human Input / Area Selection</label>
+    <input id="choice" name="choice" type="text" required placeholder="e.g. area-1">
+    <button type="submit">Resume Run</button>
+  </form>
+  {% endif %}
+</section>
+
+<section aria-labelledby="budget-heading">
+  <h2 id="budget-heading">Budget &amp; Usage</h2>
+  <table aria-label="Budget Usage">
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Used</th>
+        <th>Reserved</th>
+        <th>Limit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tool Calls</td>
+        <td>{{ snapshot.budget_usage.tool_calls_used }}</td>
+        <td>{{ snapshot.budget_usage.tool_calls_reserved }}</td>
+        <td>{{ snapshot.budget_config.max_tool_calls }}</td>
+      </tr>
+      <tr>
+        <td>Model Calls</td>
+        <td>{{ snapshot.budget_usage.model_calls_used }}</td>
+        <td>{{ snapshot.budget_usage.model_calls_reserved }}</td>
+        <td>{{ snapshot.budget_config.max_model_calls }}</td>
+      </tr>
+      <tr>
+        <td>Total Tokens</td>
+        <td>{{ snapshot.budget_usage.total_tokens_used }}{% if snapshot.budget_usage.usage_estimated %} (estimated){% endif %}</td>
+        <td>{{ snapshot.budget_usage.tokens_reserved }}</td>
+        <td>{{ snapshot.budget_config.max_total_tokens }}</td>
+      </tr>
+      <tr>
+        <td>Wall Seconds</td>
+        <td>{{ "%.2f"|format(snapshot.budget_usage.wall_seconds_elapsed) }}</td>
+        <td>-</td>
+        <td>{{ snapshot.budget_config.max_wall_seconds }}</td>
+      </tr>
+      <tr>
+        <td>Transient Retries</td>
+        <td>{{ snapshot.budget_usage.transient_retries_used }}</td>
+        <td>-</td>
+        <td>{{ snapshot.budget_config.max_transient_retries }}</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+{% if snapshot.result %}
+<section aria-labelledby="result-heading">
+  <h2 id="result-heading">Verified Result</h2>
+  <p data-testid="result-answer"><strong>Answer:</strong> {{ snapshot.result.answer }}</p>
+
+  {% if snapshot.result.partial_info %}
+  <div class="banner banner-warn" data-testid="partial-info-banner">
+    <strong>Partial Availability / Exclusions:</strong> {{ snapshot.result.partial_info }}
+  </div>
+  {% endif %}
+
+  {% if snapshot.result.contradictions %}
+  <div class="banner banner-danger" data-testid="contradictions-banner">
+    <strong>Unresolved Contradictions ({{ snapshot.result.contradictions|length }}):</strong>
+    <ul>
+      {% for c in snapshot.result.contradictions %}
+      <li>
+        {{ c.summary }}
+        <ul>
+          {% for claim in c.claims %}
+          <li><code>{{ claim.source }}</code> | asset={{ claim.asset_id }} | {{ claim.field }}={{ claim.value }}</li>
+          {% endfor %}
+        </ul>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% if snapshot.result.verified_observations %}
+  <h3>Source-Attributed Observations</h3>
+  <table aria-label="Verified Observations">
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Asset ID</th>
+        <th>Label</th>
+        <th>Value</th>
+        <th>Unit</th>
+        <th>Source Time</th>
+        <th>Quality</th>
+        <th>Area</th>
+        <th>Authorized</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for obs in snapshot.result.verified_observations %}
+      <tr>
+        <td>{{ obs.source }}</td>
+        <td>{{ obs.asset_id }}</td>
+        <td>{{ obs.observed_label }}</td>
+        <td>{{ obs.value }}</td>
+        <td>{{ obs.unit or "-" }}</td>
+        <td>{{ obs.source_time if obs.source_time else "-" }}</td>
+        <td>{{ obs.quality }}</td>
+        <td>{{ obs.area or "-" }}</td>
+        <td>{{ obs.authorized_evidence }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endif %}
+
+<section aria-labelledby="receipts-heading">
+  <h2 id="receipts-heading">Redacted Action Receipts</h2>
+  {% if redacted_receipts %}
+  <table aria-label="Action Receipts">
+    <thead>
+      <tr>
+        <th>Receipt ID</th>
+        <th>Tool</th>
+        <th>Attempt</th>
+        <th>Operation Key</th>
+        <th>Outcome</th>
+        <th>Duration (ms)</th>
+        <th>Redacted Args</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in redacted_receipts %}
+      <tr>
+        <td><code>{{ r.receipt_id }}</code></td>
+        <td>{{ r.tool_id }}</td>
+        <td>{{ r.attempt }}</td>
+        <td><code>{{ r.operation_key }}</code></td>
+        <td>{{ r.outcome }}</td>
+        <td>{{ "%.1f"|format(r.duration_ms) }}</td>
+        <td><code>{{ r.redacted_args }}</code></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No action receipts recorded yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

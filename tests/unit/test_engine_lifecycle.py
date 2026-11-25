@@ -1,0 +1,304 @@
+"""N1 unit tests for Task State Machine, pause/resume, and depth=1 delegation (F04)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from src.contracts.budgets import BudgetConfig
+from src.contracts.common import InvalidStateTransitionError, PlanValidationError
+from src.contracts.enums import (
+    ALLOWED_TASK_TRANSITIONS,
+    TERMINAL_TASK_STATUSES,
+    EffectClass,
+    TaskStatus,
+)
+from src.contracts.models import Result, TaskScope, TaskSpec, ToolSpec
+from src.engine.coordinator import Coordinator
+from src.engine.tool_registry import ToolExecutionContext, ToolRegistry
+from src.model.emulator import EmulatedModelClient
+from src.storage import BudgetExceededError, StorageRepo, TerminalStateError
+
+
+class FakeClock:
+    def __init__(self, start: datetime | None = None) -> None:
+        self.now = start or datetime(2026, 11, 25, 10, 0, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> datetime:
+        self.now = self.now + timedelta(seconds=seconds)
+        return self.now
+
+
+def _make_task(
+    task_id: str = "task-life-1",
+    *,
+    budget: BudgetConfig | None = None,
+    allowed_tools: tuple[str, ...] = ("read_scada",),
+    read_only: bool = True,
+) -> TaskSpec:
+    return TaskSpec(
+        task_id=task_id,
+        user_id="user-1",
+        profile_id="prof-1",
+        scope=TaskScope(
+            facility_id="plant-a",
+            allowed_origins=("https://scada.local",),
+            allowed_areas=("area-1", "area-2"),
+            allowed_tools=allowed_tools,
+            read_only=read_only,
+        ),
+        query="Check pump 34 status",
+        budget=budget or BudgetConfig(),
+    )
+
+
+def _register_scada_tool(registry: ToolRegistry) -> None:
+    spec = ToolSpec(
+        tool_id="read_scada",
+        version="1.0.0",
+        input_schema={"type": "object", "properties": {"asset": {"type": "string"}}},
+        output_schema={"type": "object", "required": ["status"]},
+        allowed_origins=("https://scada.local",),
+        effect_class=EffectClass.READ,
+        timeout_s=10.0,
+        verifier_name="scada_verifier",
+    )
+
+    def handler(args: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
+        del ctx
+        return {
+            "status": "running",
+            "asset": args.get("asset", "pump-34"),
+            "area": args.get("area"),
+        }
+
+    registry.register(spec, handler)
+
+
+@pytest.mark.n1
+def test_valid_and_invalid_state_transitions_and_event_trail(tmp_path: Path) -> None:
+    db_path = tmp_path / "transitions.db"
+    clock = FakeClock()
+    repo = StorageRepo(db_path, clock=clock)
+    repo.init_db()
+
+    # Exercise every legal edge in ALLOWED_TASK_TRANSITIONS
+    legal_paths: list[tuple[str, list[tuple[TaskStatus, str, str | None]]]] = [
+        ("t-q-f", [(TaskStatus.FAILED, "preflight_failed", None)]),
+        ("t-q-c", [(TaskStatus.CANCELLED, "user_cancelled", None)]),
+        (
+            "t-wait-rec",
+            [
+                (TaskStatus.RUNNING, "started", None),
+                (TaskStatus.WAITING_FOR_INPUT, "need_area", "select_area"),
+                (TaskStatus.RECOVERING, "recover_after_wait", None),
+                (TaskStatus.WAITING_FOR_INPUT, "need_confirm", "confirm_action"),
+                (TaskStatus.RUNNING, "resumed", None),
+                (TaskStatus.RECOVERING, "transient_hiccup", None),
+                (TaskStatus.PARTIAL, "partial_result", None),
+            ],
+        ),
+        (
+            "t-rec-ok",
+            [
+                (TaskStatus.RUNNING, "started", None),
+                (TaskStatus.RECOVERING, "crash_recovery", None),
+                (TaskStatus.SUCCEEDED, "recovered_ok", None),
+            ],
+        ),
+    ]
+
+    for tid, path in legal_paths:
+        _, run = repo.create_task_and_run(_make_task(tid))
+        prev_ver = run.version
+        for target, reason, req in path:
+            clock.advance(1.0)
+            updated = repo.transition_run_status(
+                run.run_id, target, reason, required_action=req
+            )
+            assert updated.status == target
+            assert updated.transition_reason == reason
+            assert updated.version == prev_ver + 1
+            prev_ver = updated.version
+
+        events = [
+            e
+            for e in repo.list_events(run_id=run.run_id)
+            if e.event_type == "run_transition"
+        ]
+        assert [(TaskStatus(e.to_status or ""), e.reason) for e in events] == [
+            (t, r) for t, r, _ in path
+        ]
+
+    # Verify illegal transitions raise InvalidStateTransitionError and are audited
+    _, bad_run = repo.create_task_and_run(_make_task("t-illegal"))
+    for illegal_target in set(TaskStatus) - ALLOWED_TASK_TRANSITIONS[TaskStatus.QUEUED]:
+        with pytest.raises(InvalidStateTransitionError):
+            repo.transition_run_status(bad_run.run_id, illegal_target, "bad_jump")
+    audits = repo.list_audit_logs(task_id="t-illegal")
+    assert len(audits) >= 1
+    assert audits[0].action == "illegal_transition_rejected"
+
+
+@pytest.mark.n1
+def test_immutable_terminal_states(tmp_path: Path) -> None:
+    db_path = tmp_path / "terminals.db"
+    clock = FakeClock()
+    repo = StorageRepo(db_path, clock=clock)
+    repo.init_db()
+
+    for idx, terminal in enumerate(sorted(TERMINAL_TASK_STATUSES, key=lambda s: s.value)):
+        tid = f"t-term-{idx}"
+        _, run = repo.create_task_and_run(_make_task(tid))
+        if terminal != TaskStatus.FAILED and terminal != TaskStatus.CANCELLED:
+            repo.transition_run_status(run.run_id, TaskStatus.RUNNING, "started")
+        expected_result = Result(
+            task_id=tid,
+            run_id=run.run_id,
+            status=terminal,
+            answer=f"Final {terminal.value}",
+        )
+        settled = repo.transition_run_status(
+            run.run_id, terminal, f"settled_{terminal.value}", result=expected_result
+        )
+        assert settled.status == terminal
+
+        for candidate in TaskStatus:
+            with pytest.raises(InvalidStateTransitionError):
+                repo.transition_run_status(run.run_id, candidate, "reopen_attempt")
+
+        snap = repo.get_run_snapshot(run.run_id)
+        assert snap.run.status == terminal
+        assert snap.result == expected_result
+
+
+@pytest.mark.n1
+async def test_pause_and_resume_waiting_for_input_and_timeout(tmp_path: Path) -> None:
+    db_path = tmp_path / "pause_resume.db"
+    clock = FakeClock()
+    repo = StorageRepo(db_path, clock=clock)
+    repo.init_db()
+    registry = ToolRegistry(clock=clock)
+    _register_scada_tool(registry)
+
+    budget = BudgetConfig(max_wall_seconds=120.0, human_wait_timeout_seconds=300.0)
+    task_spec = _make_task("task-ambiguity", budget=budget)
+
+    coord1 = Coordinator(repo, EmulatedModelClient(mode="ambiguity"), registry, clock=clock)
+    run = coord1.submit_task(task_spec)
+    clock.advance(5.0)
+    paused = await coord1.run_until_settled(run.run_id)
+    assert paused.status == TaskStatus.WAITING_FOR_INPUT
+    assert paused.required_action is not None
+
+    # Wait 200s (> max_wall_seconds=120s, but < human_wait_timeout_seconds=300s)
+    clock.advance(200.0)
+
+    # Fresh Coordinator instance resumes from SQLite WAL persisted state
+    coord2 = Coordinator(repo, EmulatedModelClient(mode="ambiguity"), registry, clock=clock)
+
+    # Attempting to widen read_only on resume is rejected
+    with pytest.raises(PlanValidationError):
+        coord2.resume_task(run.run_id, {"read_only": False})
+
+    resumed_run = coord2.resume_task(run.run_id, {"area": "area-2"})
+    assert resumed_run.status == TaskStatus.RUNNING
+
+    clock.advance(5.0)
+    final = await coord2.run_until_settled(run.run_id)
+    assert final.status == TaskStatus.SUCCEEDED
+    assert final.execution_metrics.human_wait_seconds == pytest.approx(200.0)
+    assert final.execution_metrics.wall_seconds < 20.0
+
+    # Exceeding human_wait_timeout_seconds transitions to FAILED
+    task_timeout = _make_task("task-wait-timeout", budget=budget)
+    run_to = coord2.submit_task(task_timeout)
+    paused_to = await coord2.run_until_settled(run_to.run_id)
+    assert paused_to.status == TaskStatus.WAITING_FOR_INPUT
+    clock.advance(301.0)
+    with pytest.raises(BudgetExceededError, match="Human wait timeout"):
+        coord2.resume_task(run_to.run_id, {"area": "area-1"})
+    assert repo.get_run(run_to.run_id).status == TaskStatus.FAILED
+
+
+@pytest.mark.n1
+async def test_depth1_delegation_active_cap_and_scope_narrowing(tmp_path: Path) -> None:
+    db_path = tmp_path / "delegation.db"
+    clock = FakeClock()
+    repo = StorageRepo(db_path, clock=clock)
+    repo.init_db()
+    registry = ToolRegistry(clock=clock)
+    _register_scada_tool(registry)
+
+    coord = Coordinator(repo, EmulatedModelClient(mode="delegation"), registry, clock=clock)
+    task_spec = _make_task("task-delegation")
+    root_run = coord.submit_task(task_spec)
+
+    # Run full delegation lifecycle: root spawns 2 depth=1 children concurrently
+    result = await coord.run_until_settled(root_run.run_id)
+    assert result.status == TaskStatus.SUCCEEDED
+
+    snap = repo.get_run_snapshot(root_run.run_id)
+    assert len(snap.child_runs) == 2
+    assert all(c.depth == 1 and c.status == TaskStatus.SUCCEEDED for c in snap.child_runs)
+    # Completing children frees active_children slot while retaining root tool/model usage
+    assert snap.budget_usage.active_children == 0
+    assert snap.budget_usage.tool_calls_used >= 2
+    assert snap.budget_usage.model_calls_used >= 4
+
+    # Direct cap and depth=2 and scope widening checks
+    _, root2 = repo.create_task_and_run(_make_task("task-caps"))
+    repo.transition_run_status(root2.run_id, TaskStatus.RUNNING, "started")
+    c1 = repo.create_child_run(root2.run_id, "c1")
+    c2 = repo.create_child_run(root2.run_id, "c2")
+
+    # 3rd active child exceeds max_active_children=2
+    with pytest.raises(BudgetExceededError, match="max_active_children"):
+        repo.create_child_run(root2.run_id, "c3")
+
+    # Grandchild (depth=2 > max_depth=1) rejected
+    repo.transition_run_status(c1.run_id, TaskStatus.RUNNING, "started")
+    with pytest.raises(BudgetExceededError, match="max_depth"):
+        repo.create_child_run(c1.run_id, "grandchild")
+
+    # Child scope widening rejected & audited
+    repo.transition_run_status(c2.run_id, TaskStatus.RUNNING, "started")
+    repo.transition_run_status(c2.run_id, TaskStatus.SUCCEEDED, "done")
+    assert repo.get_budget_usage("task-caps").active_children == 1
+
+    with pytest.raises(PlanValidationError, match="widening"):
+        repo.create_child_run(
+            root2.run_id,
+            "c-widen-ro",
+            child_scope=TaskScope(
+                facility_id="plant-a",
+                allowed_origins=("https://scada.local",),
+                allowed_areas=("area-1",),
+                allowed_tools=("read_scada",),
+                read_only=False,
+            ),
+        )
+    with pytest.raises(PlanValidationError, match="widening"):
+        repo.create_child_run(
+            root2.run_id,
+            "c-widen-origin",
+            child_scope=TaskScope(
+                facility_id="plant-a",
+                allowed_origins=("https://evil.local",),
+                allowed_areas=("area-1",),
+                allowed_tools=("read_scada",),
+                read_only=True,
+            ),
+        )
+    audits = repo.list_audit_logs(task_id="task-caps")
+    assert any(a.action == "child_scope_widening_rejected" for a in audits)
+
+    # Terminal parent cannot spawn child
+    repo.transition_run_status(root2.run_id, TaskStatus.FAILED, "stop")
+    with pytest.raises(TerminalStateError):
+        repo.create_child_run(root2.run_id, "c-after-terminal")

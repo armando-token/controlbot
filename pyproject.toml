@@ -45,7 +45,7 @@ markers = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "lab", "tests"]
 extend-exclude = ["tests/e2e"]
 force-exclude = true
 
@@ -57,5 +57,5 @@ python_version = "3.12"
 strict = true
 mypy_path = "."
 plugins = ["pydantic.mypy"]
-files = ["src", "tests"]
+files = ["src", "lab", "tests"]
 exclude = ["^tests/e2e/"]
