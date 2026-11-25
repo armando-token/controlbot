@@ -2,15 +2,15 @@
 
 ## Estado verificable y siguiente acción
 - **Estado del producto**: **`flujo con emulador`**
-- **Estado general de cierre M0–M7-T1**: **VERIFICADO en N1 + N2 (Darwin ARM64)**; **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
-- **Siguiente acción ejecutable**: **M7 Tiers 2–4 y Tier 5 Adversarial Hardening** contra el conjunto publicado en `tests/e2e/` (`uv run pytest tests/e2e -m "not n3" -v`), seguido de la validación N3 en host Linux destino (`./scripts/verify_n3_linux.sh`).
+- **Estado general de cierre M0–M7-T2**: **VERIFICADO en N1 + N2 (Darwin ARM64)**; **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
+- **Siguiente acción ejecutable**: **M7 Tiers 3–4 y Tier 5 Adversarial Hardening** contra el conjunto publicado en `tests/e2e/` (`uv run pytest tests/e2e -m "not n3" -v`), seguido de la validación N3 en host Linux destino (`./scripts/verify_n3_linux.sh`).
 
 ---
 
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas M7-T1 verificado**: `5be7bbd52a76c3bbcbccabcfbcd1ecaaff67fd69` (`fix(m7-t1): align adapters, web origins/tracing, area2 fixtures, benchmarks, factory & deploy for Tier 1 E2E`)
+- **Commit de código y pruebas M7-T2 verificado**: `16acc135ddad5bb4e381d1307809cd274b90273c` (`fix(m7-t2): resolve policy denial evidence, config validation, dual backend routing, benchmark gate, N3 summary & factory CLI`)
 - **Cadena de commits de hitos en `main`**:
   - `d95e98e` — `chore(m1): initialize repo, diagnostics, frozen contracts, research & ADRs`
   - `ccadffc` — `M1: remediate mypy e2e exclusion, redaction hardening, contract invariants, and doctor checks`
@@ -21,6 +21,8 @@
   - `6a11a47` — `feat(m6): add software factory, offline deploy/rollback, N3 scripts & integration fixes`
   - `2a0be81` — `docs(m6): finalize README, third-party notices, night state, backlog & NIGHT_REPORT`
   - `5be7bbd` — `fix(m7-t1): align adapters, web origins/tracing, area2 fixtures, benchmarks, factory & deploy for Tier 1 E2E`
+  - `2bca0dd` — `docs(night-report): align NIGHT_REPORT format, exact status label & M7-T1 commit SHA`
+  - `16acc13` — `fix(m7-t2): resolve policy denial evidence, config validation, dual backend routing, benchmark gate, N3 summary & factory CLI`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -39,7 +41,7 @@
 | **M4** (Integración, `LocalHttpModelClient`, Takeover, `SIGKILL`, Probe N3/AT-SPI) | `DONE` | `LocalHttpModelClient` con fallback conservador `estimated`, `A10` auth-expiry pause/resume, recuperación real `SIGKILL` (`A08`/`A14`), `make demo` (`ALM-3401` + `WO-3408`) |
 | **M5** (Benchmarks comparativos & Portabilidad Área 2 `A12`) | `DONE` | `lab/configs/facility_b.json` (`SC-77`/`CMMS-77`), `13/13` escenarios `GrokbotEngine` vs `1/13` `RuleBasedBaseline`, `engine_loc_delta=0` en `A12` |
 | **M6** (Fábrica M7 `src/factory/`, Packaging/Rollback M8 `deploy/`, Fixes E2E/M5, Docs) | `DONE` | `src/factory/` (WAL aislado `0o700`/`0o600`, `PolicyGuard`, demo 2 candidatos con rollback verificado), `deploy/` (`install_config.yaml`, `ReleaseManifest` SHA-256, `rollback.py` preservando WAL/perfiles), `make test-offline`, `make test-n3`, 5 fixes de integración |
-| **M7 (E2E Tiers 1–4 + Tier 5)** | `PLANNED` | Suite lista en `tests/e2e/` (`230` pruebas); pendiente ejecución de hito final M7 |
+| **M7 (E2E Tiers 1–4 + Tier 5)** | `IN_PROGRESS` | Tier 1 (`99/99`) y Tier 2 (`99/99`) verificados en `tests/e2e/`; pendientes Tiers 3–4 y Tier 5 |
 | **N3 Piloto Linux (`B-N3-01..04`)** | `PENDING_N3_LINUX_ENV` | `scripts/verify_n3_linux.sh`, `deploy/grokbot.service`, `deploy/Containerfile`, `deploy/OFFLINE_RUNBOOK.md` listos para host Linux |
 
 ---
@@ -69,10 +71,10 @@
 
 ### 3.3 Resultados medidos (Benchmarks M6 & Fábrica M7)
 - **Benchmark comparativo emparejado (`13` escenarios N1/N2 ejecutables; `A11` = `PENDING_N3_LINUX_ENV`)**:
-   - **Modo `emulated`** (`make bench`, commit `5be7bbd`):
-     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=411.64ms`, `p95=430.58ms`.
-     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1236.11ms`, `p95=1476.76ms`, `tool_calls=34`, `model_calls=42`, `tokens=3514`, `RAM=79.94 MB`.
-     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.236s`, `verified_succeeded=True`.
+   - **Modo `emulated`** (`make bench`, commit `16acc13`):
+     - `RuleBasedBaseline`: **`1/13` (`7.7%`)**, `promotion_eligible=False`, `false_positives=3`, `wrong_asset_attributions=3`, `duplicate_effects=1`, `state_loss_count=1`, `isolation_violations=1`, `median=413.04ms`, `p95=431.50ms`.
+     - `GrokbotEngine`: **`13/13` (`100.0%`)**, `promotion_eligible=True`, `correct_abstentions=7`, `0` falsos positivos, `0` confusiones de activo, `0` efectos duplicados, `0` pérdida de estado, `0` violaciones de aislamiento, `median=1222.26ms`, `p95=1454.80ms`, `tool_calls=34`, `model_calls=42`, `tokens=3514`, `RAM=79.83 MB`.
+     - **Portabilidad `A12` (`lab/configs/facility_b.json`)**: `engine_loc_delta=0`, `adapter_loc_delta=0`, `adaptation_time_seconds=1.344s`, `verified_succeeded=True`.
    - **Modo `local_http` contra servidor mock OpenAI en loopback** (`python -m benchmarks.runner --mode local_http --json`):
      - `GrokbotEngine`: **`13/13` (`100.0%`)**, `model_type="local_http_mock"`, `promotion_eligible=True`, `median=1239.283ms`, `p95=1534.818ms`, `tool_calls=36`, `model_calls=44`, `tokens=3656`, `RAM=80.50 MB`, `A12 verified_succeeded=True`.
    - **Fail-closed con endpoint local inalcanzable** (`--mode local_http --llm-origin http://127.0.0.1:9 --scenarios A08,A09`):
@@ -89,13 +91,14 @@
 - **`make doctor`**: Exit `0` (`n1_ready=True`, `n2_ready=True`, `n3_status=PENDING_N3_LINUX_ENV`).
 - **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`).
 - **`make typecheck`**: Exit `0` (`Success: no issues found in 96 source files`, `mypy --strict`).
-- **`make test-n1`**: Exit `0` (**`99 passed`** en `8.36s`).
+- **`make test-n1`**: Exit `0` (**`101 passed`**).
 - **`make test-n2`**: Exit `0` (**`42 passed`**, `0` warnings).
 - **`make test-acceptance`**: Exit `0` (**`19 passed`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
-- **`make test-offline`**: Exit `0` (valida `deploy/install_config.yaml`, ejecuta **`21 passed, 21 deselected`** pruebas N1/N2 de `deploy`/loopback/egreso/fábrica + `make test-n3`, e imprime `[PENDING_N3_LINUX_ENV]`).
+- **`make test-offline`**: Exit `0` (valida `deploy/install_config.yaml`, ejecuta **`22 passed, 20 deselected`** pruebas N1/N2 de `deploy`/loopback/egreso/fábrica + `make test-n3`, e imprime `[PENDING_N3_LINUX_ENV]`).
 - **`make check`**: Exit `0` (`doctor` + `lint` + `typecheck` + `test`).
 - **`uv run pytest tests/e2e -m tier1 -v`**: Exit `0` (**`99 passed`** en `F01`–`F18`).
+- **`uv run pytest tests/e2e -m tier2 -v`**: Exit `0` (**`99 passed`** en `F01`–`F18`).
 - **Criterio Linux sin Internet (`A11`)**:
   - Verificado en N2: `validate_local_model_origin`, `ToolRegistry` y `DeployInstallConfig` bloquean orígenes externos (`https://api.openai.com`, `8.8.8.8`, redirecciones HTTP 3xx) antes de conectar; Playwright aborta subrecursos fuera de allowlist y la UI web no realiza peticiones CDN.
   - Pendiente N3 en Linux: aislamiento kernel `ip netns`/`nftables`/`iptables` e inferencia con pesos locales reales (`PENDING_N3_LINUX_ENV`; automatizado en `scripts/verify_n3_linux.sh` y documentado en `deploy/OFFLINE_RUNBOOK.md`).
@@ -127,18 +130,18 @@
 
 ## 6. Horas usadas, recursos observados y riesgo principal
 
-- **Ventana nocturna**: inicio `2026-11-25T09:07:18Z`, cierre M7-T1 `2026-11-25T12:57:00Z` (~`3.83 horas` transcurridas de un presupuesto total de `8.0 horas` hasta `17:07Z`, conservando los últimos 35 minutos reservados para integración/verificación/reporte final).
-- **Recursos observados**: Apple M1 (8 cores), `8 GB` RAM; RSS pico medido en benchmarks `~79.9–80.5 MB`; VRAM `N/A` (sin servidor LLM local ni GPU Linux en este host).
-- **Riesgo principal**: la ejecución real **N3** en Linux (bloqueo de egreso a nivel kernel `netns`/`iptables`, precisión/latencia/VRAM de un modelo cuantizado real en CPU/GPU local, y sesión AT-SPI/X11/Wayland en vivo) permanece sin validar en hardware Linux hasta disponer del entorno destino, y los Tiers 2–5 de `tests/e2e/` corresponden a las fases siguientes de M7.
+- **Ventana nocturna**: inicio `2026-11-25T09:07:18Z`, cierre M7-T2 `2026-11-25T13:41:00Z` (~`4.56 horas` transcurridas de un presupuesto total de `8.0 horas` hasta `17:07Z`, conservando los últimos 35 minutos reservados para integración/verificación/reporte final).
+- **Recursos observados**: Apple M1 (8 cores), `8 GB` RAM; RSS pico medido en benchmarks `~79.8–80.5 MB`; VRAM `N/A` (sin servidor LLM local ni GPU Linux en este host).
+- **Riesgo principal**: la ejecución real **N3** en Linux (bloqueo de egreso a nivel kernel `netns`/`iptables`, precisión/latencia/VRAM de un modelo cuantizado real en CPU/GPU local, y sesión AT-SPI/X11/Wayland en vivo) permanece sin validar en hardware Linux hasta disponer del entorno destino, y los Tiers 3–5 de `tests/e2e/` corresponden a las fases siguientes de M7.
 
 ---
 
 ## 7. Siguiente tarea ejecutable, prerrequisitos y prueba habilitante
 
-- **Siguiente tarea ejecutable inmediata (`B-M7-01`)**:
-   - **Objetivo**: Ejecutar y aprobar Tiers 2–4 de la suite `tests/e2e/` y completar el bucle adversarial de cobertura Tier 5.
-   - **Prerrequisitos**: Tier 1 E2E (`99/99`) y puertas base en `main` (`make check && make test-offline && make test-n3 && make demo && make bench` en Exit `0`).
-   - **Prueba habilitante**: `uv run pytest tests/e2e -m "not n3" -v` (Tiers 1–4 N1/N2 en `0` fallos).
+- **Siguiente tarea ejecutable inmediata (`B-M7-02`)**:
+   - **Objetivo**: Ejecutar y aprobar Tiers 3–4 de la suite `tests/e2e/` y completar el bucle adversarial de cobertura Tier 5.
+   - **Prerrequisitos**: Tier 1 (`99/99`) y Tier 2 (`99/99`) E2E y puertas base en `main` (`make check && make test-offline && make test-n3 && make demo && make bench` en Exit `0`).
+   - **Prueba habilitante**: `uv run pytest tests/e2e -m "tier3 or tier4" -v` y suite completa `uv run pytest tests/e2e -v`.
 - **Siguiente tarea en host Linux destino (`B-N3-01..04`)**:
    - **Objetivo**: Validar N3 completo en Linux sin Internet (`A11` + LLM local real + AT-SPI/X11/Wayland).
    - **Prerrequisitos**: Host Linux provisionado, wheelhouse + Chromium `1248` pre-cacheados, pesos LLM fijados y reglas `netns`/`iptables` activas.
