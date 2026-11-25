@@ -31,7 +31,10 @@
 ## P3 — Software Factory, Packaging & Final Report (M6 + M7)
 - [x] `B-M6-01`: Implement `src/factory/` (M7 autonomous local software factory with isolated DB/branch, persistent backlog lease, policy immutability guard, 1 accepted + 1 rejected asset-confusing candidate demo).
 - [x] `B-M8-01`: Implement `deploy/` declarative install config, rollback manifest, offline ops runbook, `scripts/verify_n3_linux.sh`, `make test-offline`, `make test-n3`, `README.md`, and finalize `THIRD_PARTY_NOTICES.md` + `ops/NIGHT_REPORT.md`.
-- [ ] `B-M7-01`: Run and pass parallel E2E Tracking suite Tiers 1–4 and complete Tier 5 adversarial coverage hardening (requires M6 complete and `TEST_READY.md`).
+- [x] `B-M7-01`: Run and pass E2E Tracking suite Tiers 1–4 (`230/230`) and complete Tier 5 adversarial coverage hardening (`26/26` `@pytest.mark.tier5` covering `T5-01`–`T5-21` + R1 reviewer fixes on `4845c82d`, `make check && make test-offline && make demo && make bench` verified).
+
+## P4 — Optional Capstone (`M8_CAPSTONE` — PAUSED / DEFERRED per user request `2026-11-25T21:31:15Z`)
+- [ ] `B-M8-02`: `PENDING` (paused per user instruction `2026-11-25T21:31:15Z` so M1–M7 can be tested right away; prep blueprints `c7b61f5c` & `5d5e2b7b` preserved) — Optional `M8_CAPSTONE`: `AntigravityCliModelClient`, `office_artcraft.py` (`gridcraft-cli` + `wordcraft-cli`), >=3 authenticated portals with randomized canary data, and live E2E (`tests/live/`, `make demo-office-live`); requires M7 complete and explicit user resume; next command: `make check && make demo`.
 
 ## BLOCKED_ENV (N3 — Requires Target Linux Host)
 - [ ] `B-N3-01`: Provision Linux host/VM/container runtime (`docker`/`lima`/`qemu`) on target Linux environment (requires Linux target hardware).
