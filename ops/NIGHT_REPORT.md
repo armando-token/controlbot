@@ -10,7 +10,7 @@
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas M7-T3 verificado**: `25ff3229ca1dfbcc220b25651464ba874be5d4ad` (`fix(m7-t3): harden evaluate-patch diff parsing, path normalization, symlink/forbidden checks & demo timestamp`)
+- **Commit de código y pruebas M7-T3 verificado**: `23425a08c927645a297c978806f873f55ff15338` (`fix(m7-t3): block parent, multi-hop & 120000 ancestor symlinks and handle ELOOP cleanly`)
 - **Cadena de commits de hitos en `main`**:
   - `d95e98e` — `chore(m1): initialize repo, diagnostics, frozen contracts, research & ADRs`
   - `ccadffc` — `M1: remediate mypy e2e exclusion, redaction hardening, contract invariants, and doctor checks`
@@ -27,6 +27,8 @@
   - `93b7e0c` — `fix(m7-t3): resolve crash recovery, poller loop guard, depth=1 delegation, factory/deploy/benchmark CLIs & ambiguity observations`
   - `03f681b` — `docs(night-report): update NIGHT_REPORT with M7-T3 commit SHA 93b7e0c and verification counts`
   - `25ff322` — `fix(m7-t3): harden evaluate-patch diff parsing, path normalization, symlink/forbidden checks & demo timestamp`
+  - `3030735` — `docs(night-report): update NIGHT_REPORT with M7-T3-R2 commit SHA 25ff322 and verification counts`
+  - `23425a0` — `fix(m7-t3): block parent, multi-hop & 120000 ancestor symlinks and handle ELOOP cleanly`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -95,7 +97,7 @@
 - **`make doctor`**: Exit `0` (`n1_ready=True`, `n2_ready=True`, `n3_status=PENDING_N3_LINUX_ENV`).
 - **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`).
 - **`make typecheck`**: Exit `0` (`Success: no issues found in 99 source files`, `mypy --strict`).
-- **`make test-n1`**: Exit `0` (**`118 passed`**).
+- **`make test-n1`**: Exit `0` (**`119 passed`**).
 - **`make test-n2`**: Exit `0` (**`42 passed`**, `0` warnings).
 - **`make test-acceptance`**: Exit `0` (**`19 passed`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
