@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from src.contracts.budgets import BudgetConfig
 from src.contracts.common import FrozenModel, HttpOrigin, NonEmptyStr, UtcDatetime, utc_now
@@ -81,6 +82,8 @@ class Run(FrozenModel):
             raise ValueError("Child run (depth>0) must define parent_run_id.")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not be earlier than created_at.")
+        if self.deadline_at < self.created_at:
+            raise ValueError("deadline_at must not be earlier than created_at.")
         if self.status == TaskStatus.WAITING_FOR_INPUT and self.required_action is None:
             raise ValueError("waiting_for_input run must specify required_action.")
         return self
@@ -109,6 +112,10 @@ class Step(FrozenModel):
         ):
             raise ValueError(
                 "Leased step with lease_owner must set lease_expiry and lease_generation >= 1."
+            )
+        if self.lease_owner is None and self.lease_expiry is not None:
+            raise ValueError(
+                "Unleased step with lease_owner=None must have lease_expiry=None."
             )
         return self
 
@@ -155,10 +162,19 @@ class ActionReceipt(FrozenModel):
     error_detail: str | None = None
     recorded_at: UtcDatetime = Field(default_factory=utc_now)
 
+    @field_validator("redacted_args", "observed_before", "observed_after", mode="after")
+    @classmethod
+    def _deepcopy_dict_fields(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return copy.deepcopy(value) if value is not None else None
+
     @model_validator(mode="after")
-    def _enforce_redacted_args(self) -> ActionReceipt:
-        if contains_unredacted_secret(self.redacted_args):
-            raise ValueError("ActionReceipt.redacted_args contains unredacted secret material.")
+    def _enforce_redacted_fields(self) -> ActionReceipt:
+        for field_name in ("redacted_args", "observed_before", "observed_after", "error_detail"):
+            val = getattr(self, field_name)
+            if val is not None and contains_unredacted_secret(val):
+                raise ValueError(
+                    f"ActionReceipt.{field_name} contains unredacted secret material."
+                )
         return self
 
 

@@ -304,7 +304,7 @@ def check_playwright_env(
         chromium_dirs = sorted(
             p.name
             for p in resolved_cache.iterdir()
-            if p.is_dir() and p.name.startswith("chromium-")
+            if p.is_dir() and p.name.startswith("chromium-") and any(p.iterdir())
         )
         headless_dirs = sorted(
             p.name
@@ -426,17 +426,16 @@ def run_doctor(checks: Sequence[CheckResult] | None = None) -> DoctorReport:
         ]
     )
 
-    n1_ready = all(
-        c.status != CheckStatus.FAIL
-        for c in resolved_checks
-        if c.required_for == EvidenceLevel.N1
-    )
-    n2_ready = n1_ready and all(
-        c.status != CheckStatus.FAIL
-        for c in resolved_checks
-        if c.required_for == EvidenceLevel.N2
-    )
+    n1_checks = [c for c in resolved_checks if c.required_for == EvidenceLevel.N1]
+    n2_checks = [c for c in resolved_checks if c.required_for == EvidenceLevel.N2]
     n3_checks = [c for c in resolved_checks if c.required_for == EvidenceLevel.N3]
+
+    n1_ready = bool(n1_checks) and all(c.status != CheckStatus.FAIL for c in n1_checks)
+    n2_ready = (
+        n1_ready
+        and bool(n2_checks)
+        and all(c.status != CheckStatus.FAIL for c in n2_checks)
+    )
     n3_status: Literal["PENDING_N3_LINUX_ENV", "READY"] = (
         "READY"
         if n3_checks and all(c.status == CheckStatus.PASS for c in n3_checks)

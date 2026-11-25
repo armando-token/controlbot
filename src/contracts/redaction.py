@@ -13,13 +13,18 @@ SENSITIVE_KEY_TOKENS: frozenset[str] = frozenset(
         "password",
         "passwd",
         "secret",
+        "secret_key",
         "api_key",
         "apikey",
+        "token",
         "access_token",
         "refresh_token",
         "auth_token",
+        "session_token",
+        "csrf_token",
         "authorization",
         "cookie",
+        "cookies",
         "set_cookie",
         "private_key",
         "client_secret",
@@ -32,12 +37,15 @@ _SENSITIVE_KEY_SUFFIXES: tuple[str, ...] = (
     "_password",
     "_passwd",
     "_secret",
+    "_secret_key",
     "_api_key",
     "_apikey",
+    "_token",
     "_access_token",
     "_refresh_token",
     "_auth_token",
     "_cookie",
+    "_cookies",
     "_set_cookie",
     "_private_key",
     "_client_secret",
@@ -45,17 +53,47 @@ _SENSITIVE_KEY_SUFFIXES: tuple[str, ...] = (
     "_credentials",
 )
 
-_BEARER_RE = re.compile(r"(?i)\b(Bearer)\s+(?!\[REDACTED\])(\S+)")
-_BASIC_RE = re.compile(r"(?i)\b(Basic)\s+(?!\[REDACTED\])(\S+)")
-_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@")
+_SAFE_KEY_TOKENS: frozenset[str] = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "max_total_tokens",
+        "tokens_reserved",
+        "prompt_tokens_used",
+        "completion_tokens_used",
+        "session_id",
+        "task_id",
+        "run_id",
+        "step_id",
+        "operation_key",
+    }
+)
+
+_BEARER_RE = re.compile(r"(?i)\b(Bearer)\s+(?!\[REDACTED\](?:\s|$))(\S+)")
+_BASIC_RE = re.compile(r"(?i)\b(Basic)\s+(?!\[REDACTED\](?:\s|$))(\S+)")
+_URL_USERINFO_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://)(?:([^/\s?#:@]+)(?::([^/\s?#@]*))?|:([^/\s?#@]+))@"
+)
 
 
 def is_sensitive_key(key: str) -> bool:
     """Return True if a mapping key represents secret or credential material."""
     normalized = key.strip().lower().replace("-", "_")
+    if normalized in _SAFE_KEY_TOKENS:
+        return False
     if normalized in SENSITIVE_KEY_TOKENS:
         return True
     return normalized.endswith(_SENSITIVE_KEY_SUFFIXES)
+
+
+def _is_userinfo_redacted(match: re.Match[str]) -> bool:
+    user = match.group(2)
+    pwd = match.group(3)
+    colon_only_pwd = match.group(4)
+    if colon_only_pwd is not None:
+        return colon_only_pwd == REDACTED_PLACEHOLDER
+    return user == REDACTED_PLACEHOLDER and (pwd is None or pwd == REDACTED_PLACEHOLDER)
 
 
 def redact_string(value: str) -> str:
@@ -64,14 +102,19 @@ def redact_string(value: str) -> str:
     scrubbed = _BASIC_RE.sub(rf"\1 {REDACTED_PLACEHOLDER}", scrubbed)
 
     def _mask_userinfo(match: re.Match[str]) -> str:
+        if _is_userinfo_redacted(match):
+            return match.group(0)
         scheme_prefix = match.group(1)
-        return f"{scheme_prefix}{REDACTED_PLACEHOLDER}:{REDACTED_PLACEHOLDER}@"
+        has_colon_password = match.group(3) is not None or match.group(4) is not None
+        if has_colon_password:
+            return f"{scheme_prefix}{REDACTED_PLACEHOLDER}:{REDACTED_PLACEHOLDER}@"
+        return f"{scheme_prefix}{REDACTED_PLACEHOLDER}@"
 
     return _URL_USERINFO_RE.sub(_mask_userinfo, scrubbed)
 
 
 def redact_secrets(value: Any) -> Any:
-    """Recursively deep-copy and redact secrets from dicts, lists, tuples, and strings."""
+    """Recursively deep-copy and redact secrets from dicts, lists, tuples, sets, and strings."""
     if isinstance(value, Mapping):
         redacted: dict[Any, Any] = {}
         for k, v in value.items():
@@ -84,6 +127,10 @@ def redact_secrets(value: Any) -> Any:
         return [redact_secrets(item) for item in value]
     if isinstance(value, tuple):
         return tuple(redact_secrets(item) for item in value)
+    if isinstance(value, set):
+        return {redact_secrets(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(redact_secrets(item) for item in value)
     if isinstance(value, str):
         return redact_string(value)
     return value
@@ -108,14 +155,10 @@ def contains_unredacted_secret(value: Any) -> bool:
             if contains_unredacted_secret(v):
                 return True
         return False
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, set, frozenset)):
         return any(contains_unredacted_secret(item) for item in value)
     if isinstance(value, str):
         if _BEARER_RE.search(value) or _BASIC_RE.search(value):
             return True
-        for match in _URL_USERINFO_RE.finditer(value):
-            user, pwd = match.group(2), match.group(3)
-            if user != REDACTED_PLACEHOLDER or pwd != REDACTED_PLACEHOLDER:
-                return True
-        return False
+        return any(not _is_userinfo_redacted(match) for match in _URL_USERINFO_RE.finditer(value))
     return False

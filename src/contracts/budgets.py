@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Any
+
+from pydantic import ConfigDict, Field, field_validator
 
 from src.contracts.common import FrozenModel
 
 
 class BudgetConfig(FrozenModel):
     """Execution budget defaults matching Megaplan §4.4 laboratory limits."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     max_active_children: int = Field(default=2, ge=0)
     max_depth: int = Field(default=1, ge=0)
@@ -19,9 +23,26 @@ class BudgetConfig(FrozenModel):
     max_transient_retries: int = Field(default=1, ge=0)
     human_wait_timeout_seconds: float = Field(default=300.0, gt=0.0)
 
+    @field_validator(
+        "max_active_children",
+        "max_depth",
+        "max_tool_calls",
+        "max_model_calls",
+        "max_total_tokens",
+        "max_transient_retries",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bool_for_int(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("Boolean value is not valid for integer budget field.")
+        return value
+
 
 class BudgetUsage(FrozenModel):
     """Tracked resource usage and in-flight reservations shared by root + child runs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     active_children: int = Field(default=0, ge=0)
     tool_calls_used: int = Field(default=0, ge=0)
@@ -35,6 +56,24 @@ class BudgetUsage(FrozenModel):
     tokens_reserved: int = Field(default=0, ge=0)
     transient_retries_used: int = Field(default=0, ge=0)
     usage_estimated: bool = False
+
+    @field_validator(
+        "active_children",
+        "tool_calls_used",
+        "tool_calls_reserved",
+        "model_calls_used",
+        "model_calls_reserved",
+        "prompt_tokens_used",
+        "completion_tokens_used",
+        "tokens_reserved",
+        "transient_retries_used",
+        mode="before",
+    )
+    @classmethod
+    def _reject_bool_for_int(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("Boolean value is not valid for integer usage field.")
+        return value
 
     @property
     def total_tokens_used(self) -> int:

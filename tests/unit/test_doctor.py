@@ -48,6 +48,7 @@ def test_check_sqlite_wal(tmp_path: Path) -> None:
 def test_check_playwright_env(tmp_path: Path) -> None:
     cache_dir = tmp_path / "ms-playwright"
     (cache_dir / "chromium-1248").mkdir(parents=True)
+    (cache_dir / "chromium-1248" / "chrome-bin").write_text("stub", encoding="utf-8")
     (cache_dir / "chromium_headless_shell-1248").mkdir(parents=True)
 
     passed = check_playwright_env(
@@ -62,12 +63,24 @@ def test_check_playwright_env(tmp_path: Path) -> None:
     # Missing headless shell -> WARN
     cache_warn = tmp_path / "ms-playwright-warn"
     (cache_warn / "chromium-1248").mkdir(parents=True)
+    (cache_warn / "chromium-1248" / "chrome-bin").write_text("stub", encoding="utf-8")
     warned = check_playwright_env(
         cache_dir=cache_warn,
         chrome_app_path=tmp_path / "MissingChrome.app",
         has_playwright_pkg=True,
     )
     assert warned.status == CheckStatus.WARN
+
+    # Empty chromium-* directory -> FAIL
+    empty_chromium_cache = tmp_path / "ms-playwright-empty-chromium"
+    (empty_chromium_cache / "chromium-1248").mkdir(parents=True)
+    (empty_chromium_cache / "chromium_headless_shell-1248").mkdir(parents=True)
+    failed_empty_chromium = check_playwright_env(
+        cache_dir=empty_chromium_cache,
+        chrome_app_path=tmp_path / "MissingChrome.app",
+        has_playwright_pkg=True,
+    )
+    assert failed_empty_chromium.status == CheckStatus.FAIL
 
     # Missing chromium binary -> FAIL
     empty_cache = tmp_path / "ms-playwright-empty"
@@ -171,4 +184,13 @@ def test_check_git_and_check_tooling_edge_cases(tmp_path: Path) -> None:
     missing_tools = doctor.check_tooling(which_fn=lambda _: None)
     assert missing_tools.status == CheckStatus.FAIL
     assert "uv" in missing_tools.summary and "make" in missing_tools.summary
+
+
+@pytest.mark.n1
+def test_run_doctor_empty_checks_not_ready() -> None:
+    empty_report = run_doctor(checks=[])
+    assert empty_report.n1_ready is False
+    assert empty_report.n2_ready is False
+    assert empty_report.n3_status == "PENDING_N3_LINUX_ENV"
+
 

@@ -39,6 +39,7 @@ from src.contracts import (
     contains_unredacted_secret,
     is_terminal_status,
     redact_secrets,
+    validate_http_origin,
     validate_plan_for_task,
     validate_status_transition,
 )
@@ -663,4 +664,333 @@ def test_origin_normalization_blank_strings_and_plan_task_mismatch() -> None:
     errors = validate_plan_for_task(mismatched_plan, task, tools)
     assert any("plan.task_id" in e for e in errors)
     assert any("not in tool 'scada.read_alarms'.allowed_origins" in e for e in errors)
+
+
+@pytest.mark.n1
+def test_redaction_hardening_regression() -> None:
+    # Token-only URL userinfo and already-redacted URL userinfo
+    token_url = {"url": "https://ghp_superSecretToken123@scada.local/login"}
+    assert contains_unredacted_secret(token_url) is True
+    redacted_token_url = redact_secrets(token_url)
+    assert redacted_token_url == {"url": f"https://{REDACTED_PLACEHOLDER}@scada.local/login"}
+    assert contains_unredacted_secret(redacted_token_url) is False
+    assert contains_unredacted_secret("https://[REDACTED]extra@scada.local/login") is True
+
+    # Bearer / Basic partial-[REDACTED] prefix bypasses
+    for leaked in ("Bearer [REDACTED]leaked_suffix", "Basic [REDACTED]leaked_suffix"):
+        assert contains_unredacted_secret(leaked) is True
+        redacted_hdr = redact_secrets(leaked)
+        assert redacted_hdr.endswith(f" {REDACTED_PLACEHOLDER}")
+        assert contains_unredacted_secret(redacted_hdr) is False
+    assert contains_unredacted_secret("Bearer [REDACTED]") is False
+    assert contains_unredacted_secret("Basic [REDACTED] trailing") is False
+
+    # set and frozenset containers
+    set_payload: dict[str, Any] = {
+        "headers": {"Bearer secret_inside_set", "Accept: application/json"},
+        "frozen": frozenset({"Basic c2VjcmV0", "ok"}),
+    }
+    assert contains_unredacted_secret(set_payload) is True
+    redacted_sets = redact_secrets(set_payload)
+    assert isinstance(redacted_sets["headers"], set)
+    assert isinstance(redacted_sets["frozen"], frozenset)
+    assert f"Bearer {REDACTED_PLACEHOLDER}" in redacted_sets["headers"]
+    assert f"Basic {REDACTED_PLACEHOLDER}" in redacted_sets["frozen"]
+    assert contains_unredacted_secret(redacted_sets) is False
+
+    # Expanded sensitive keys and safe telemetry/ID allowlist
+    secret_keys_payload = {
+        "token": "jwt.secret",
+        "session_token": "sess-sec",
+        "csrf_token": "csrf-sec",
+        "cookies": "sid=abc",
+        "secret_key": "sk-1",
+        "app_secret_key": "sk-2",
+        "custom_secret": "s-3",
+        "custom_token": "t-4",
+    }
+    assert contains_unredacted_secret(secret_keys_payload) is True
+    redacted_keys = redact_secrets(secret_keys_payload)
+    assert all(v == REDACTED_PLACEHOLDER for v in redacted_keys.values())
+    assert contains_unredacted_secret(redacted_keys) is False
+
+    safe_keys_payload = {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+        "max_total_tokens": 24000,
+        "tokens_reserved": 500,
+        "prompt_tokens_used": 100,
+        "completion_tokens_used": 50,
+        "session_id": "sess-1",
+        "task_id": "task-1",
+        "run_id": "run-1",
+        "step_id": "step-1",
+        "operation_key": "op-1",
+    }
+    assert contains_unredacted_secret(safe_keys_payload) is False
+    assert redact_secrets(safe_keys_payload) == safe_keys_payload
+
+
+@pytest.mark.n1
+def test_action_receipt_aliasing_and_all_secret_fields() -> None:
+    shared_args: dict[str, Any] = {"asset": "bomba 34", "nested": {"k": "v"}}
+    shared_before: dict[str, Any] = {"state": "idle"}
+    shared_after: dict[str, Any] = {"state": "running"}
+
+    receipt = ActionReceipt(
+        receipt_id="rcpt-alias",
+        task_id="t1",
+        run_id="r1",
+        step_id="s1",
+        attempt=1,
+        tool_id="scada.read_alarms",
+        redacted_args=shared_args,
+        operation_key="op-1",
+        observed_before=shared_before,
+        observed_after=shared_after,
+        duration_ms=2.0,
+        outcome=ReceiptOutcome.SUCCEEDED,
+        error_detail=f"Authorization: Bearer {REDACTED_PLACEHOLDER}",
+    )
+
+    # Mutating caller dicts after construction must not mutate receipt
+    shared_args["password"] = "LEAKED"
+    shared_args["nested"]["token"] = "LEAKED"
+    shared_before["cookie"] = "LEAKED"
+    shared_after["secret"] = "LEAKED"
+    assert "password" not in receipt.redacted_args
+    assert "token" not in receipt.redacted_args["nested"]
+    assert receipt.observed_before == {"state": "idle"}
+    assert receipt.observed_after == {"state": "running"}
+
+    # Unredacted secrets rejected in observed_before, observed_after, and error_detail
+    with pytest.raises(ValidationError):
+        ActionReceipt(
+            receipt_id="rcpt-b",
+            task_id="t1",
+            run_id="r1",
+            step_id="s1",
+            attempt=1,
+            tool_id="scada.read_alarms",
+            redacted_args={"asset": "bomba 34"},
+            operation_key="op-1",
+            observed_before={"cookie": "raw_cookie"},
+            duration_ms=1.0,
+            outcome=ReceiptOutcome.SUCCEEDED,
+        )
+    with pytest.raises(ValidationError):
+        ActionReceipt(
+            receipt_id="rcpt-a",
+            task_id="t1",
+            run_id="r1",
+            step_id="s1",
+            attempt=1,
+            tool_id="scada.read_alarms",
+            redacted_args={"asset": "bomba 34"},
+            operation_key="op-1",
+            observed_after={"url": "https://ghp_secret@scada.local"},
+            duration_ms=1.0,
+            outcome=ReceiptOutcome.SUCCEEDED,
+        )
+    with pytest.raises(ValidationError):
+        ActionReceipt(
+            receipt_id="rcpt-e",
+            task_id="t1",
+            run_id="r1",
+            step_id="s1",
+            attempt=1,
+            tool_id="scada.read_alarms",
+            redacted_args={"asset": "bomba 34"},
+            operation_key="op-1",
+            duration_ms=1.0,
+            outcome=ReceiptOutcome.FAILED_PERMISSION,
+            error_detail="401 with Bearer raw_secret_token",
+        )
+
+
+@pytest.mark.n1
+def test_origin_case_ipv6_ports_and_fragment_query_rejection() -> None:
+    assert validate_http_origin("HTTP://LOCALHOST:8001/") == "http://localhost:8001"
+    assert validate_http_origin("https://SCADA.Local") == "https://scada.local"
+    assert validate_http_origin("http://[2001:DB8::1]:8080/") == "http://[2001:db8::1]:8080"
+    assert validate_http_origin("http://[::1]/") == "http://[::1]"
+
+    for invalid_origin in (
+        "http://127.0.0.1:notaport",
+        "http://127.0.0.1:99999",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:",
+        "http://127.0.0.1:8001#",
+        "http://127.0.0.1:8001?",
+        "http://127.0.0.1:8001/#",
+    ):
+        with pytest.raises(ValueError):
+            validate_http_origin(invalid_origin)
+
+
+@pytest.mark.n1
+def test_run_deadline_step_orphan_lease_and_budget_bool_inf() -> None:
+    now = datetime(2026, 11, 25, 9, 0, tzinfo=UTC)
+    with pytest.raises(ValidationError):
+        Run(
+            run_id="r-bad-deadline",
+            task_id="t1",
+            deadline_at=now - timedelta(seconds=1),
+            created_at=now,
+            updated_at=now,
+        )
+
+    with pytest.raises(ValidationError):
+        Step(
+            step_id="s-orphan-expiry",
+            run_id="r1",
+            step_index=0,
+            tool_id="scada.read_alarms",
+            operation_key="op-1",
+            lease_owner=None,
+            lease_expiry=now + timedelta(seconds=30),
+            lease_generation=1,
+            completion_verifier="verify_scada_alarms",
+        )
+
+    with pytest.raises(ValidationError):
+        BudgetConfig(max_tool_calls=True)
+    with pytest.raises(ValidationError):
+        BudgetConfig(max_wall_seconds=float("inf"))
+    with pytest.raises(ValidationError):
+        BudgetConfig(max_wall_seconds=float("nan"))
+    with pytest.raises(ValidationError):
+        BudgetUsage(tool_calls_used=False)
+    with pytest.raises(ValidationError):
+        BudgetUsage(wall_seconds_elapsed=float("inf"))
+
+
+@pytest.mark.n1
+def test_planning_fail_closed_origins_and_effect_class_mismatch() -> None:
+    tools = _make_tool_specs()
+    local_tool = ToolSpec(
+        tool_id="local.inspect",
+        version="1.0.0",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        allowed_origins=(),
+        effect_class=EffectClass.READ,
+        verifier_name="verify_local",
+    )
+    all_tools = {**tools, "local.inspect": local_tool}
+
+    # Empty TaskScope.allowed_origins=() must fail-closed on target_origin and origin tools
+    empty_origin_task = _make_task_spec(
+        scope=TaskScope(
+            facility_id="fac-a",
+            allowed_origins=(),
+            allowed_tools=("local.inspect", "scada.read_alarms"),
+            read_only=True,
+        )
+    )
+    # Local tool without origin passes when target_origin is None
+    local_ok_plan = ExecutionPlan(
+        plan_id="p-local-ok",
+        task_id=empty_origin_task.task_id,
+        steps=(
+            PlanStep(
+                step_index=0,
+                tool_id="local.inspect",
+                completion_verifier="verify_local",
+                target_origin=None,
+            ),
+        ),
+    )
+    assert validate_plan_for_task(local_ok_plan, empty_origin_task, all_tools) == []
+
+    # Local tool with explicit target_origin fails-closed against empty allowed_origins
+    local_evil_origin_plan = ExecutionPlan(
+        plan_id="p-local-evil",
+        task_id=empty_origin_task.task_id,
+        steps=(
+            PlanStep(
+                step_index=0,
+                tool_id="local.inspect",
+                completion_verifier="verify_local",
+                target_origin="http://evil.example.com",
+            ),
+        ),
+    )
+    evil_errs = validate_plan_for_task(local_evil_origin_plan, empty_origin_task, all_tools)
+    assert any("not in scope.allowed_origins" in e for e in evil_errs)
+
+    # Origin-restricted tool with target_origin=None fails empty scope and missing origin
+    missing_origin_plan = ExecutionPlan(
+        plan_id="p-missing-origin",
+        task_id=empty_origin_task.task_id,
+        steps=(
+            PlanStep(
+                step_index=0,
+                tool_id="scada.read_alarms",
+                completion_verifier="verify_scada_alarms",
+                target_origin=None,
+            ),
+        ),
+    )
+    missing_errs = validate_plan_for_task(missing_origin_plan, empty_origin_task, all_tools)
+    assert any("scope.allowed_origins is empty" in e for e in missing_errs)
+    assert any("target_origin is required" in e for e in missing_errs)
+
+    # Disjoint scope.allowed_origins vs tool.allowed_origins, plus target_origin=None
+    disjoint_task = _make_task_spec(
+        scope=TaskScope(
+            facility_id="fac-a",
+            allowed_origins=("http://127.0.0.1:8102",),
+            allowed_tools=("scada.read_alarms",),
+            read_only=True,
+        )
+    )
+    disjoint_errs = validate_plan_for_task(
+        ExecutionPlan(
+            plan_id="p-disjoint",
+            task_id=disjoint_task.task_id,
+            steps=(
+                PlanStep(
+                    step_index=0,
+                    tool_id="scada.read_alarms",
+                    completion_verifier="verify_scada_alarms",
+                    target_origin=None,
+                ),
+            ),
+        ),
+        disjoint_task,
+        all_tools,
+    )
+    assert any("no overlap with scope.allowed_origins" in e for e in disjoint_errs)
+    assert any("target_origin is required" in e for e in disjoint_errs)
+
+    # step.effect_class != tool_spec.effect_class rejected even when read_only=False
+    rw_task = _make_task_spec(
+        scope=TaskScope(
+            facility_id="fac-a",
+            allowed_origins=("http://127.0.0.1:8103",),
+            allowed_tools=("effect.apply",),
+            read_only=False,
+        )
+    )
+    mismatch_effect_errs = validate_plan_for_task(
+        ExecutionPlan(
+            plan_id="p-effect-mismatch",
+            task_id=rw_task.task_id,
+            steps=(
+                PlanStep(
+                    step_index=0,
+                    tool_id="effect.apply",
+                    completion_verifier="verify_effect_applied",
+                    target_origin="http://127.0.0.1:8103",
+                    effect_class=EffectClass.READ,
+                ),
+            ),
+        ),
+        rw_task,
+        all_tools,
+    )
+    assert any("effect_class" in e for e in mismatch_effect_errs)
+
 

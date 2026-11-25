@@ -77,6 +77,12 @@ def validate_plan_for_task(
                 f"step[{step.step_index}]: tool_id {step.tool_id!r} not in scope.allowed_tools"
             )
 
+        if step.effect_class != tool_spec.effect_class:
+            errors.append(
+                f"step[{step.step_index}]: effect_class {step.effect_class.value!r} "
+                f"!= tool {step.tool_id!r} effect_class {tool_spec.effect_class.value!r}"
+            )
+
         if task.scope.read_only and (
             step.effect_class == EffectClass.EFFECT
             or tool_spec.effect_class == EffectClass.EFFECT
@@ -86,11 +92,25 @@ def validate_plan_for_task(
                 "scope.read_only=True"
             )
 
+        if tool_spec.allowed_origins:
+            if not task.scope.allowed_origins:
+                errors.append(
+                    f"step[{step.step_index}]: tool {step.tool_id!r} requires allowed_origins, "
+                    "but scope.allowed_origins is empty"
+                )
+            elif not (set(tool_spec.allowed_origins) & set(task.scope.allowed_origins)):
+                errors.append(
+                    f"step[{step.step_index}]: tool {step.tool_id!r}.allowed_origins has no "
+                    "overlap with scope.allowed_origins"
+                )
+            if step.target_origin is None:
+                errors.append(
+                    f"step[{step.step_index}]: target_origin is required for "
+                    f"origin-restricted tool {step.tool_id!r}"
+                )
+
         if step.target_origin is not None:
-            if (
-                task.scope.allowed_origins
-                and step.target_origin not in task.scope.allowed_origins
-            ):
+            if step.target_origin not in task.scope.allowed_origins:
                 errors.append(
                     f"step[{step.step_index}]: target_origin {step.target_origin!r} "
                     "not in scope.allowed_origins"
