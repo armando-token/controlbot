@@ -274,6 +274,9 @@ class FactoryEngine:
                     ["commit", "-m", f"factory({candidate.candidate_id}): {candidate.hypothesis}"],
                 )
             candidate_commit = _run_git(self._repo_path, ["rev-parse", "HEAD"])
+            diff_text = _run_git(
+                self._repo_path, ["diff", f"{base_commit}..{candidate_commit}"]
+            )[:16384]
 
             # Independent PolicyGuard audit before any regression or promotion
             try:
@@ -320,6 +323,9 @@ class FactoryEngine:
                     lesson=lesson,
                     wall_seconds_delta=elapsed,
                     budget_id=self._budget_id,
+                    hypothesis=candidate.hypothesis,
+                    diff=diff_text,
+                    auditor_signoff="rejected",
                 )
                 raise
 
@@ -419,6 +425,9 @@ class FactoryEngine:
                     manifest=manifest,
                     wall_seconds_delta=elapsed,
                     budget_id=self._budget_id,
+                    hypothesis=candidate.hypothesis,
+                    diff=diff_text,
+                    auditor_signoff="approved",
                 )
                 return FactoryCycleResult(
                     status=FactoryStatus.PROMOTED,
@@ -491,6 +500,9 @@ class FactoryEngine:
                 lesson=lesson,
                 wall_seconds_delta=elapsed,
                 budget_id=self._budget_id,
+                hypothesis=candidate.hypothesis,
+                diff=diff_text,
+                auditor_signoff="rejected",
             )
             return FactoryCycleResult(
                 status=FactoryStatus.REJECTED,

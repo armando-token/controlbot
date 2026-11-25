@@ -297,3 +297,56 @@ def test_deploy_templates_runbook_and_verify_n3_script_honesty() -> None:
     assert "PENDING_N3_LINUX_ENV" in script_text
     if os.name == "posix":
         assert os.access(script_path, os.X_OK)
+
+
+@pytest.mark.n1
+def test_deploy_config_human_output_install_and_manifest_fields(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import sqlite3
+
+    from deploy.install import main as deploy_install_main
+
+    rc = deploy_config_main(["--config", str(_REPO_ROOT / "deploy" / "install_config.yaml")])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "local_http" in out
+    assert "1.0.0" in out
+    assert "http://127.0.0.1:8101" in out
+
+    db_path = tmp_path / "prod_wal.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("CREATE TABLE sentinel (id INTEGER PRIMARY KEY, note TEXT);")
+    conn.execute("INSERT INTO sentinel (note) VALUES ('intact');")
+    conn.commit()
+    conn.close()
+
+    stage = tmp_path / "stage"
+    inst_rc = deploy_install_main(
+        [
+            "--config",
+            "deploy/install_config.yaml",
+            "--db",
+            str(db_path),
+            "--target",
+            str(stage),
+            "--manifest-dir",
+            str(stage),
+            "--json",
+        ]
+    )
+    assert inst_rc == 0
+    manifest_data = json.loads((stage / "release_manifest.json").read_text(encoding="utf-8"))
+    assert manifest_data["uv_lock_hash"]
+    assert manifest_data["config_hash"]
+    assert manifest_data["restore_command"]
+    assert str(db_path) in manifest_data["state_preserve_paths"]
+
+    check_conn = sqlite3.connect(db_path)
+    try:
+        rows = check_conn.execute("SELECT note FROM sentinel;").fetchall()
+        assert rows == [("intact",)]
+    finally:
+        check_conn.close()

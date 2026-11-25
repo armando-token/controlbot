@@ -406,3 +406,129 @@ def test_factory_rollback_missing_or_corrupt_manifest_clean_error(
     assert "Traceback" not in proc.stderr
     assert json.dumps({"ok": True}) not in proc.stdout
     assert callable(rollback_from_manifest)
+
+
+@pytest.mark.n1
+def test_factory_migration_resume_and_audit_log_completeness(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_factory.db"
+    # Pre-populate a legacy factory DB without attempt_count / budget_used columns
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute(
+        """
+        CREATE TABLE factory_backlog (
+            item_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            hypothesis TEXT NOT NULL,
+            target_metric TEXT NOT NULL,
+            baseline_repro_cmd TEXT NOT NULL,
+            max_attempts INTEGER NOT NULL,
+            attempts_used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE factory_budgets (
+            budget_id TEXT PRIMARY KEY,
+            max_cycles INTEGER NOT NULL,
+            cycles_used INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL,
+            attempts_used INTEGER NOT NULL DEFAULT 0,
+            max_wall_seconds REAL NOT NULL,
+            wall_seconds_used REAL NOT NULL DEFAULT 0.0,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO factory_backlog (
+            item_id, title, priority, status, hypothesis, target_metric,
+            baseline_repro_cmd, max_attempts, attempts_used, created_at, updated_at
+        ) VALUES (
+            'B-LEG', 'Legacy', 1, 'pending', 'Speed up', 'steps',
+            'pytest -q', 3, 1, '2026-11-25T12:00:00+00:00', '2026-11-25T12:00:00+00:00'
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO factory_budgets (
+            budget_id, max_cycles, cycles_used, max_attempts, attempts_used,
+            max_wall_seconds, wall_seconds_used, updated_at
+        ) VALUES ('default', 4, 1, 3, 1, 120.0, 1.0, '2026-11-25T12:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    lab_repo = tmp_path / "lab_repo"
+    _init_git_repo(lab_repo)
+    store = FactoryStore(db_path)
+    engine = FactoryEngine(lab_repo, store)
+
+    # Verify migration backfilled attempt_count and budget_used
+    migrated = open_factory_connection(db_path)
+    try:
+        b_row = migrated.execute(
+            "SELECT attempts_used, attempt_count FROM factory_backlog WHERE item_id = 'B-LEG';"
+        ).fetchone()
+        assert int(b_row["attempts_used"]) == 1
+        assert int(b_row["attempt_count"]) == 1
+        g_row = migrated.execute(
+            "SELECT attempts_used, attempt_count, budget_used FROM factory_budgets "
+            "WHERE budget_id = 'default';"
+        ).fetchone()
+        assert int(g_row["attempt_count"]) == 1
+        assert int(g_row["budget_used"]) == 1
+    finally:
+        migrated.close()
+
+    files = {"app.py": "def compute_steps() -> int:\n    return 5\n"}
+    cand = CandidatePatch(
+        candidate_id="cand-mig-1",
+        item_id="B-LEG",
+        branch_name="factory/cand-mig-1",
+        hypothesis="Return 5 steps instead of 50",
+        target_metric="steps",
+        proposal_hash=compute_proposal_hash(
+            item_id="B-LEG",
+            target_metric="steps",
+            files_to_modify=files,
+        ),
+        files_to_modify=files,
+    )
+    def _eval_repo(repo_dir: Path) -> EvalResult:
+        txt = (repo_dir / "app.py").read_text(encoding="utf-8")
+        metric = 5.0 if "return 50" not in txt and "return 5" in txt else 50.0
+        return EvalResult(passed=True, metric=metric)
+
+    res = engine.run_candidate_cycle(cand, evaluator=_eval_repo)
+    assert res.status == FactoryStatus.PROMOTED, res.reason
+
+    audit_conn = open_factory_connection(db_path)
+    try:
+        audit_row = audit_conn.execute(
+            "SELECT detail_json FROM factory_audit_log ORDER BY created_at DESC LIMIT 1;"
+        ).fetchone()
+        assert audit_row is not None
+        detail = json.loads(str(audit_row["detail_json"]))
+        assert detail["hypothesis"] == "Return 5 steps instead of 50"
+        assert detail["baseline_metric"] is not None
+        assert detail["candidate_metric"] == 5.0
+        assert "return 5" in detail["diff"]
+        assert detail["base_commit"]
+        assert detail["candidate_commit"]
+        assert detail["auditor_signoff"] == "approved"
+    finally:
+        audit_conn.close()
+
+    # Resume CLI preserves counters without resetting or crashing
+    rc = factory_cli_main(["resume", "--db", str(db_path), "--repo", str(lab_repo), "--json"])
+    assert rc == 0
+    assert store.get_budget().attempts_used == 2

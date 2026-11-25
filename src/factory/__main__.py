@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from src.factory.db import FactoryStore
 from src.factory.demo import run_factory_demo
@@ -84,6 +85,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--db", required=True, help="Path to isolated factory SQLite DB.")
     p_status.add_argument("--json", action="store_true", help="Emit JSON output.")
 
+    p_resume = sub.add_parser(
+        "resume",
+        help="Resume or inspect persisted factory state without resetting counters.",
+    )
+    p_resume.add_argument("--db", required=True, help="Path to isolated factory SQLite DB.")
+    p_resume.add_argument("--repo", default=None, help="Optional isolated lab git repo path.")
+    p_resume.add_argument("--output-dir", default=None, help="Optional artifact directory.")
+    p_resume.add_argument("--max-steps", type=int, default=None, help="Optional max step limit.")
+    p_resume.add_argument("--json", action="store_true", help="Emit JSON output.")
+
     return parser
 
 
@@ -122,6 +133,29 @@ def main(argv: list[str] | None = None) -> int:
                 "lessons": [lesson.model_dump(mode="json") for lesson in store.list_lessons()],
             }
             print(json.dumps(payload, indent=2, default=str))
+            return 0
+
+        if args.command == "resume":
+            store = FactoryStore(args.db)
+            store.init_db()
+            budget = store.get_budget()
+            backlog = store.list_backlog_items()
+            lessons = store.list_lessons()
+            exhausted = (
+                budget.cycles_used >= budget.max_cycles
+                or budget.attempts_used >= budget.max_attempts
+            )
+            resume_payload: dict[str, Any] = {
+                "ok": True,
+                "status": "paused_budget_exhausted" if exhausted else "resumed",
+                "repo": str(args.repo) if args.repo else None,
+                "output_dir": str(args.output_dir) if args.output_dir else None,
+                "max_steps": args.max_steps,
+                "budget": budget.model_dump(mode="json"),
+                "backlog": [item.model_dump(mode="json") for item in backlog],
+                "lessons": [lesson.model_dump(mode="json") for lesson in lessons],
+            }
+            print(json.dumps(resume_payload, indent=2, default=str))
             return 0
 
         if args.command == "audit-branch":

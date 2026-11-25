@@ -30,3 +30,9 @@ logs/
 .DS_Store
 .agents/
 tmp/
+
+# Generated runtime reports / manifests / acceptance evidence
+benchmarks/benchmark_report.json
+benchmarks/benchmark_report.md
+tests/acceptance/acceptance_evidence.jsonl
+deploy/release_manifest.json

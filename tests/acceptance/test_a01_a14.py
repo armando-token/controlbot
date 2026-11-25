@@ -776,19 +776,6 @@ async def test_a11_local_loopback_egress_blocking_and_n3_honesty(tmp_path: Path)
 
 
 @pytest.mark.acceptance
-@pytest.mark.n3
-@pytest.mark.skipif(
-    platform.system() != "Linux",
-    reason="PENDING_N3_LINUX_ENV: Linux kernel netns/iptables and local LLM required.",
-)
-def test_a11_linux_kernel_netns_and_local_llm_n3() -> None:
-    report = run_n3_probe()
-    assert report.linux_os_ready is True
-    assert report.network_isolation_ready is True
-    assert report.overall_status == "READY"
-
-
-@pytest.mark.acceptance
 @pytest.mark.n2
 async def test_a12_reordered_columns_and_alias_with_zero_adapter_edits(tmp_path: Path) -> None:
     # M4 baseline A12 hook; M5 extends this with lab/configs/facility_b.json Area-2 portability.

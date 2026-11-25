@@ -23,6 +23,7 @@ from src.factory.models import (
     LessonRecord,
     RollbackManifest,
 )
+from src.storage.redaction import redact_payload_strict
 
 _RUNTIME_TABLES: frozenset[str] = frozenset({"tasks", "runs", "steps", "action_receipts"})
 _FORBIDDEN_DIR_MARKERS: tuple[str, ...] = (".grokbot_profiles", "browser_profiles")
@@ -170,6 +171,7 @@ class FactoryStore:
                     baseline_repro_cmd TEXT NOT NULL,
                     max_attempts INTEGER NOT NULL,
                     attempts_used INTEGER NOT NULL DEFAULT 0,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -197,6 +199,8 @@ class FactoryStore:
                     cycles_used INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL,
                     attempts_used INTEGER NOT NULL DEFAULT 0,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    budget_used INTEGER NOT NULL DEFAULT 0,
                     max_wall_seconds REAL NOT NULL,
                     wall_seconds_used REAL NOT NULL DEFAULT 0.0,
                     updated_at TEXT NOT NULL
@@ -267,6 +271,32 @@ class FactoryStore:
                 );
                 """
             )
+            backlog_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(factory_backlog);").fetchall()
+            }
+            if "attempt_count" not in backlog_cols:
+                conn.execute(
+                    "ALTER TABLE factory_backlog "
+                    "ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;"
+                )
+                conn.execute("UPDATE factory_backlog SET attempt_count = attempts_used;")
+
+            budget_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(factory_budgets);").fetchall()
+            }
+            if "attempt_count" not in budget_cols:
+                conn.execute(
+                    "ALTER TABLE factory_budgets "
+                    "ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;"
+                )
+                conn.execute("UPDATE factory_budgets SET attempt_count = attempts_used;")
+            if "budget_used" not in budget_cols:
+                conn.execute(
+                    "ALTER TABLE factory_budgets ADD COLUMN budget_used INTEGER NOT NULL DEFAULT 0;"
+                )
+                conn.execute("UPDATE factory_budgets SET budget_used = attempts_used;")
 
         if os.name == "posix" and self._db_path.exists():
             os.chmod(self._db_path, 0o600)
@@ -278,8 +308,9 @@ class FactoryStore:
                 """
                 INSERT INTO factory_backlog (
                     item_id, title, priority, status, hypothesis, target_metric,
-                    baseline_repro_cmd, max_attempts, attempts_used, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    baseline_repro_cmd, max_attempts, attempts_used, attempt_count,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_id) DO UPDATE SET
                     title=excluded.title,
                     priority=excluded.priority,
@@ -298,6 +329,7 @@ class FactoryStore:
                     item.target_metric,
                     item.baseline_repro_cmd,
                     item.max_attempts,
+                    item.attempts_used,
                     item.attempts_used,
                     ensure_utc(item.created_at).isoformat(),
                     now,
@@ -359,14 +391,16 @@ class FactoryStore:
                     """
                     INSERT INTO factory_budgets (
                         budget_id, max_cycles, cycles_used, max_attempts, attempts_used,
-                        max_wall_seconds, wall_seconds_used, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                        attempt_count, budget_used, max_wall_seconds, wall_seconds_used, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         target.budget_id,
                         target.max_cycles,
                         target.cycles_used,
                         target.max_attempts,
+                        target.attempts_used,
+                        target.attempts_used,
                         target.attempts_used,
                         target.max_wall_seconds,
                         target.wall_seconds_used,
@@ -556,6 +590,9 @@ class FactoryStore:
         manifest: RollbackManifest | None = None,
         wall_seconds_delta: float = 0.0,
         budget_id: str = "default",
+        hypothesis: str | None = None,
+        diff: str | None = None,
+        auditor_signoff: str | None = None,
     ) -> None:
         """Atomically fence lease generation, increment budgets/attempts, and persist records."""
         now_dt = ensure_utc(self._clock())
@@ -600,10 +637,10 @@ class FactoryStore:
             conn.execute(
                 """
                 UPDATE factory_backlog
-                SET attempts_used = ?, status = ?, updated_at = ?
+                SET attempts_used = ?, attempt_count = ?, status = ?, updated_at = ?
                 WHERE item_id = ?;
                 """,
-                (new_item_attempts, new_item_status, now_iso, record.item_id),
+                (new_item_attempts, new_item_attempts, new_item_status, now_iso, record.item_id),
             )
 
             budget_row = conn.execute(
@@ -615,8 +652,8 @@ class FactoryStore:
                     """
                     INSERT INTO factory_budgets (
                         budget_id, max_cycles, cycles_used, max_attempts, attempts_used,
-                        max_wall_seconds, wall_seconds_used, updated_at
-                    ) VALUES (?, 4, 1, 2, 1, 300.0, ?, ?);
+                        attempt_count, budget_used, max_wall_seconds, wall_seconds_used, updated_at
+                    ) VALUES (?, 4, 1, 2, 1, 1, 1, 300.0, ?, ?);
                     """,
                     (budget_id, max(0.0, wall_seconds_delta), now_iso),
                 )
@@ -626,6 +663,8 @@ class FactoryStore:
                     UPDATE factory_budgets
                     SET cycles_used = cycles_used + 1,
                         attempts_used = attempts_used + 1,
+                        attempt_count = attempts_used + 1,
+                        budget_used = attempts_used + 1,
                         wall_seconds_used = wall_seconds_used + ?,
                         updated_at = ?
                     WHERE budget_id = ?;
@@ -706,6 +745,24 @@ class FactoryStore:
                 "UPDATE factory_leases SET status = 'released', updated_at = ? WHERE lease_id = ?;",
                 (now_iso, lease.lease_id),
             )
+            audit_detail = redact_payload_strict(
+                {
+                    "candidate_id": record.candidate_id,
+                    "item_id": record.item_id,
+                    "branch": record.branch_name,
+                    "hypothesis": hypothesis or "",
+                    "baseline_metric": record.baseline_metric,
+                    "candidate_metric": record.candidate_metric,
+                    "diff": diff or "",
+                    "base_commit": record.base_commit,
+                    "candidate_commit": record.candidate_commit,
+                    "auditor_signoff": (
+                        auditor_signoff
+                        or ("approved" if record.status == "PROMOTED" else "rejected")
+                    ),
+                    "reason": record.reason,
+                }
+            )
             conn.execute(
                 """
                 INSERT INTO factory_audit_log (
@@ -717,14 +774,7 @@ class FactoryStore:
                     lease.owner,
                     f"candidate_{record.status.lower()}",
                     "allow" if record.status == "PROMOTED" else "deny",
-                    json.dumps(
-                        {
-                            "candidate_id": record.candidate_id,
-                            "item_id": record.item_id,
-                            "branch": record.branch_name,
-                            "reason": record.reason,
-                        }
-                    ),
+                    json.dumps(audit_detail),
                     now_iso,
                 ),
             )

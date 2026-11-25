@@ -51,6 +51,9 @@ class ReleaseManifest(FrozenModel):
     created_at: UtcDatetime
     install_config_path: NonEmptyStr
     install_config_sha256: NonEmptyStr
+    config_hash: NonEmptyStr
+    uv_lock_hash: NonEmptyStr
+    restore_command: NonEmptyStr
     facility_config_path: NonEmptyStr
     facility_config_sha256: NonEmptyStr
     previous_release_id: str | None = None
@@ -101,6 +104,8 @@ def _collect_artifact_files(
                 if not child.is_file():
                     continue
                 if "__pycache__" in child.parts or child.suffix == ".pyc":
+                    continue
+                if child.name == "release_manifest.json" and child.parent.name == "deploy":
                     continue
                 collected.add(child.resolve())
 
@@ -207,13 +212,26 @@ def create_release_manifest(
     except ValueError:
         rel_facility = str(facility_path)
 
+    uv_lock_path = resolved_root / "uv.lock"
+    if not uv_lock_path.exists():
+        raise ManifestError(f"uv.lock not found for manifest: {uv_lock_path}")
+    uv_lock_hash = compute_sha256(uv_lock_path)
+    install_cfg_hash = compute_sha256(resolved_install)
+    restore_cmd = (
+        "uv run python -m deploy.rollback "
+        f"--manifest deploy/release_manifest.json --root-dir {resolved_root}"
+    )
+
     return ReleaseManifest(
         release_id=eff_release_id,
         version=version,
         git_commit=commit,
         created_at=now,
         install_config_path=rel_install,
-        install_config_sha256=compute_sha256(resolved_install),
+        install_config_sha256=install_cfg_hash,
+        config_hash=install_cfg_hash,
+        uv_lock_hash=uv_lock_hash,
+        restore_command=restore_cmd,
         facility_config_path=rel_facility,
         facility_config_sha256=compute_sha256(facility_path),
         previous_release_id=prev_id,
@@ -292,8 +310,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output",
-        required=True,
-        help="Output path for generated release manifest JSON.",
+        default="deploy/release_manifest.json",
+        help=(
+            "Output path for generated release manifest JSON "
+            "(default: deploy/release_manifest.json)."
+        ),
     )
     parser.add_argument(
         "--root-dir",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -161,6 +162,53 @@ def _scrub_and_verify(payload: Any, *, label: str = "payload") -> Any:
     if contains_unredacted_secret_strict(scrubbed):
         raise ValueError(f"{label} serialization failed redaction check.")
     return scrubbed
+
+
+def _is_truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pad_redacted_auth_markers(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _pad_redacted_auth_markers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_pad_redacted_auth_markers(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(
+            r"(?i)\b(Bearer|Basic)\s+\[REDACTED\](?=$|[^ \t\r\n])",
+            r"\1 [REDACTED] ",
+            value,
+        )
+    return value
+
+
+def _maybe_write_trace_from_payload(run_id: str, payload: dict[str, Any]) -> None:
+    if not _is_truthy_env("GROKBOT_TRACING_ENABLED"):
+        return
+    raw_dir = os.environ.get("GROKBOT_TRACE_DIR", "").strip()
+    if not raw_dir:
+        return
+    trace_dir = Path(raw_dir)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    deploy_cfg = os.environ.get("GROKBOT_DEPLOY_CONFIG", "").strip() or None
+    trace_doc = _pad_redacted_auth_markers(
+        _scrub_and_verify(
+            {
+                "run_id": run_id,
+                "tracing_enabled": True,
+                "deploy_config": deploy_cfg,
+                **payload,
+            },
+            label="Trace",
+        )
+    )
+    json_text = json.dumps(trace_doc, indent=2) + "\n"
+    if contains_unredacted_secret_strict(json_text):
+        raise ValueError("Serialized trace failed redaction check.")
+    trace_path = trace_dir / f"trace_{run_id}.json"
+    tmp_path = trace_dir / f".tmp_trace_{run_id}.json"
+    tmp_path.write_text(json_text, encoding="utf-8")
+    os.replace(tmp_path, trace_path)
 
 
 def _serialize_redacted_receipt(receipt: ActionReceipt) -> dict[str, Any]:
@@ -450,10 +498,19 @@ def create_app(
         task_spec = payload.to_task_spec()
         try:
             overrides = _env_origin_overrides()
+            raw_inst_env = os.environ.get("GROKBOT_INSTALLATION_CONFIG", "").strip()
             configured_origins: set[str] = set()
+            strict_configured_check = False
             if task_spec.installation_config_path is not None:
+                strict_configured_check = True
                 configured_origins = _load_configured_origins_from_path(
                     task_spec.installation_config_path,
+                    origin_overrides=overrides,
+                )
+            elif raw_inst_env:
+                strict_configured_check = True
+                configured_origins = _load_configured_origins_from_path(
+                    raw_inst_env,
                     origin_overrides=overrides,
                 )
             else:
@@ -469,16 +526,40 @@ def create_app(
                 if configured_origins and overrides:
                     configured_origins.update(overrides.values())
 
-            if configured_origins and task_spec.scope.allowed_origins:
-                disallowed = [
-                    origin
-                    for origin in task_spec.scope.allowed_origins
-                    if origin not in configured_origins
-                ]
-                if disallowed:
-                    raise ValueError(
-                        f"Unconfigured or disallowed allowed_origins: {disallowed}"
+            if task_spec.scope.allowed_origins:
+                if strict_configured_check:
+                    if configured_origins:
+                        disallowed = [
+                            origin
+                            for origin in task_spec.scope.allowed_origins
+                            if origin not in configured_origins
+                        ]
+                        if disallowed:
+                            raise ValueError(
+                                f"Unconfigured or disallowed allowed_origins: {disallowed}"
+                            )
+                else:
+                    all_apps_overridden = active_runtime is not None and all(
+                        app_id in overrides
+                        for app_id in active_runtime.facility_config.apps
                     )
+                    for origin in task_spec.scope.allowed_origins:
+                        parsed_origin = urlparse(origin)
+                        hostname = (parsed_origin.hostname or "").lower()
+                        is_loopback = hostname in {"127.0.0.1", "localhost", "::1"}
+                        if not is_loopback:
+                            raise ValueError(
+                                "Non-loopback allowed_origin requires "
+                                f"installation_config_path: {origin}"
+                            )
+                        if (
+                            all_apps_overridden
+                            and configured_origins
+                            and origin not in configured_origins
+                        ):
+                            raise ValueError(
+                                f"Unconfigured or disallowed allowed_origins: {[origin]}"
+                            )
         except (OSError, ValueError, ValidationError, OriginNotAllowedError) as exc:
             raise HTTPException(
                 status_code=422,
@@ -513,9 +594,11 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=str(_scrub_and_verify(f"Unknown run_id: {run_id}", label="error")),
             )
+        serialized = _serialize_snapshot(snapshot)
+        _maybe_write_trace_from_payload(run_id, serialized)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content=_serialize_snapshot(snapshot),
+            content=serialized,
         )
 
     @app.post("/api/tasks/{run_id}/cancel")

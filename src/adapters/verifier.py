@@ -192,7 +192,7 @@ class Verifier:
                 f"{area or 'unknown-area'} ({asset_id})" for asset_id, area in distinct
             )
             required_action = (
-                f"Ambiguous asset {target_asset_query!r} across multiple areas; "
+                f"Ambiguous asset {target_asset_query} across multiple areas; "
                 f"specify area or asset_id: {options}"
             )
             return True, distinct, required_action

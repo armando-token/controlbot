@@ -27,6 +27,7 @@ VALID_MAINTENANCE_MODES: frozenset[str] = frozenset(
         "contradictory",
         "reordered",
         "facility_b",
+        "area2",
     }
 )
 
@@ -130,6 +131,10 @@ class MaintenanceState:
         self.fixture_mode = mode
         if mode == "reordered":
             self.column_order = REORDERED_MAINT_COLUMNS
+        elif mode in ("facility_b", "area2"):
+            self.column_order = REORDERED_MAINT_COLUMNS
+            self.header_labels = dict(FACILITY_B_MAINT_HEADER_LABELS)
+            self.work_orders_table_label = FACILITY_B_WORK_ORDERS_TABLE_LABEL
 
     def set_column_order(self, order: tuple[str, ...]) -> None:
         self.column_order = order
@@ -152,11 +157,12 @@ class MaintenanceState:
             return [dict(row) for row in self.custom_work_orders]
         ref = self.reference_time
         mode = self.fixture_mode
-        if mode == "facility_b":
+        if mode in ("facility_b", "area2"):
+            asset_code = "bomba-77-b2" if mode == "area2" else "CMMS-77"
             return [
                 {
                     "id": "WO-7701",
-                    "asset_id": "CMMS-77",
+                    "asset_id": asset_code,
                     "asset_label": "bomba 77",
                     "intervention": "Inspected east cooling impeller and bearing housing",
                     "recorded_at": _iso_utc(ref - timedelta(minutes=55)),
@@ -165,7 +171,7 @@ class MaintenanceState:
                 },
                 {
                     "id": "WO-7705",
-                    "asset_id": "CMMS-77",
+                    "asset_id": asset_code,
                     "asset_label": "bomba 77",
                     "intervention": "Replaced mechanical seal and calibrated pressure transmitter",
                     "recorded_at": _iso_utc(ref - timedelta(minutes=10)),
@@ -275,17 +281,24 @@ def _filter_work_orders(
     asset_id: str | None,
     asset: str | None,
     area: str | None,
+    *,
+    mode: str = "default",
 ) -> tuple[list[dict[str, Any]], bool]:
     if area is not None and area not in allowed_areas:
         return [], False
+    area2_aliases = {"CMMS-77", "bomba-77-b2"}
     result: list[dict[str, Any]] = []
     for row in records:
         if row["area"] not in allowed_areas:
             continue
         if area is not None and row["area"] != area:
             continue
-        if asset_id is not None and row["asset_id"] != asset_id:
-            continue
+        if asset_id is not None:
+            if mode == "area2" and asset_id in area2_aliases:
+                if row["asset_id"] not in area2_aliases:
+                    continue
+            elif row["asset_id"] != asset_id:
+                continue
         if asset is not None and asset.strip().lower() not in (
             str(row["asset_label"]).lower(),
             str(row["asset_id"]).lower(),
@@ -361,7 +374,7 @@ def create_maintenance_app(
     if state is None:
         effective_cols = column_order or (
             REORDERED_MAINT_COLUMNS
-            if fixture_mode in ("reordered", "facility_b")
+            if fixture_mode in ("reordered", "facility_b", "area2")
             else DEFAULT_MAINT_COLUMNS
         )
         effective_headers = (
@@ -369,7 +382,7 @@ def create_maintenance_app(
             if header_labels is not None
             else (
                 dict(FACILITY_B_MAINT_HEADER_LABELS)
-                if fixture_mode == "facility_b"
+                if fixture_mode in ("facility_b", "area2")
                 else dict(_HEADER_LABELS)
             )
         )
@@ -378,7 +391,7 @@ def create_maintenance_app(
             if work_orders_table_label is not None
             else (
                 FACILITY_B_WORK_ORDERS_TABLE_LABEL
-                if fixture_mode == "facility_b"
+                if fixture_mode in ("facility_b", "area2")
                 else "Maintenance Work Orders"
             )
         )
@@ -571,7 +584,12 @@ def create_maintenance_app(
             )
             return RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
         rows, allowed = _filter_work_orders(
-            maint_state.get_work_orders(), sess.areas, asset_id, asset, area
+            maint_state.get_work_orders(),
+            sess.areas,
+            asset_id,
+            asset,
+            area,
+            mode=maint_state.fixture_mode,
         )
         if not allowed:
             return HTMLResponse(
@@ -607,7 +625,12 @@ def create_maintenance_app(
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
         rows, allowed = _filter_work_orders(
-            maint_state.get_work_orders(), sess.areas, asset_id, asset, area
+            maint_state.get_work_orders(),
+            sess.areas,
+            asset_id,
+            asset,
+            area,
+            mode=maint_state.fixture_mode,
         )
         if not allowed:
             return JSONResponse(

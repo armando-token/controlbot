@@ -857,3 +857,109 @@ async def test_web_create_app_runtime_env_and_422_origin_validation(
             settled = await web_app.state.runtime.web_coordinator.wait_for_run(run_id, timeout=20.0)
             assert settled is not None
             assert settled.status == TaskStatus.SUCCEEDED
+
+
+@pytest.mark.n2
+async def test_verifier_unquoted_ambiguity_area2_lab_and_redacted_tracing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from src.adapters.config import load_facility_config
+    from src.adapters.verifier import Verifier
+    from src.contracts.enums import DataQuality
+    from src.contracts.models import Observation, TaskScope, TaskSpec
+    from src.contracts.redaction import contains_unredacted_secret
+    from src.web.app import create_app
+
+    cfg_a = load_facility_config(Path("lab/configs/facility_a.json"))
+    now = utc_now()
+    obs1 = Observation(
+        source="scada",
+        session_id="op__p1__scada",
+        asset_id="bomba-34-a1",
+        observed_label="bomba 34",
+        value="HIGH_VIBRATION",
+        unit="alarm_code",
+        source_time=now,
+        observed_at=now,
+        quality=DataQuality.GOOD,
+        area="area-1",
+    )
+    obs2 = Observation(
+        source="scada",
+        session_id="op__p1__scada",
+        asset_id="bomba-34-a2",
+        observed_label="bomba 34",
+        value="SEAL_LEAK",
+        unit="alarm_code",
+        source_time=now,
+        observed_at=now,
+        quality=DataQuality.GOOD,
+        area="area-2",
+    )
+    is_ambig, _, action = Verifier().detect_ambiguity(
+        (obs1, obs2), cfg_a, target_asset_query="bomba 34"
+    )
+    assert is_ambig is True
+    assert action is not None
+    assert "Ambiguous asset bomba 34 across multiple areas" in action
+    assert "'bomba 34'" not in action
+
+    # Area-2 mode returns bomba-77-b2 and accepts SC-77/CMMS-77 filter; facility_b stays SC-77
+    scada_area2 = create_scada_app(fixture_mode="area2")
+    maint_area2 = create_maintenance_app(fixture_mode="area2")
+    assert scada_area2.state.scada_state.get_alarms()[0]["asset_id"] == "bomba-77-b2"
+    assert maint_area2.state.maintenance_state.get_work_orders()[0]["asset_id"] == "bomba-77-b2"
+    scada_fb = create_scada_app(fixture_mode="facility_b")
+    assert scada_fb.state.scada_state.get_alarms()[0]["asset_id"] == "SC-77"
+
+    # Tracing redaction + partial-outage loopback origin pass
+    trace_dir = tmp_path / "traces"
+    db_path = tmp_path / "trace_web.sqlite3"
+    profiles_dir = tmp_path / "profiles"
+    async with run_asgi_server(create_scada_app(fixture_mode="default")) as scada_origin:
+        monkeypatch.setenv("GROKBOT_DB_PATH", str(db_path))
+        monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(profiles_dir))
+        monkeypatch.setenv("GROKBOT_SCADA_URL", scada_origin)
+        monkeypatch.delenv("GROKBOT_MAINTENANCE_URL", raising=False)
+        monkeypatch.delenv("GROKBOT_INSTALLATION_CONFIG", raising=False)
+        monkeypatch.setenv("GROKBOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("GROKBOT_TRACE_DIR", str(trace_dir))
+
+        web_app = create_app()
+        async with (
+            web_app.router.lifespan_context(web_app),
+            run_asgi_server(web_app) as web_origin,
+            httpx.AsyncClient(base_url=web_origin, trust_env=False) as client,
+        ):
+            resp = await client.post(
+                "/api/tasks",
+                json={
+                    "user_id": "operator_ro",
+                    "profile_id": "p1",
+                    "facility_id": "facility-a",
+                    "allowed_origins": [scada_origin, "http://127.0.0.1:59999"],
+                    "allowed_areas": ["area-1"],
+                    "query": (
+                        "Check bomba 34 password=secret-pw-123 "
+                        "Authorization: Bearer secret-tok-123"
+                    ),
+                },
+            )
+            assert resp.status_code == 201
+            run_id = resp.json()["run_id"]
+            settled = await web_app.state.runtime.web_coordinator.wait_for_run(run_id, timeout=20.0)
+            assert settled is not None
+            assert settled.status == TaskStatus.PARTIAL
+            snap_resp = await client.get(f"/api/tasks/{run_id}")
+            assert snap_resp.status_code == 200
+
+    trace_files = list(trace_dir.glob("trace_*.json"))
+    assert trace_files
+    trace_text = trace_files[0].read_text(encoding="utf-8")
+    assert "secret-pw-123" not in trace_text
+    assert "secret-tok-123" not in trace_text
+    assert not contains_unredacted_secret(trace_text)
+    assert not contains_unredacted_secret(json.loads(trace_text))
+    del TaskScope, TaskSpec

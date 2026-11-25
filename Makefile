@@ -40,4 +40,4 @@ test-offline:
 	@if [ "$$(uname -s)" != "Linux" ]; then echo "[PENDING_N3_LINUX_ENV] N1/N2 offline egress-allowlist & loopback checks passed on $$(uname -s); kernel netns/iptables & real local LLM checks remain PENDING_N3_LINUX_ENV (see scripts/verify_n3_linux.sh)."; fi
 
 bench:
-	$(UV) run python -m benchmarks.runner
+	$(UV) run python -m benchmarks.runner --output-dir benchmarks

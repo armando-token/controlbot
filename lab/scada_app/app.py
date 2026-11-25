@@ -27,6 +27,7 @@ VALID_SCADA_MODES: frozenset[str] = frozenset(
         "contradictory",
         "reordered",
         "facility_b",
+        "area2",
     }
 )
 
@@ -137,6 +138,11 @@ class ScadaState:
         self.fixture_mode = mode
         if mode == "reordered":
             self.column_order = REORDERED_SCADA_COLUMNS
+        elif mode in ("facility_b", "area2"):
+            self.column_order = REORDERED_SCADA_COLUMNS
+            self.header_labels = dict(FACILITY_B_SCADA_HEADER_LABELS)
+            self.alarms_table_label = FACILITY_B_ALARMS_TABLE_LABEL
+            self.readings_table_label = FACILITY_B_READINGS_TABLE_LABEL
 
     def set_column_order(self, order: tuple[str, ...]) -> None:
         self.column_order = order
@@ -159,11 +165,12 @@ class ScadaState:
             return [dict(row) for row in self.custom_alarms]
         ref = self.reference_time
         mode = self.fixture_mode
-        if mode == "facility_b":
+        if mode in ("facility_b", "area2"):
+            asset_code = "bomba-77-b2" if mode == "area2" else "SC-77"
             return [
                 {
                     "id": "ALM-7701",
-                    "asset_id": "SC-77",
+                    "asset_id": asset_code,
                     "asset_label": "bomba 77",
                     "value": "SEAL_TEMP_HIGH",
                     "unit": "alarm_code",
@@ -174,7 +181,7 @@ class ScadaState:
                 },
                 {
                     "id": "ALM-7702",
-                    "asset_id": "SC-77",
+                    "asset_id": asset_code,
                     "asset_label": "bomba 77",
                     "value": "PRESSURE_DROP",
                     "unit": "alarm_code",
@@ -264,11 +271,12 @@ class ScadaState:
             return [dict(row) for row in self.custom_readings]
         ref = self.reference_time
         mode = self.fixture_mode
-        if mode == "facility_b":
+        if mode in ("facility_b", "area2"):
+            asset_code = "bomba-77-b2" if mode == "area2" else "SC-77"
             return [
                 {
                     "id": "RDG-7701",
-                    "asset_id": "SC-77",
+                    "asset_id": asset_code,
                     "asset_label": "bomba 77",
                     "value": 6.8,
                     "unit": "mm/s",
@@ -279,7 +287,7 @@ class ScadaState:
                 },
                 {
                     "id": "RDG-7702",
-                    "asset_id": "SC-77",
+                    "asset_id": asset_code,
                     "asset_label": "bomba 77",
                     "value": 5.1,
                     "unit": "bar",
@@ -382,17 +390,24 @@ def _filter_records(
     asset_id: str | None,
     asset: str | None,
     area: str | None,
+    *,
+    mode: str = "default",
 ) -> tuple[list[dict[str, Any]], bool]:
     if area is not None and area not in allowed_areas:
         return [], False
+    area2_aliases = {"SC-77", "bomba-77-b2"}
     result: list[dict[str, Any]] = []
     for row in records:
         if row["area"] not in allowed_areas:
             continue
         if area is not None and row["area"] != area:
             continue
-        if asset_id is not None and row["asset_id"] != asset_id:
-            continue
+        if asset_id is not None:
+            if mode == "area2" and asset_id in area2_aliases:
+                if row["asset_id"] not in area2_aliases:
+                    continue
+            elif row["asset_id"] != asset_id:
+                continue
         if asset is not None and asset.strip().lower() not in (
             str(row["asset_label"]).lower(),
             str(row["asset_id"]).lower(),
@@ -470,7 +485,7 @@ def create_scada_app(
     if state is None:
         effective_cols = column_order or (
             REORDERED_SCADA_COLUMNS
-            if fixture_mode in ("reordered", "facility_b")
+            if fixture_mode in ("reordered", "facility_b", "area2")
             else DEFAULT_SCADA_COLUMNS
         )
         effective_headers = (
@@ -478,21 +493,25 @@ def create_scada_app(
             if header_labels is not None
             else (
                 dict(FACILITY_B_SCADA_HEADER_LABELS)
-                if fixture_mode == "facility_b"
+                if fixture_mode in ("facility_b", "area2")
                 else dict(_HEADER_LABELS)
             )
         )
         effective_alarms_label = (
             alarms_table_label
             if alarms_table_label is not None
-            else (FACILITY_B_ALARMS_TABLE_LABEL if fixture_mode == "facility_b" else "SCADA Alarms")
+            else (
+                FACILITY_B_ALARMS_TABLE_LABEL
+                if fixture_mode in ("facility_b", "area2")
+                else "SCADA Alarms"
+            )
         )
         effective_readings_label = (
             readings_table_label
             if readings_table_label is not None
             else (
                 FACILITY_B_READINGS_TABLE_LABEL
-                if fixture_mode == "facility_b"
+                if fixture_mode in ("facility_b", "area2")
                 else "SCADA Readings"
             )
         )
@@ -690,7 +709,14 @@ def create_scada_app(
                 else "/login"
             )
             return RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
-        rows, allowed = _filter_records(scada_state.get_alarms(), sess.areas, asset_id, asset, area)
+        rows, allowed = _filter_records(
+            scada_state.get_alarms(),
+            sess.areas,
+            asset_id,
+            asset,
+            area,
+            mode=scada_state.fixture_mode,
+        )
         if not allowed:
             return HTMLResponse(
                 "<h1>403 Forbidden Area</h1>",
@@ -728,7 +754,12 @@ def create_scada_app(
             )
             return RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
         rows, allowed = _filter_records(
-            scada_state.get_readings(), sess.areas, asset_id, asset, area
+            scada_state.get_readings(),
+            sess.areas,
+            asset_id,
+            asset,
+            area,
+            mode=scada_state.fixture_mode,
         )
         if not allowed:
             return HTMLResponse(
@@ -764,7 +795,14 @@ def create_scada_app(
                 {"detail": "Session expired", "code": "AUTH_EXPIRED"},
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
-        rows, allowed = _filter_records(scada_state.get_alarms(), sess.areas, asset_id, asset, area)
+        rows, allowed = _filter_records(
+            scada_state.get_alarms(),
+            sess.areas,
+            asset_id,
+            asset,
+            area,
+            mode=scada_state.fixture_mode,
+        )
         if not allowed:
             return JSONResponse(
                 {"detail": "Forbidden area", "code": "FORBIDDEN_AREA"},
@@ -794,7 +832,12 @@ def create_scada_app(
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
         rows, allowed = _filter_records(
-            scada_state.get_readings(), sess.areas, asset_id, asset, area
+            scada_state.get_readings(),
+            sess.areas,
+            asset_id,
+            asset,
+            area,
+            mode=scada_state.fixture_mode,
         )
         if not allowed:
             return JSONResponse(

@@ -132,18 +132,82 @@ class DeployInstallConfig(FrozenModel):
     """Top-level declarative installation configuration for Grokbot-clon."""
 
     schema_version: NonEmptyStr = "1.0.0"
-    environment: Literal["lab_offline", "pilot_offline"]
+    policy_version: NonEmptyStr
+    backend_mode: BackendMode = BackendMode.LOCAL_HTTP
+    environment: Literal["lab_offline", "pilot_offline"] = "lab_offline"
     host_os_target: Literal["linux"] = "linux"
     bind_address: NonEmptyStr = "127.0.0.1"
     web_port: int = Field(default=8000, ge=1, le=65535)
-    facility_config_path: NonEmptyStr
+    ports: dict[str, int] = Field(
+        default_factory=lambda: {
+            "web": 8000,
+            "scada": 8101,
+            "maintenance": 8102,
+            "effect_sim": 8103,
+            "local_llm": 8080,
+        }
+    )
+    facility_config_path: NonEmptyStr = "lab/configs/facility_a.json"
     allow_private_lan_origins: bool = False
     allowed_origins: tuple[HttpOrigin, ...]
+    storage_path: NonEmptyStr = "/var/lib/grokbot/grokbot.sqlite3"
     storage: StorageDeployConfig
-    local_model: LocalModelEndpointConfig
+    local_model: LocalModelEndpointConfig | None = None
     permissions: PermissionPolicy
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
-    offline_ops: OfflineOpsConfig
+    offline_ops: OfflineOpsConfig = Field(
+        default_factory=lambda: OfflineOpsConfig(
+            egress_blocked=True,
+            pre_cached_wheels_dir="/opt/grokbot/wheelhouse",
+            playwright_browsers_path="/opt/grokbot/ms-playwright",
+        )
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        if "budget" in data and "budgets" not in data:
+            data["budgets"] = data["budget"]
+        elif "budgets" in data and "budget" not in data:
+            data["budget"] = data["budgets"]
+
+        if "storage_path" in data and "storage" not in data:
+            raw_sp = data["storage_path"]
+            if isinstance(raw_sp, str) and raw_sp.strip():
+                data["storage"] = {
+                    "sqlite_wal_path": raw_sp.strip(),
+                    "profile_root": "/var/lib/grokbot/profiles",
+                }
+        elif (
+            "storage" in data
+            and isinstance(data["storage"], Mapping)
+            and "storage_path" not in data
+            and isinstance(data["storage"].get("sqlite_wal_path"), str)
+        ):
+            data["storage_path"] = data["storage"]["sqlite_wal_path"]
+
+        if isinstance(data.get("permissions"), list):
+            data["permissions"] = {
+                "read_only_default": True,
+                "granted_permissions": tuple(str(p) for p in data["permissions"]),
+                "factory_isolated": True,
+                "allow_external_egress": False,
+            }
+        return data
+
+    @field_validator("ports")
+    @classmethod
+    def _validate_ports(cls, value: dict[str, int]) -> dict[str, int]:
+        if not value:
+            raise ValueError("ports must be a non-empty mapping.")
+        for svc, port in value.items():
+            if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+                raise ValueError(f"Port for {svc!r} must be in 1..65535, got {port!r}")
+        return value
 
     @model_validator(mode="after")
     def _validate_origins_and_bind(self) -> DeployInstallConfig:
@@ -306,11 +370,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(cfg.model_dump_json(indent=2))
     else:
+        origins_str = ", ".join(cfg.allowed_origins)
+        model_origin = cfg.local_model.origin if cfg.local_model is not None else "none"
         print(
             f"Deploy config valid: env={cfg.environment}, "
+            f"backend_mode={cfg.backend_mode.value}, "
+            f"policy_version={cfg.policy_version}, "
             f"bind={cfg.bind_address}:{cfg.web_port}, "
-            f"origins={len(cfg.allowed_origins)}, "
-            f"model={cfg.local_model.origin}"
+            f"allowed_origins=[{origins_str}], "
+            f"model={model_origin}"
         )
     return 0
 

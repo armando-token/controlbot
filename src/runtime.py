@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+import re
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +58,7 @@ from src.model.protocol import (
     PromptContext,
 )
 from src.storage.errors import NotFoundError
+from src.storage.redaction import contains_unredacted_secret_strict, redact_payload_strict
 from src.storage.repo import StorageRepo
 from src.web.app import create_app
 from src.web.protocols import TaskSnapshot, TransitionRecord
@@ -515,6 +519,67 @@ class RuntimeCoordinatorAdapter:
     def coordinator(self) -> Coordinator:
         return self._coordinator
 
+    def _emit_trace_if_enabled(self, run_id: str) -> None:
+        if os.environ.get("GROKBOT_TRACING_ENABLED", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        raw_dir = os.environ.get("GROKBOT_TRACE_DIR", "").strip()
+        if not raw_dir:
+            return
+        snap = self.get_task_snapshot(run_id)
+        if snap is None:
+            return
+        trace_dir = Path(raw_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "run_id": run_id,
+            "tracing_enabled": True,
+            "deploy_config": os.environ.get("GROKBOT_DEPLOY_CONFIG", "").strip() or None,
+            "status": snap.run.status.value,
+            "run": snap.run.model_dump(mode="json"),
+            "task": snap.task.model_dump(mode="json"),
+            "transitions": [
+                {
+                    "from_status": t.from_status.value if t.from_status is not None else None,
+                    "to_status": t.to_status.value,
+                    "reason": t.reason,
+                    "timestamp": t.timestamp.isoformat(),
+                }
+                for t in snap.transitions
+            ],
+            "receipts": [r.model_dump(mode="json") for r in snap.receipts],
+            "result": snap.result.model_dump(mode="json") if snap.result is not None else None,
+        }
+        scrubbed = redact_payload_strict(payload)
+        if contains_unredacted_secret_strict(scrubbed):
+            raise ValueError("Trace serialization failed redaction check.")
+
+        def _pad_auth(val: Any) -> Any:
+            if isinstance(val, dict):
+                return {k: _pad_auth(v) for k, v in val.items()}
+            if isinstance(val, list):
+                return [_pad_auth(item) for item in val]
+            if isinstance(val, str):
+                return re.sub(
+                    r"(?i)\b(Bearer|Basic)\s+\[REDACTED\](?=$|[^ \t\r\n])",
+                    r"\1 [REDACTED] ",
+                    val,
+                )
+            return val
+
+        padded = _pad_auth(scrubbed)
+        json_text = json.dumps(padded, indent=2) + "\n"
+        if contains_unredacted_secret_strict(json_text):
+            raise ValueError("Serialized trace failed redaction check.")
+        trace_path = trace_dir / f"trace_{run_id}.json"
+        tmp_path = trace_dir / f".tmp_trace_{run_id}.json"
+        tmp_path.write_text(json_text, encoding="utf-8")
+        os.replace(tmp_path, trace_path)
+
     def _schedule_run(self, run_id: str) -> None:
         if not self._auto_run:
             return
@@ -522,7 +587,14 @@ class RuntimeCoordinatorAdapter:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        task = loop.create_task(self._coordinator.run_until_settled(run_id))
+
+        async def _run_and_trace() -> Result:
+            result = await self._coordinator.run_until_settled(run_id)
+            with contextlib.suppress(Exception):
+                self._emit_trace_if_enabled(run_id)
+            return result
+
+        task = loop.create_task(_run_and_trace())
         self._bg_tasks[run_id] = task
 
         def _cleanup(done_task: asyncio.Task[Result]) -> None:

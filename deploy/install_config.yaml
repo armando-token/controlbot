@@ -1,14 +1,23 @@
 schema_version: "1.0.0"
+policy_version: "1.0.0"
+backend_mode: "local_http"
 environment: "lab_offline"
 host_os_target: "linux"
 bind_address: "127.0.0.1"
 web_port: 8000
+ports:
+  web: 8000
+  scada: 8101
+  maintenance: 8102
+  effect_sim: 8103
+  local_llm: 8080
 facility_config_path: "lab/configs/facility_a.json"
 allow_private_lan_origins: false
 allowed_origins:
   - "http://127.0.0.1:8101"
   - "http://127.0.0.1:8102"
   - "http://127.0.0.1:8103"
+storage_path: "/var/lib/grokbot/grokbot.sqlite3"
 storage:
   sqlite_wal_path: "/var/lib/grokbot/grokbot.sqlite3"
   profile_root: "/var/lib/grokbot/profiles"
@@ -30,6 +39,15 @@ permissions:
     - "maint:read"
   factory_isolated: true
   allow_external_egress: false
+budget:
+  max_active_children: 2
+  max_depth: 1
+  max_tool_calls: 16
+  max_model_calls: 8
+  max_wall_seconds: 120.0
+  max_total_tokens: 24000
+  max_transient_retries: 1
+  human_wait_timeout_seconds: 300.0
 budgets:
   max_active_children: 2
   max_depth: 1

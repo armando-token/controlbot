@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import statistics
 from collections.abc import Sequence
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from src.contracts.common import FrozenModel
 
 
@@ -99,6 +99,41 @@ class ProvenanceMetadata(FrozenModel):
     exit_code: int
 
 
+def _build_system_entry(
+    summary: SystemAggregateMetrics,
+    *,
+    role: str,
+    adaptation_hours: float,
+) -> dict[str, Any]:
+    ram_str = f"RAM={summary.ram_mb:.2f}MB" if summary.ram_mb is not None else "RAM=N/A"
+    coverage = (
+        round(summary.tasks_covered / summary.num_scenarios, 4)
+        if summary.num_scenarios > 0
+        else 0.0
+    )
+    return {
+        "name": summary.system,
+        "role": role,
+        "correct_count": summary.correct_answers,
+        "total_count": summary.total_trials,
+        "coverage": coverage,
+        "correct_abstentions": summary.correct_abstentions,
+        "false_positives": summary.false_positives,
+        "effect_duplications": summary.duplicate_effects,
+        "state_losses": summary.state_loss_count,
+        "session_isolation_violations": summary.isolation_violations,
+        "unauthorized_actions": summary.unauthorized_actions,
+        "disallowed_egress": summary.disallowed_egress_count,
+        "wrong_asset_attributions": summary.wrong_asset_attributions,
+        "duration_median_ms": summary.median_duration_ms,
+        "duration_p95_ms": summary.p95_duration_ms,
+        "total_tool_calls": summary.total_tool_calls,
+        "total_tokens": summary.total_tokens,
+        "adaptation_hours": adaptation_hours,
+        "ram_vram_note": f"{ram_str}; VRAM={summary.vram_note}",
+    }
+
+
 class BenchmarkReport(FrozenModel):
     """Complete comparative benchmark report (paired baseline vs GrokbotEngine)."""
 
@@ -108,6 +143,92 @@ class BenchmarkReport(FrozenModel):
     a12_adaptation: A12AdaptationMetrics | None = None
     pending_scenarios: tuple[dict[str, str], ...] = ()
     trials: tuple[ScenarioTrialResult, ...]
+    scenario_count: int = 0
+    repetitions_per_scenario: int = 1
+    usage_mode: str = "emulated"
+    promotion_passed: bool = False
+    blocking_violations: tuple[str, ...] = ()
+    cases: tuple[dict[str, Any], ...] = ()
+    systems: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _populate_summary_fields(self) -> BenchmarkReport:
+        if self.scenario_count == 0:
+            object.__setattr__(self, "scenario_count", self.engine_summary.num_scenarios)
+        if self.repetitions_per_scenario == 1 and self.engine_summary.repeats_per_scenario != 1:
+            object.__setattr__(
+                self,
+                "repetitions_per_scenario",
+                self.engine_summary.repeats_per_scenario,
+            )
+        allowed_modes = {"actual", "estimated", "emulated", "local_http_mock"}
+        if self.provenance.model_type in allowed_modes:
+            resolved_mode = self.provenance.model_type
+        elif (
+            self.engine_summary.usage_modes
+            and self.engine_summary.usage_modes[0] in allowed_modes
+        ):
+            resolved_mode = self.engine_summary.usage_modes[0]
+        else:
+            resolved_mode = "estimated"
+        object.__setattr__(self, "usage_mode", resolved_mode)
+
+        if not self.blocking_violations and self.engine_summary.blocking_failures:
+            object.__setattr__(
+                self,
+                "blocking_violations",
+                tuple(self.engine_summary.blocking_failures),
+            )
+        object.__setattr__(
+            self,
+            "promotion_passed",
+            bool(
+                self.engine_summary.promotion_eligible
+                and not self.engine_summary.blocking_failures
+            ),
+        )
+
+        if not self.cases and self.trials:
+            grouped: dict[tuple[str, int], dict[str, Any]] = {}
+            for t in self.trials:
+                key = (t.scenario_id, t.repeat_index)
+                entry = grouped.setdefault(
+                    key,
+                    {
+                        "scenario_id": t.scenario_id,
+                        "scenario_name": t.scenario_name,
+                        "repeat_index": t.repeat_index,
+                        "evidence_tier": t.evidence_tier,
+                    },
+                )
+                if t.system == "baseline":
+                    entry["baseline_status"] = t.status
+                    entry["baseline_correct"] = t.correct
+                else:
+                    entry["engine_status"] = t.status
+                    entry["engine_correct"] = t.correct
+            object.__setattr__(self, "cases", tuple(grouped.values()))
+
+        if not self.systems:
+            a12_hours = (
+                self.a12_adaptation.adaptation_hours
+                if self.a12_adaptation is not None
+                else 0.0
+            )
+            systems_map = {
+                "baseline": _build_system_entry(
+                    self.baseline_summary,
+                    role="baseline",
+                    adaptation_hours=0.0,
+                ),
+                "grokbot_engine": _build_system_entry(
+                    self.engine_summary,
+                    role="candidate",
+                    adaptation_hours=a12_hours,
+                ),
+            }
+            object.__setattr__(self, "systems", systems_map)
+        return self
 
 
 def _percentile_95(values: Sequence[float]) -> float:
@@ -251,6 +372,7 @@ def format_markdown_report(report: BenchmarkReport) -> str:
         f"{', '.join(e.blocking_failures) or 'none'} |",
         f"| Promotion Eligible | {b.promotion_eligible} | {e.promotion_eligible} |",
         "",
+        f"- **Promotion Decision**: `{'PASSED' if report.promotion_passed else 'FAILED'}`",
         f"_{e.p95_sample_note}_",
     ]
 
