@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,24 @@ _UUID_RE = re.compile(
 _CONV_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 _USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 _INLINE_TOKEN_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pou]_[A-Za-z0-9_]{8,})\b")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_MODEL_LINE_RE = re.compile(r"^([a-z0-9][a-z0-9._-]+)\s+(.+)$")
+_SKIP_DIR_NAMES: frozenset[str] = frozenset(
+    {".git", ".venv", "__pycache__", "node_modules", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+)
+_FALLBACK_MODELS: tuple[dict[str, Any], ...] = (
+    {"id": "gemini-4-carbon-low", "label": "Gemini 4 Carbon (Low)", "is_hydrogen": False},
+    {"id": "gemini-4-carbon-medium", "label": "Gemini 4 Carbon (Medium)", "is_hydrogen": False},
+    {"id": "gemini-4-carbon-high", "label": "Gemini 4 Carbon (High)", "is_hydrogen": False},
+    {"id": "gemini-4-neon-low", "label": "Gemini 4 Neon (Low)", "is_hydrogen": False},
+    {"id": "gemini-4-neon-medium", "label": "Gemini 4 Neon (Medium)", "is_hydrogen": False},
+    {"id": "gemini-4-neon-high", "label": "Gemini 4 Neon (High)", "is_hydrogen": False},
+    {"id": "gemini-4-neon-xhigh", "label": "Gemini 4 Neon (XHigh)", "is_hydrogen": False},
+    {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6 (Thinking)", "is_hydrogen": False},
+    {"id": "claude-opus-4-6-thinking", "label": "Claude Opus 4.6 (Thinking)", "is_hydrogen": False},
+)
+_MODELS_CACHE_TTL_S = 120.0
+_models_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 
 def _scrub_text(value: str) -> str:
@@ -205,9 +224,10 @@ async def send_agy_prompt(
     conversation_id: str | None = None,
     project_dir: Path | None = None,
     model: str = "gemini-4-carbon-low",
+    allow_hydrogen: bool = False,
     timeout_s: float = 120.0,
 ) -> dict[str, Any]:
-    """Execute one non-hydrogen Antigravity CLI turn, optionally resuming conversation_id."""
+    """Execute one Antigravity CLI turn, optionally resuming conversation_id."""
     cleaned_prompt = prompt.strip()
     if not cleaned_prompt:
         raise ValueError("prompt must not be empty.")
@@ -215,8 +235,10 @@ async def send_agy_prompt(
     cleaned_model = model.strip()
     if not cleaned_model:
         raise ValueError("model must not be empty.")
-    if "hydrogen" in cleaned_model.lower():
-        raise ValueError("Hydrogen models are disabled by policy; use carbon/neon instead.")
+    if "hydrogen" in cleaned_model.lower() and not allow_hydrogen:
+        raise ValueError(
+            "Hydrogen models are disabled by policy; enable opt-in or use carbon/neon."
+        )
 
     cleaned_cid: str | None = None
     if conversation_id is not None and conversation_id.strip():
@@ -298,3 +320,187 @@ async def send_agy_prompt(
     if contains_unredacted_secret_strict(scrubbed):
         raise RuntimeError("agy response failed strict secret redaction check.")
     return scrubbed
+
+
+def parse_agy_models_output(raw_text: str) -> list[dict[str, Any]]:
+    """Parse `agy models` stdout (including ANSI spinners) into structured model entries."""
+    models: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_line in raw_text.splitlines():
+        segment = raw_line.split("\r")[-1]
+        cleaned = _ANSI_RE.sub("", segment).strip()
+        if not cleaned or "fetching available models" in cleaned.lower():
+            continue
+        match = _MODEL_LINE_RE.match(cleaned)
+        if match is None:
+            continue
+        model_id = match.group(1).strip()
+        label = match.group(2).strip()
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append(
+            {
+                "id": model_id,
+                "label": label,
+                "is_hydrogen": "hydrogen" in model_id.lower(),
+            }
+        )
+    return models
+
+
+async def list_agy_models(*, force_refresh: bool = False) -> list[dict[str, Any]]:
+    """Return available Antigravity CLI models with a short TTL cache."""
+    global _models_cache
+    now = time.monotonic()
+    if not force_refresh and _models_cache is not None:
+        cached_at, cached_items = _models_cache
+        if (now - cached_at) < _MODELS_CACHE_TTL_S:
+            return [dict(item) for item in cached_items]
+
+    agy_bin = find_agy_executable()
+    if agy_bin is None:
+        return [dict(item) for item in _FALLBACK_MODELS]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            agy_bin,
+            "models",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except (OSError, TimeoutError):
+        return [dict(item) for item in _FALLBACK_MODELS]
+
+    parsed = parse_agy_models_output(stdout_b.decode("utf-8", errors="replace"))
+    if proc.returncode != 0 or not parsed:
+        return [dict(item) for item in _FALLBACK_MODELS]
+
+    _models_cache = (now, parsed)
+    return [dict(item) for item in parsed]
+
+
+def _resolve_relative_project_path(project_dir: Path, rel_path: str) -> Path:
+    cleaned = rel_path.strip().lstrip("/")
+    if not cleaned:
+        return project_dir
+    if "\x00" in cleaned or "\\" in cleaned:
+        raise ValueError(f"Invalid relative path: {rel_path!r}")
+    parts = Path(cleaned).parts
+    if any(part in {".", ".."} for part in parts):
+        raise ValueError(f"Relative path traversal forbidden: {rel_path!r}")
+    resolved_root = project_dir.resolve()
+    candidate = (resolved_root / cleaned).resolve()
+    if not candidate.is_relative_to(resolved_root):
+        raise ValueError(f"Path escapes project root: {rel_path!r}")
+    return candidate
+
+
+def _is_sensitive_filename(path: Path) -> bool:
+    name_low = path.name.lower()
+    if name_low == ".env" or name_low.startswith(".env."):
+        return True
+    if name_low.endswith((".pem", ".key", ".p12", ".pfx", ".kdbx")):
+        return True
+    if name_low in {"id_rsa", "id_ed25519", "secrets.json", "credentials.json", ".npmrc", ".netrc"}:
+        return True
+    return "secret" in name_low or "credential" in name_low
+
+
+def list_project_files(
+    projects_root: Path,
+    project_name: str,
+    rel_path: str = "",
+) -> dict[str, Any]:
+    """List directories and files safely within a single project folder."""
+    project_dir = resolve_project_dir(projects_root, project_name)
+    target_dir = _resolve_relative_project_path(project_dir, rel_path)
+    if not target_dir.is_dir():
+        raise ValueError(f"Directory not found inside {project_name}: {rel_path!r}")
+
+    resolved_root = project_dir.resolve()
+    rel_clean = (
+        ""
+        if target_dir.resolve() == resolved_root
+        else target_dir.resolve().relative_to(resolved_root).as_posix()
+    )
+    parent_path = ""
+    if rel_clean:
+        parent_obj = Path(rel_clean).parent
+        parent_path = "" if str(parent_obj) == "." else parent_obj.as_posix()
+
+    entries: list[dict[str, Any]] = []
+    try:
+        children = list(target_dir.iterdir())
+    except OSError as exc:
+        raise ValueError(f"Cannot list directory: {exc}") from exc
+
+    for child in children:
+        if child.name in _SKIP_DIR_NAMES or child.name == ".DS_Store":
+            continue
+        try:
+            resolved_child = child.resolve()
+            if not resolved_child.is_relative_to(resolved_root):
+                continue
+            stat = resolved_child.stat()
+        except OSError:
+            continue
+        is_dir = resolved_child.is_dir()
+        child_rel = resolved_child.relative_to(resolved_root).as_posix()
+        entries.append(
+            {
+                "name": child.name,
+                "rel_path": child_rel,
+                "is_dir": is_dir,
+                "size_bytes": 0 if is_dir else stat.st_size,
+                "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            }
+        )
+
+    entries.sort(key=lambda item: (not bool(item["is_dir"]), str(item["name"]).lower()))
+    return {
+        "project": project_name,
+        "rel_path": rel_clean,
+        "parent_path": parent_path,
+        "entries": entries,
+    }
+
+
+def read_project_file(
+    projects_root: Path,
+    project_name: str,
+    rel_path: str,
+    *,
+    max_bytes: int = 128_000,
+) -> dict[str, Any]:
+    """Read a non-sensitive UTF-8 project file up to max_bytes with secret redaction."""
+    if not rel_path.strip():
+        raise ValueError("rel_path must not be empty.")
+    project_dir = resolve_project_dir(projects_root, project_name)
+    target = _resolve_relative_project_path(project_dir, rel_path)
+    if not target.is_file():
+        raise ValueError(f"File not found inside {project_name}: {rel_path!r}")
+    if _is_sensitive_filename(target):
+        raise ValueError(f"Access to sensitive file {target.name!r} is restricted.")
+
+    raw_bytes = target.read_bytes()
+    total_size = len(raw_bytes)
+    sample = raw_bytes[:8192]
+    if b"\x00" in sample:
+        raise ValueError(f"Binary file preview is not supported for {target.name!r}.")
+
+    truncated = total_size > max_bytes
+    text = raw_bytes[:max_bytes].decode("utf-8", errors="replace")
+    scrubbed = _scrub_text(text)
+    if contains_unredacted_secret_strict(scrubbed):
+        scrubbed = "[REDACTED]"
+    return {
+        "project": project_name,
+        "rel_path": target.resolve().relative_to(project_dir.resolve()).as_posix(),
+        "size_bytes": total_size,
+        "truncated": truncated,
+        "content": scrubbed,
+    }

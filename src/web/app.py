@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, quote_plus, urlparse
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -41,6 +43,8 @@ from src.storage.redaction import (
     is_sensitive_key_strict,
     redact_payload_strict,
 )
+from src.web.live_browser import LiveBrowserController
+from src.web.live_terminal import LiveTerminalSession
 from src.web.protocols import CoordinatorProtocol, SessionManagerProtocol, TaskSnapshot, maybe_await
 from src.web.schemas import (
     AgySendRequest,
@@ -56,7 +60,10 @@ from src.web.workspace import (
     default_projects_root,
     find_agy_executable,
     list_agy_conversations,
+    list_agy_models,
     list_local_projects,
+    list_project_files,
+    read_project_file,
     resolve_project_dir,
     send_agy_prompt,
 )
@@ -643,6 +650,21 @@ def create_app(
         else:
             sess_mgr = session_manager
 
+    env_live_root = (
+        os.environ.get("GROKBOT_PROFILE_ROOT", "").strip()
+        or os.environ.get("GROKBOT_PROFILES_DIR", "").strip()
+    )
+    live_profile_root = (
+        Path(env_live_root) / "live_studio"
+        if env_live_root
+        else (
+            resolved_db.parent / "browser_profiles" / "live_studio"
+            if resolved_db is not None
+            else Path.cwd() / ".grokbot_profiles" / "live_studio"
+        )
+    )
+    live_browser = LiveBrowserController(profile_root=live_profile_root)
+
     jinja_env = Environment(
         loader=FileSystemLoader(str(_TEMPLATES_DIR)),
         autoescape=True,
@@ -651,14 +673,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        if active_runtime is not None:
-            async with active_runtime:
-                yield
-            return
         try:
-            yield
+            if active_runtime is not None:
+                async with active_runtime:
+                    yield
+            else:
+                yield
         finally:
-            if owns_session_manager and internal_sm is not None:
+            await live_browser.stop()
+            if active_runtime is None and owns_session_manager and internal_sm is not None:
                 await internal_sm.close_all()
 
     app = FastAPI(title="Grokbotclon Local Operator Console", version="1.0.0", lifespan=lifespan)
@@ -718,6 +741,47 @@ def create_app(
             content=_scrub_and_verify(payload, label="ProjectsList"),
         )
 
+    @app.get("/api/projects/{project_name}/files")
+    async def api_list_project_files(project_name: str, path: str = "") -> JSONResponse:
+        try:
+            listing = list_project_files(default_projects_root(), project_name, path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(listing, label="ProjectFiles"),
+        )
+
+    @app.get("/api/projects/{project_name}/file")
+    async def api_read_project_file(project_name: str, path: str) -> JSONResponse:
+        try:
+            doc = read_project_file(default_projects_root(), project_name, path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(doc, label="ProjectFile"),
+        )
+
+    @app.get("/api/agy/models")
+    async def api_list_agy_models(refresh: bool = False) -> JSONResponse:
+        models = await list_agy_models(force_refresh=refresh)
+        payload = {
+            "available": find_agy_executable() is not None,
+            "default_model": "gemini-4-carbon-low",
+            "models": models,
+        }
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(payload, label="AgyModels"),
+        )
+
     @app.get("/api/agy/conversations")
     async def api_list_agy_conversations() -> JSONResponse:
         brain_root = default_agy_brain_root()
@@ -749,6 +813,7 @@ def create_app(
                 conversation_id=payload.conversation_id,
                 project_dir=project_dir,
                 model=payload.model,
+                allow_hydrogen=payload.allow_hydrogen,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -770,6 +835,180 @@ def create_app(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(result, label="AgySendResult"),
         )
+
+    @app.get("/api/browser/status")
+    async def api_browser_status() -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(await live_browser.status(), label="BrowserStatus"),
+        )
+
+    @app.post("/api/browser/start")
+    async def api_browser_start(request: Request) -> JSONResponse:
+        initial_url: str | None = None
+        raw_body = await request.body()
+        if raw_body.strip():
+            try:
+                parsed = json.loads(raw_body.decode("utf-8"))
+                if isinstance(parsed, dict) and isinstance(parsed.get("url"), str):
+                    initial_url = parsed["url"]
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid JSON body.") from exc
+        try:
+            st = await live_browser.start(initial_url=initial_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(st, label="BrowserStatus"),
+        )
+
+    @app.post("/api/browser/stop")
+    async def api_browser_stop() -> JSONResponse:
+        st = await live_browser.stop()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(st, label="BrowserStatus"),
+        )
+
+    @app.websocket("/ws/browser")
+    async def ws_live_browser(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_json({"type": "status", **(await live_browser.status())})
+        initial_frame = await live_browser.capture_frame()
+        if initial_frame is not None:
+            await websocket.send_json(initial_frame)
+
+        async def _send_state_and_frame() -> None:
+            st = await live_browser.status()
+            await websocket.send_json({"type": "status", **st})
+            if st.get("running"):
+                frame = await live_browser.capture_frame()
+                if frame is not None:
+                    await websocket.send_json(frame)
+
+        async def _reader() -> None:
+            while True:
+                msg = await websocket.receive_json()
+                if not isinstance(msg, dict):
+                    continue
+                ev_type = str(msg.get("type", "")).strip().lower()
+                try:
+                    if ev_type == "start":
+                        url_arg = msg.get("url")
+                        await live_browser.start(
+                            initial_url=str(url_arg) if isinstance(url_arg, str) else None
+                        )
+                    elif ev_type == "stop":
+                        await live_browser.stop()
+                    elif ev_type == "navigate":
+                        await live_browser.navigate(str(msg.get("url", "")))
+                    elif ev_type == "back":
+                        await live_browser.go_back()
+                    elif ev_type == "forward":
+                        await live_browser.go_forward()
+                    elif ev_type == "reload":
+                        await live_browser.reload()
+                    elif ev_type in {"click", "dblclick", "wheel", "type", "key"}:
+                        await live_browser.handle_input(msg)
+                    await _send_state_and_frame()
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "message": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": str(_scrub_and_verify(str(exc), label="ws_error")),
+                        }
+                    )
+
+        async def _ticker() -> None:
+            while True:
+                await asyncio.sleep(0.55)
+                if live_browser.running:
+                    frame = await live_browser.capture_frame()
+                    if frame is not None:
+                        await websocket.send_json(frame)
+
+        reader_task = asyncio.create_task(_reader())
+        ticker_task = asyncio.create_task(_ticker())
+        try:
+            done, pending = await asyncio.wait(
+                {reader_task, ticker_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                with contextlib.suppress(WebSocketDisconnect, asyncio.CancelledError):
+                    t.result()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            for t in (reader_task, ticker_task):
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+
+    @app.websocket("/ws/terminal")
+    async def ws_live_terminal(websocket: WebSocket) -> None:
+        await websocket.accept()
+        project_name = websocket.query_params.get("project", "").strip()
+        if project_name:
+            try:
+                cwd = resolve_project_dir(default_projects_root(), project_name)
+            except ValueError as exc:
+                await websocket.send_json({"type": "error", "message": str(exc)})
+                await websocket.close(code=1008)
+                return
+        else:
+            root = default_projects_root()
+            cwd = root if root.is_dir() else Path.cwd()
+
+        term = LiveTerminalSession(cwd=cwd)
+        await websocket.send_json({"type": "ready", "cwd": str(cwd)})
+
+        async def _pty_to_ws() -> None:
+            while True:
+                chunk = await term.output_queue.get()
+                if chunk is None:
+                    await websocket.send_json({"type": "exit"})
+                    break
+                await websocket.send_json({"type": "output", "data": chunk})
+
+        async def _ws_to_pty() -> None:
+            while True:
+                msg = await websocket.receive_json()
+                if not isinstance(msg, dict):
+                    continue
+                msg_type = str(msg.get("type", "")).strip().lower()
+                if msg_type == "input":
+                    term.write(str(msg.get("data", "")))
+                elif msg_type == "resize":
+                    cols = int(msg.get("cols", 100))
+                    rows = int(msg.get("rows", 28))
+                    term.resize(cols=cols, rows=rows)
+
+        out_task = asyncio.create_task(_pty_to_ws())
+        in_task = asyncio.create_task(_ws_to_pty())
+        try:
+            done, pending = await asyncio.wait(
+                {out_task, in_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                with contextlib.suppress(WebSocketDisconnect, asyncio.CancelledError):
+                    t.result()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            for t in (out_task, in_task):
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+            term.close()
 
     @app.post("/api/tasks", status_code=status.HTTP_201_CREATED)
     async def api_submit_task(payload: TaskSubmitRequest) -> JSONResponse:

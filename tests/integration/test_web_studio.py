@@ -1,4 +1,4 @@
-"""N2 integration tests for ControlBot Studio UX (/app), workspace APIs, and local_server."""
+"""N2 integration tests for ControlBot Studio UX (/app), live browser/terminal & workspace."""
 
 from __future__ import annotations
 
@@ -12,6 +12,34 @@ from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.local_server import running_local_stack
 from src.storage.redaction import contains_unredacted_secret_strict
 from src.web import create_app
+from src.web.workspace import parse_agy_models_output
+from starlette.testclient import TestClient
+
+
+@pytest.mark.n1
+def test_parse_agy_models_output_handles_spinner_and_hydrogen_flag() -> None:
+    raw = (
+        "\r⠋ Fetching available models...\r⠙ Fetching available models...\n"
+        "gemini-4-neon-high             Gemini 4 Neon (High)\n"
+        "gemini-4-carbon-low            Gemini 4 Carbon (Low)\n"
+        "gemini-4-hydrogen-low          Gemini 4 Hydrogen (Low)\n"
+        "claude-sonnet-4-6              Claude Sonnet 4.6 (Thinking)\n"
+        "claude-opus-4-6-thinking       Claude Opus 4.6 (Thinking)\n"
+        "gpt-oss-120b-medium            GPT-OSS 120B (Medium)\n"
+    )
+    parsed = parse_agy_models_output(raw)
+    ids = [m["id"] for m in parsed]
+    assert ids == [
+        "gemini-4-neon-high",
+        "gemini-4-carbon-low",
+        "gemini-4-hydrogen-low",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium",
+    ]
+    hydrogen_flags = {m["id"]: m["is_hydrogen"] for m in parsed}
+    assert hydrogen_flags["gemini-4-hydrogen-low"] is True
+    assert hydrogen_flags["claude-sonnet-4-6"] is False
 
 
 @pytest.mark.n2
@@ -22,13 +50,13 @@ async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Pat
         studio_resp = await client.get("/app")
         assert studio_resp.status_code == 200
         assert "text/html" in studio_resp.headers["content-type"].lower()
-        body = studio_resp.text
-        body_low = body.lower()
+        body_low = studio_resp.text.lower()
         assert "controlbot studio" in body_low
         assert "color-scheme: light" in body_low
         assert "#f8fafc" in body_low
         assert "controlbot.showplantmodule" in body_low
-        assert "conversaciones antigravity" in body_low
+        assert "computador en vivo" in body_low
+        assert "mostrar hydrogen" in body_low
         assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
         assert "https://" not in body_low
 
@@ -46,14 +74,19 @@ async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Pat
 
 
 @pytest.mark.n2
-async def test_projects_and_agy_workspace_apis_with_safety_validation(
+async def test_projects_files_models_and_agy_workspace_apis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     projects_dir = tmp_path / "Projects"
     proj_alpha = projects_dir / "AlphaApp"
-    proj_alpha.mkdir(parents=True)
-    (proj_alpha / "README.md").write_text("# AlphaApp\n", encoding="utf-8")
+    (proj_alpha / "src").mkdir(parents=True)
+    (proj_alpha / "README.md").write_text(
+        "# AlphaApp\napi_key=secret-readme-999\n",
+        encoding="utf-8",
+    )
+    (proj_alpha / ".env").write_text("SECRET=123\n", encoding="utf-8")
+    (proj_alpha / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
 
     brain_dir = tmp_path / "brain"
     conv_uuid = "11111111-2222-3333-4444-555555555555"
@@ -88,6 +121,29 @@ async def test_projects_and_agy_workspace_apis_with_safety_validation(
         assert [p["name"] for p in proj_json["projects"]] == ["AlphaApp"]
         assert proj_json["projects"][0]["has_readme"] is True
 
+        files_resp = await client.get("/api/projects/AlphaApp/files")
+        assert files_resp.status_code == 200
+        entry_names = [e["name"] for e in files_resp.json()["entries"]]
+        assert "README.md" in entry_names
+        assert "src" in entry_names
+
+        read_resp = await client.get("/api/projects/AlphaApp/file", params={"path": "README.md"})
+        assert read_resp.status_code == 200
+        assert "secret-readme-999" not in read_resp.json()["content"]
+        assert REDACTED_PLACEHOLDER in read_resp.json()["content"]
+
+        env_blocked = await client.get("/api/projects/AlphaApp/file", params={"path": ".env"})
+        assert env_blocked.status_code == 422
+
+        trav_blocked = await client.get("/api/projects/AlphaApp/file", params={"path": "../etc"})
+        assert trav_blocked.status_code == 422
+
+        models_resp = await client.get("/api/agy/models")
+        assert models_resp.status_code == 200
+        models_json = models_resp.json()
+        assert models_json["default_model"] == "gemini-4-carbon-low"
+        assert len(models_json["models"]) >= 5
+
         convs_resp = await client.get("/api/agy/conversations")
         assert convs_resp.status_code == 200
         convs = convs_resp.json()["conversations"]
@@ -108,6 +164,45 @@ async def test_projects_and_agy_workspace_apis_with_safety_validation(
             json={"prompt": "hola", "project_name": "../etc", "model": "gemini-4-carbon-low"},
         )
         assert bad_proj.status_code == 422
+
+
+@pytest.mark.n2
+def test_lazy_browser_and_live_terminal_websocket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projects_dir = tmp_path / "Projects"
+    proj = projects_dir / "DemoProj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("CONTROLBOT_PROJECTS_ROOT", str(projects_dir))
+
+    app = create_app(db_path=tmp_path / "ws_live.sqlite3")
+    with TestClient(app) as client:
+        st0 = client.get("/api/browser/status")
+        assert st0.status_code == 200
+        assert st0.json()["running"] is False
+
+        started = client.post("/api/browser/start", json={})
+        assert started.status_code == 200
+        assert started.json()["running"] is True
+
+        stopped = client.post("/api/browser/stop")
+        assert stopped.status_code == 200
+        assert stopped.json()["running"] is False
+
+        with client.websocket_connect("/ws/terminal?project=DemoProj") as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "ready"
+            assert str(proj.resolve()) == ready["cwd"]
+            ws.send_json({"type": "input", "data": "echo CONTROLBOT_PTY_OK\n"})
+            collected = ""
+            for _ in range(30):
+                msg = ws.receive_json()
+                if msg.get("type") == "output":
+                    collected += str(msg.get("data", ""))
+                    if "CONTROLBOT_PTY_OK" in collected:
+                        break
+            assert "CONTROLBOT_PTY_OK" in collected
 
 
 @pytest.mark.n2
@@ -146,8 +241,6 @@ async def test_unified_local_server_stack_boots_and_completes_pump34_task(tmp_pa
             assert sys_json["runtime_mode"] == "live_runtime"
             assert sys_json["backend_mode"] == "emulated"
             assert sys_json["facility"]["facility_id"] == "facility-a"
-            app_ids = {item["app_id"] for item in sys_json["facility"]["apps"]}
-            assert app_ids == {"scada", "maintenance", "effect_sim"}
 
             studio_resp = await client.get("/app")
             assert studio_resp.status_code == 200

@@ -40,8 +40,8 @@
       background: var(--bg);
       color: var(--text);
       font-family: var(--sans);
-      font-size: 14px;
-      line-height: 1.5;
+      font-size: 13.5px;
+      line-height: 1.48;
     }
     a { color: var(--blue); text-decoration: none; }
     a:hover { text-decoration: underline; }
@@ -49,32 +49,26 @@
 
     .layout {
       display: grid;
-      grid-template-columns: 300px minmax(0, 1fr) 0px;
+      grid-template-columns: 260px minmax(340px, 1fr) minmax(440px, 1.2fr);
       height: 100vh;
       overflow: hidden;
     }
-    .layout.show-inspector {
-      grid-template-columns: 300px minmax(0, 1fr) 320px;
+    .layout.computer-hidden {
+      grid-template-columns: 260px minmax(0, 1fr) 0px;
     }
 
-    .sidebar, .inspector {
+    .sidebar, .computer-pane {
       background: var(--surface);
-      border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
-    .inspector {
-      border-right: none;
-      border-left: 1px solid var(--border);
-    }
-    .layout:not(.show-inspector) .inspector {
-      border-left: none;
-      visibility: hidden;
-    }
+    .sidebar { border-right: 1px solid var(--border); }
+    .computer-pane { border-left: 1px solid var(--border); }
+    .layout.computer-hidden .computer-pane { border-left: none; visibility: hidden; }
 
     .panel-header {
-      padding: 14px 16px;
+      padding: 12px 14px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
@@ -88,8 +82,7 @@
       align-items: center;
       gap: 8px;
       font-weight: 700;
-      font-size: 15px;
-      letter-spacing: -0.01em;
+      font-size: 14.5px;
       color: var(--text);
     }
     .brand-dot {
@@ -99,13 +92,10 @@
       background: #10b981;
       box-shadow: 0 0 0 3px #d1fae5;
     }
-    .brand-dot.offline {
-      background: var(--rose);
-      box-shadow: 0 0 0 3px var(--rose-soft);
-    }
+    .brand-dot.offline { background: var(--rose); box-shadow: 0 0 0 3px var(--rose-soft); }
 
     .badge-row {
-      padding: 8px 16px;
+      padding: 7px 14px;
       border-bottom: 1px solid var(--border);
       background: var(--bg);
       display: flex;
@@ -135,60 +125,41 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 6px;
-      padding: 7px 12px;
+      gap: 5px;
+      padding: 6px 11px;
       border-radius: 8px;
       border: 1px solid var(--border-strong);
       background: var(--surface);
       color: var(--text);
-      font-size: 12.5px;
+      font-size: 12px;
       font-weight: 600;
       cursor: pointer;
-      transition: background 0.14s, border-color 0.14s;
     }
     .btn:hover:not(:disabled) { background: var(--surface-subtle); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #ffffff;
-    }
+    .btn-primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
     .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
-    .btn-danger {
-      background: var(--rose-soft);
-      border-color: #fecdd3;
-      color: var(--rose);
-    }
-    .btn-sm { padding: 4px 9px; font-size: 11.5px; }
+    .btn-danger { background: var(--rose-soft); border-color: #fecdd3; color: var(--rose); }
+    .btn-sm { padding: 4px 8px; font-size: 11.5px; }
 
-    .sidebar-body, .inspector-body {
-      flex: 1;
-      overflow-y: auto;
-      padding: 12px;
-    }
+    .sidebar-body { flex: 1; overflow-y: auto; padding: 10px 12px; }
     .sidebar-footer {
-      padding: 10px 14px;
+      padding: 9px 12px;
       border-top: 1px solid var(--border);
       background: var(--bg);
-      font-size: 12px;
+      font-size: 11.5px;
       color: var(--text-dim);
       flex-shrink: 0;
     }
-    .sidebar-footer label {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      cursor: pointer;
-      user-select: none;
-    }
+    .sidebar-footer label { display: flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
 
     .section-label {
-      font-size: 11px;
+      font-size: 10.5px;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--text-muted);
-      margin: 14px 4px 7px;
+      margin: 12px 4px 6px;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -198,67 +169,30 @@
     .list-item {
       width: 100%;
       text-align: left;
-      padding: 8px 10px;
+      padding: 7px 9px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: transparent;
       color: var(--text);
       cursor: pointer;
-      margin-bottom: 3px;
+      margin-bottom: 2px;
       display: block;
     }
     .list-item:hover { background: var(--surface-subtle); }
-    .list-item.active {
-      background: var(--accent-soft);
-      border-color: #99f6e4;
-      color: var(--accent-text);
-    }
-    .list-item-title {
-      font-size: 12.5px;
-      font-weight: 600;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .list-item-sub {
-      font-size: 11px;
-      color: var(--text-muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-family: var(--mono);
-    }
+    .list-item.active { background: var(--accent-soft); border-color: #99f6e4; color: var(--accent-text); }
+    .list-item-title { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .list-item-sub { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
 
-    .cid-box {
-      display: flex;
-      gap: 6px;
-      margin-bottom: 8px;
-    }
-    .cid-input {
-      flex: 1;
-      min-width: 0;
+    .cid-box { display: flex; gap: 6px; margin-bottom: 7px; }
+    .text-input {
       padding: 6px 8px;
       border-radius: 7px;
       border: 1px solid var(--border-strong);
       background: var(--surface);
       color: var(--text);
-      font-family: var(--mono);
-      font-size: 11.5px;
-    }
-
-    .portal-link {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 7px 10px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      margin-bottom: 6px;
-      color: var(--text);
       font-size: 12px;
     }
-    .portal-link:hover { background: var(--surface-subtle); text-decoration: none; }
+    .cid-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 11.5px; }
 
     .main {
       display: flex;
@@ -268,178 +202,65 @@
       background: var(--bg);
     }
     .topbar {
-      padding: 11px 20px;
+      padding: 10px 16px;
       border-bottom: 1px solid var(--border);
       background: var(--surface);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 10px;
       flex-shrink: 0;
     }
-    .topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
-    .topbar-title {
-      font-weight: 700;
-      font-size: 14px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .topbar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .topbar-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .topbar-title { font-weight: 700; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .topbar-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
-    .thread {
-      flex: 1;
-      overflow-y: auto;
-      padding: 22px 26px;
-    }
-    .thread-inner {
-      width: 100%;
-      max-width: 900px;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-    }
+    .thread { flex: 1; overflow-y: auto; padding: 18px 20px; }
+    .thread-inner { width: 100%; max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
 
     .card {
       border-radius: var(--radius);
       border: 1px solid var(--border);
       background: var(--surface);
-      padding: 15px 18px;
+      padding: 13px 16px;
       box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
     }
-    .card-hero {
-      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
-      border-color: #cbd5e1;
-    }
-    .card-hero h1 { margin: 0 0 6px; font-size: 20px; letter-spacing: -0.02em; }
-    .card-hero p { margin: 0; color: var(--text-dim); }
-
-    .card-user {
-      background: #eff6ff;
-      border-color: #bfdbfe;
-      align-self: flex-end;
-      max-width: 84%;
-    }
-    .card-user-text { font-size: 14px; font-weight: 500; margin-bottom: 6px; white-space: pre-wrap; }
+    .card-hero { background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%); border-color: var(--border-strong); }
+    .card-hero h1 { margin: 0 0 5px; font-size: 18px; }
+    .card-hero p { margin: 0; color: var(--text-dim); font-size: 13px; }
+    .card-user { background: #eff6ff; border-color: #bfdbfe; align-self: flex-end; max-width: 88%; }
+    .card-user-text { font-size: 13.5px; font-weight: 500; margin-bottom: 6px; white-space: pre-wrap; }
     .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
-
-    .card-hitl {
-      border-color: #f59e0b;
-      background: #fffbeb;
-    }
-    .hitl-title { font-weight: 700; color: var(--amber); margin-bottom: 6px; font-size: 14px; }
-    .hitl-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
-    .hitl-input {
-      background: var(--surface);
-      border: 1px solid var(--border-strong);
-      border-radius: 8px;
-      color: var(--text);
-      padding: 6px 10px;
-      font-size: 13px;
-      min-width: 180px;
-    }
+    .card-hitl { border-color: #f59e0b; background: #fffbeb; }
 
     .cmd-strip {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
-      padding: 9px 12px;
+      gap: 8px;
+      padding: 8px 10px;
       border-radius: 8px;
       background: var(--surface-subtle);
       border: 1px solid var(--border);
       margin-top: 10px;
     }
-    .cmd-strip code {
-      overflow-x: auto;
-      white-space: nowrap;
-      color: var(--text);
-    }
+    .cmd-strip code { overflow-x: auto; white-space: nowrap; color: var(--text); }
 
-    .starter-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-      gap: 10px;
-      margin-top: 14px;
-    }
-    .starter-card {
-      text-align: left;
-      padding: 12px 14px;
-      border-radius: 9px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-      cursor: pointer;
-    }
-    .starter-card:hover { background: var(--surface-subtle); border-color: var(--accent); }
-    .starter-card-title { font-weight: 700; font-size: 13px; margin-bottom: 3px; }
-    .starter-card-desc { font-size: 12px; color: var(--text-dim); }
-
-    .banner {
-      padding: 10px 12px;
-      border-radius: 8px;
-      margin-top: 10px;
-      font-size: 12.5px;
-    }
-    .banner-warn { background: var(--amber-soft); border: 1px solid #fde68a; color: #92400e; }
+    .answer-box { font-size: 13.5px; color: var(--text); white-space: pre-wrap; line-height: 1.55; margin-top: 8px; }
+    .banner { padding: 9px 11px; border-radius: 8px; margin-top: 8px; font-size: 12px; }
     .banner-err { background: var(--rose-soft); border: 1px solid #fecdd3; color: #9f1239; }
+    .banner-warn { background: var(--amber-soft); border: 1px solid #fde68a; color: #92400e; }
 
-    .answer-box {
-      font-size: 14px;
-      color: var(--text);
-      white-space: pre-wrap;
-      line-height: 1.6;
-      margin-top: 8px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 10px;
-      font-size: 12px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--border);
-      padding: 7px 8px;
-      text-align: left;
-      vertical-align: top;
-    }
-    th {
-      color: var(--text-muted);
-      font-weight: 700;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-
-    .timeline-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-    .timeline-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 10px;
-      padding: 6px 9px;
-      border-radius: 7px;
-      background: var(--surface-subtle);
-      font-size: 12px;
-    }
-
-    .composer-wrap {
-      border-top: 1px solid var(--border);
-      background: var(--surface);
-      padding: 12px 24px 14px;
-      flex-shrink: 0;
-    }
-    .composer-inner { max-width: 900px; margin: 0 auto; }
+    .composer-wrap { border-top: 1px solid var(--border); background: var(--surface); padding: 10px 16px 12px; flex-shrink: 0; }
+    .composer-inner { max-width: 780px; margin: 0 auto; }
     .composer-box {
       display: flex;
-      gap: 10px;
+      gap: 8px;
       align-items: flex-end;
       background: var(--bg);
       border: 1px solid var(--border-strong);
       border-radius: 10px;
-      padding: 9px 12px;
+      padding: 8px 10px;
     }
     .composer-box:focus-within { border-color: var(--accent); background: var(--surface); }
     .composer-box textarea {
@@ -449,18 +270,18 @@
       outline: none;
       color: var(--text);
       font-family: var(--sans);
-      font-size: 14px;
+      font-size: 13.5px;
       resize: none;
-      min-height: 38px;
-      max-height: 140px;
+      min-height: 36px;
+      max-height: 130px;
     }
     .composer-controls {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 12px;
-      margin-top: 8px;
-      font-size: 12px;
+      gap: 10px;
+      margin-top: 7px;
+      font-size: 11.5px;
       color: var(--text-dim);
     }
     .composer-controls select {
@@ -468,40 +289,147 @@
       border: 1px solid var(--border-strong);
       color: var(--text);
       border-radius: 6px;
-      padding: 4px 8px;
-      font-size: 12px;
+      padding: 3px 7px;
+      font-size: 11.5px;
+      max-width: 240px;
     }
     .composer-controls label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
 
-    .meter { margin-bottom: 10px; }
-    .meter-head { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-dim); margin-bottom: 3px; }
-    .meter-track { height: 6px; border-radius: 999px; background: var(--surface-subtle); border: 1px solid var(--border); overflow: hidden; }
-    .meter-fill { height: 100%; background: var(--accent); transition: width 0.25s; }
-    .meter-fill.warn { background: #d97706; }
-
-    .session-card {
-      padding: 9px 10px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
+    /* Right Live Computer Workspace */
+    .comp-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
       background: var(--bg);
-      margin-bottom: 8px;
-      font-size: 12px;
+      flex-shrink: 0;
     }
-    .session-card-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
-    pre.json-box {
-      background: var(--surface-subtle);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px;
-      overflow-x: auto;
-      max-height: 240px;
-      margin: 8px 0 0;
-      color: var(--text);
+    .comp-tab {
+      padding: 5px 11px;
+      border-radius: 7px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .comp-tab:hover { background: var(--surface-hover); color: var(--text); }
+    .comp-tab.active {
+      background: var(--surface);
+      border-color: var(--border-strong);
+      color: var(--accent-text);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
     }
 
-    @media (max-width: 1080px) {
-      .layout.show-inspector { grid-template-columns: 270px minmax(0, 1fr) 0px; }
-      .inspector { display: none; }
+    .comp-panel { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+    .comp-panel.active { display: flex; }
+
+    .comp-toolbar {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+    .url-input { flex: 1; min-width: 140px; font-family: var(--mono); }
+
+    .browser-stage {
+      flex: 1;
+      background: #eef2f6;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      overflow: auto;
+      position: relative;
+    }
+    .browser-viewport {
+      position: relative;
+      background: #ffffff;
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+      overflow: hidden;
+      outline: none;
+      max-width: 100%;
+    }
+    .browser-viewport:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .browser-viewport img { display: block; width: 100%; height: auto; max-height: 100%; cursor: crosshair; user-select: none; }
+    .browser-placeholder {
+      text-align: center;
+      max-width: 400px;
+      padding: 28px 22px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    .term-screen {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 14px;
+      background: #fbfcfe;
+      color: #0f172a;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      outline: none;
+      cursor: text;
+    }
+    .term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-soft); }
+    .term-input-bar {
+      display: flex;
+      gap: 6px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+
+    .files-split { flex: 1; display: grid; grid-template-rows: 220px 1fr; overflow: hidden; }
+    .files-list { overflow-y: auto; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
+    .file-row {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 5px 8px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 12px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .file-row:hover { background: var(--surface-subtle); }
+    .file-viewer {
+      overflow: auto;
+      padding: 12px 14px;
+      background: #fbfcfe;
+      margin: 0;
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: pre;
+    }
+
+    .starter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; margin-top: 12px; }
+    .starter-card { text-align: left; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; }
+    .starter-card:hover { background: var(--surface-subtle); border-color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+    th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; }
+    th { color: var(--text-muted); font-size: 11px; text-transform: uppercase; }
+    .portal-link { display: flex; justify-content: space-between; align-items: center; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; margin-bottom: 5px; font-size: 11.5px; color: var(--text); }
+
+    @media (max-width: 1120px) {
+      .layout { grid-template-columns: 230px minmax(0, 1fr) 0px; }
+      .computer-pane { display: none; }
     }
     @media (max-width: 760px) {
       .layout { grid-template-columns: minmax(0, 1fr); }
@@ -517,7 +445,7 @@
           <span id="conn-dot" class="brand-dot"></span>
           <span>ControlBot Studio</span>
         </div>
-        <button id="new-agy-btn" class="btn btn-primary btn-sm" type="button">+ Nuevo chat</button>
+        <button id="new-agy-btn" class="btn btn-primary btn-sm" type="button">+ Nuevo</button>
       </div>
       <div id="system-badges" class="badge-row">
         <span class="pill">Conectando...</span>
@@ -528,20 +456,14 @@
           <span>Proyectos</span>
           <span id="projects-count" class="pill">0</span>
         </div>
-        <div id="projects-list">
-          <div style="color:var(--text-muted);font-size:12px;padding:4px;">Cargando proyectos...</div>
-        </div>
+        <div id="projects-list"></div>
 
-        <div class="section-label">
-          <span>Conversaciones Antigravity (agy)</span>
-        </div>
+        <div class="section-label"><span>Conversaciones Antigravity</span></div>
         <div class="cid-box">
-          <input id="cid-input" class="cid-input" type="text" placeholder="Pegar ID de conversación...">
+          <input id="cid-input" class="text-input cid-input" type="text" placeholder="Pegar ID de sesión...">
           <button id="cid-use-btn" class="btn btn-sm" type="button">Usar</button>
         </div>
-        <div id="agy-list">
-          <div style="color:var(--text-muted);font-size:12px;padding:4px;">Cargando sesiones...</div>
-        </div>
+        <div id="agy-list"></div>
 
         <div id="plant-sidebar-section" style="display:none;">
           <div class="section-label">
@@ -551,10 +473,7 @@
           <div id="runs-list"></div>
           <div class="section-label"><span>Portales Lab</span></div>
           <div id="portals-list"></div>
-          <a class="portal-link" href="/">
-            <span>Consola HTML Clásica</span>
-            <span class="pill">/</span>
-          </a>
+          <a class="portal-link" href="/"><span>Consola HTML Clásica</span><span class="pill">/</span></a>
         </div>
       </div>
 
@@ -570,13 +489,14 @@
       <div class="topbar">
         <div class="topbar-left">
           <span id="topbar-title" class="topbar-title">Workspace · Antigravity</span>
-          <span id="topbar-status" class="pill pill-info" style="display:none;"></span>
+          <span id="topbar-status" class="pill pill-ok">Listo</span>
         </div>
         <div class="topbar-actions">
-          <button id="workspace-mode-btn" class="btn btn-sm" type="button" style="display:none;">Workspace / agy</button>
-          <button id="plant-mode-btn" class="btn btn-sm" type="button" style="display:none;">Demo Planta</button>
+          <button id="open-term-resume-btn" class="btn btn-sm" type="button" style="display:none;">Abrir en Terminal</button>
+          <button id="workspace-mode-btn" class="btn btn-sm" type="button" style="display:none;">Chat</button>
+          <button id="plant-mode-btn" class="btn btn-sm" type="button" style="display:none;">Planta</button>
           <button id="cancel-top-btn" class="btn btn-danger btn-sm" type="button" style="display:none;">Cancelar</button>
-          <button id="toggle-inspector-btn" class="btn btn-sm" type="button" style="display:none;">Inspector</button>
+          <button id="toggle-computer-btn" class="btn btn-sm" type="button">Computador</button>
         </div>
       </div>
 
@@ -586,34 +506,34 @@
 
       <div class="composer-wrap">
         <div class="composer-inner">
-          <div id="submit-error" class="banner banner-err" style="display:none;margin-top:0;margin-bottom:10px;"></div>
+          <div id="submit-error" class="banner banner-err" style="display:none;margin-top:0;margin-bottom:8px;"></div>
           <div class="composer-box">
             <textarea id="query-input" rows="2" placeholder="Escribe un prompt para el proyecto/conversación actual — Enter para enviar"></textarea>
             <button id="send-btn" class="btn btn-primary" type="button">Enviar</button>
           </div>
           <div id="agy-composer-controls" class="composer-controls">
-            <span>Modelo Antigravity:
-              <select id="agy-model-select">
-                <option value="gemini-4-carbon-low" selected>Gemini 4 Carbon (Low)</option>
-                <option value="gemini-4-carbon-medium">Gemini 4 Carbon (Medium)</option>
-                <option value="gemini-4-neon-low">Gemini 4 Neon (Low)</option>
-                <option value="gemini-4-neon-medium">Gemini 4 Neon (Medium)</option>
-              </select>
+            <span>Modelo:
+              <select id="agy-model-select"></select>
             </span>
+            <button id="refresh-models-btn" class="btn btn-sm" type="button">↻ Modelos</button>
+            <label title="Oculto por defecto porque tiende a alucinar o simular resultados">
+              <input id="show-hydrogen-check" type="checkbox">
+              <span>Mostrar Hydrogen</span>
+            </label>
             <span id="agy-context-label" style="margin-left:auto;color:var(--text-muted);"></span>
           </div>
           <div id="plant-composer-controls" class="composer-controls" style="display:none;">
             <span>Área:
               <select id="area-select">
-                <option value="">Auto (preguntar si es ambiguo)</option>
+                <option value="">Auto</option>
                 <option value="area-1" selected>area-1</option>
               </select>
             </span>
             <span>Usuario:
               <select id="user-select">
-                <option value="operator_ro" selected>operator_ro (Auditor)</option>
-                <option value="operator_a">operator_a (Área 1)</option>
-                <option value="operator_b">operator_b (Área 2)</option>
+                <option value="operator_ro" selected>operator_ro</option>
+                <option value="operator_a">operator_a</option>
+                <option value="operator_b">operator_b</option>
               </select>
             </span>
             <label><input id="readonly-check" type="checkbox" checked> Solo lectura</label>
@@ -623,45 +543,126 @@
       </div>
     </main>
 
-    <aside class="inspector">
+    <aside class="computer-pane">
       <div class="panel-header">
-        <strong style="font-size:13px;">Inspector Planta</strong>
-        <button id="refresh-btn" class="btn btn-sm" type="button">Actualizar</button>
+        <strong style="font-size:13.5px;">Computador en Vivo</strong>
+        <span id="comp-ram-pill" class="pill pill-ok">Modo ligero (0 MB idle)</span>
       </div>
-      <div class="inspector-body">
-        <div class="section-label"><span>Presupuesto de corrida</span></div>
-        <div id="budget-panel" style="color:var(--text-muted);font-size:12px;">
-          Selecciona una corrida de planta para ver sus métricas.
-        </div>
-
-        <div class="section-label"><span>Sesiones Playwright &amp; Takeover</span></div>
-        <div id="sessions-panel" style="color:var(--text-muted);font-size:12px;">
-          Sin sesiones activas todavía.
-        </div>
-
-        <div class="section-label"><span>Recibos redactados (JSON)</span></div>
-        <div id="receipts-json-panel" style="color:var(--text-muted);font-size:12px;">
-          Sin recibos en esta vista.
-        </div>
+      <div class="comp-tabs">
+        <button class="comp-tab active" data-tab="browser" type="button">Navegador</button>
+        <button class="comp-tab" data-tab="terminal" type="button">Terminal</button>
+        <button class="comp-tab" data-tab="files" type="button">Archivos</button>
+        <button class="comp-tab" data-tab="vm" type="button">Escritorio VM</button>
       </div>
+
+      <!-- TAB 1: LIVE INTERACTIVE PLAYWRIGHT BROWSER -->
+      <section id="tab-browser" class="comp-panel active">
+        <div class="comp-toolbar">
+          <button id="br-start-btn" class="btn btn-primary btn-sm" type="button">Iniciar</button>
+          <button id="br-stop-btn" class="btn btn-danger btn-sm" type="button" style="display:none;">Detener</button>
+          <button id="br-back-btn" class="btn btn-sm" type="button" title="Atrás">&larr;</button>
+          <button id="br-fwd-btn" class="btn btn-sm" type="button" title="Adelante">&rarr;</button>
+          <button id="br-reload-btn" class="btn btn-sm" type="button" title="Recargar">&#x21bb;</button>
+          <input id="br-url-input" class="text-input url-input" type="text" placeholder="127.0.0.1:8000 o github.com">
+          <button id="br-go-btn" class="btn btn-sm" type="button">Ir</button>
+        </div>
+        <div id="br-error" class="banner banner-err" style="display:none;margin:8px 12px 0;"></div>
+        <div class="browser-stage">
+          <div id="br-placeholder" class="browser-placeholder">
+            <h3 style="margin:0 0 6px;">Navegador Playwright en vivo</h3>
+            <p style="margin:0 0 12px;color:var(--text-dim);font-size:12.5px;">
+              Apagado por defecto para ahorrar RAM en tu Mac mini. Presiona <strong>Iniciar</strong> o escribe una URL arriba para navegar, hacer clic y probar logins en tiempo real.
+            </p>
+            <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+              <button id="br-quick-start-btn" class="btn btn-primary btn-sm" type="button">Iniciar navegador ahora</button>
+              <button id="br-quick-local-btn" class="btn btn-sm" type="button">Abrir 127.0.0.1:8000</button>
+            </div>
+          </div>
+          <div id="br-viewport" class="browser-viewport" tabindex="0" style="display:none;">
+            <img id="br-img" alt="Navegador vivo ControlBot">
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: LIVE INTERACTIVE PTY TERMINAL -->
+      <section id="tab-terminal" class="comp-panel">
+        <div class="comp-toolbar">
+          <button id="term-connect-btn" class="btn btn-primary btn-sm" type="button">Conectar zsh</button>
+          <button id="term-disconnect-btn" class="btn btn-danger btn-sm" type="button" style="display:none;">Desconectar</button>
+          <span id="term-cwd-pill" class="pill">~</span>
+          <button id="term-git-btn" class="btn btn-sm" type="button">git status</button>
+          <button id="term-ls-btn" class="btn btn-sm" type="button">ls -la</button>
+          <button id="term-ctrlc-btn" class="btn btn-sm" type="button">Ctrl+C</button>
+          <button id="term-clear-btn" class="btn btn-sm" type="button">Limpiar</button>
+        </div>
+        <div id="term-screen" class="term-screen" tabindex="0">Presiona "Conectar zsh" para abrir una terminal real en la Mac mini (carpeta del proyecto seleccionado).</div>
+        <div class="term-input-bar">
+          <input id="term-cmd-input" class="text-input url-input" type="text" placeholder="Escribe un comando (ej. agy --resume <id>) y Enter...">
+          <button id="term-send-btn" class="btn btn-primary btn-sm" type="button">Ejecutar</button>
+        </div>
+      </section>
+
+      <!-- TAB 3: PROJECT FILE EXPLORER -->
+      <section id="tab-files" class="comp-panel">
+        <div class="comp-toolbar">
+          <button id="files-up-btn" class="btn btn-sm" type="button">&uarr; Subir</button>
+          <span id="files-breadcrumb" class="pill">/</span>
+          <button id="files-refresh-btn" class="btn btn-sm" type="button" style="margin-left:auto;">&#x21bb;</button>
+        </div>
+        <div class="files-split">
+          <div id="files-list" class="files-list">
+            <div style="color:var(--text-muted);font-size:12px;">Selecciona un proyecto en la izquierda para explorar sus archivos.</div>
+          </div>
+          <pre id="file-viewer" class="file-viewer">Haz clic en cualquier archivo de código o texto para inspeccionarlo aquí.</pre>
+        </div>
+      </section>
+
+      <!-- TAB 4: OPTIONAL REMOTE LINUX VM (noVNC) -->
+      <section id="tab-vm" class="comp-panel">
+        <div class="comp-toolbar">
+          <input id="vm-url-input" class="text-input url-input" type="text" placeholder="URL noVNC opcional (ej. 10.0.0.20:6080/vnc.html)">
+          <button id="vm-connect-btn" class="btn btn-primary btn-sm" type="button">Conectar VM</button>
+          <button id="vm-disconnect-btn" class="btn btn-sm" type="button" style="display:none;">Cerrar</button>
+        </div>
+        <div id="vm-stage" style="flex:1;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--bg);">
+          <div id="vm-placeholder" class="browser-placeholder">
+            <h3 style="margin:0 0 6px;">Escritorio VM Linux (noVNC opcional)</h3>
+            <p style="margin:0;color:var(--text-dim);font-size:12.5px;">
+              Conecta cualquier contenedor Docker/Colima o servidor Linux con noVNC si más adelante quieres ver un escritorio Linux completo aquí (0 MB locales cuando no se usa).
+            </p>
+          </div>
+          <iframe id="vm-frame" title="Escritorio VM noVNC" style="display:none;width:100%;height:100%;border:none;background:#ffffff;"></iframe>
+        </div>
+      </section>
     </aside>
   </div>
 
   <script>
     (function () {
-      const TERMINAL = new Set(["succeeded", "failed", "partial", "cancelled"]);
+      const TERMINAL_STATUSES = new Set(["succeeded", "failed", "partial", "cancelled"]);
       const PLANT_KEY = "controlbot.showPlantModule";
+      const HYDROGEN_KEY = "controlbot.showHydrogen";
       let systemInfo = null;
       let projectsData = { projects_root: "", projects: [] };
       let agyData = { available: false, hostname: "Mac-mini", conversations: [] };
+      let modelsData = { available: false, default_model: "gemini-4-carbon-low", models: [] };
       let showPlantModule = localStorage.getItem(PLANT_KEY) === "true";
-      let activeMode = "agy"; // "agy" | "plant"
-      let selectedProject = null; // null or project object
+      let showHydrogen = localStorage.getItem(HYDROGEN_KEY) === "true";
+      let computerOpen = true;
+      let activeTab = "browser";
+      let activeMode = "agy";
+      let selectedProject = null;
       let activeAgyId = "";
       let agyTurns = [];
       let activeRunId = null;
       let pollTimer = null;
-      let inspectorOpen = false;
+
+      let browserWs = null;
+      let browserRunning = false;
+      let termWs = null;
+      let termBuffer = "";
+      let currentFilesRelPath = "";
+      let currentParentPath = "";
 
       const els = {
         layout: document.getElementById("layout"),
@@ -680,26 +681,59 @@
         portalsList: document.getElementById("portals-list"),
         topbarTitle: document.getElementById("topbar-title"),
         topbarStatus: document.getElementById("topbar-status"),
+        openTermResumeBtn: document.getElementById("open-term-resume-btn"),
         workspaceModeBtn: document.getElementById("workspace-mode-btn"),
         plantModeBtn: document.getElementById("plant-mode-btn"),
         cancelTopBtn: document.getElementById("cancel-top-btn"),
-        toggleInspectorBtn: document.getElementById("toggle-inspector-btn"),
+        toggleComputerBtn: document.getElementById("toggle-computer-btn"),
         threadInner: document.getElementById("thread-inner"),
         submitError: document.getElementById("submit-error"),
         queryInput: document.getElementById("query-input"),
         sendBtn: document.getElementById("send-btn"),
         agyComposerControls: document.getElementById("agy-composer-controls"),
         agyModelSelect: document.getElementById("agy-model-select"),
+        refreshModelsBtn: document.getElementById("refresh-models-btn"),
+        showHydrogenCheck: document.getElementById("show-hydrogen-check"),
         agyContextLabel: document.getElementById("agy-context-label"),
         plantComposerControls: document.getElementById("plant-composer-controls"),
         areaSelect: document.getElementById("area-select"),
         userSelect: document.getElementById("user-select"),
         readonlyCheck: document.getElementById("readonly-check"),
         facilityLabel: document.getElementById("facility-label"),
-        budgetPanel: document.getElementById("budget-panel"),
-        sessionsPanel: document.getElementById("sessions-panel"),
-        receiptsJsonPanel: document.getElementById("receipts-json-panel"),
-        refreshBtn: document.getElementById("refresh-btn")
+        compRamPill: document.getElementById("comp-ram-pill"),
+        brStartBtn: document.getElementById("br-start-btn"),
+        brStopBtn: document.getElementById("br-stop-btn"),
+        brBackBtn: document.getElementById("br-back-btn"),
+        brFwdBtn: document.getElementById("br-fwd-btn"),
+        brReloadBtn: document.getElementById("br-reload-btn"),
+        brUrlInput: document.getElementById("br-url-input"),
+        brGoBtn: document.getElementById("br-go-btn"),
+        brError: document.getElementById("br-error"),
+        brPlaceholder: document.getElementById("br-placeholder"),
+        brQuickStartBtn: document.getElementById("br-quick-start-btn"),
+        brQuickLocalBtn: document.getElementById("br-quick-local-btn"),
+        brViewport: document.getElementById("br-viewport"),
+        brImg: document.getElementById("br-img"),
+        termConnectBtn: document.getElementById("term-connect-btn"),
+        termDisconnectBtn: document.getElementById("term-disconnect-btn"),
+        termCwdPill: document.getElementById("term-cwd-pill"),
+        termGitBtn: document.getElementById("term-git-btn"),
+        termLsBtn: document.getElementById("term-ls-btn"),
+        termCtrlcBtn: document.getElementById("term-ctrlc-btn"),
+        termClearBtn: document.getElementById("term-clear-btn"),
+        termScreen: document.getElementById("term-screen"),
+        termCmdInput: document.getElementById("term-cmd-input"),
+        termSendBtn: document.getElementById("term-send-btn"),
+        filesUpBtn: document.getElementById("files-up-btn"),
+        filesBreadcrumb: document.getElementById("files-breadcrumb"),
+        filesRefreshBtn: document.getElementById("files-refresh-btn"),
+        filesList: document.getElementById("files-list"),
+        fileViewer: document.getElementById("file-viewer"),
+        vmUrlInput: document.getElementById("vm-url-input"),
+        vmConnectBtn: document.getElementById("vm-connect-btn"),
+        vmDisconnectBtn: document.getElementById("vm-disconnect-btn"),
+        vmPlaceholder: document.getElementById("vm-placeholder"),
+        vmFrame: document.getElementById("vm-frame")
       };
 
       function esc(val) {
@@ -716,6 +750,11 @@
         if (st === "waiting_for_input" || st === "partial" || st === "recovering") return "pill pill-warn";
         if (st === "failed" || st === "cancelled") return "pill pill-err";
         return "pill pill-info";
+      }
+
+      function wsUrl(path) {
+        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        return proto + "//" + window.location.host + path;
       }
 
       function showError(msg) {
@@ -755,22 +794,92 @@
         } catch (_) {}
       }
 
+      function stripAnsi(txt) {
+        return String(txt || "")
+          .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+          .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+      }
+
+      function appendTermOutput(chunk) {
+        const clean = stripAnsi(chunk);
+        const parts = clean.split("\r");
+        for (let i = 0; i < parts.length; i++) {
+          if (i > 0 && !parts[i].startsWith("\n")) {
+            const lastNl = termBuffer.lastIndexOf("\n");
+            termBuffer = lastNl >= 0 ? termBuffer.slice(0, lastNl + 1) : "";
+          }
+          termBuffer += parts[i];
+        }
+        if (termBuffer.length > 50000) {
+          termBuffer = termBuffer.slice(termBuffer.length - 50000);
+        }
+        els.termScreen.textContent = termBuffer;
+        els.termScreen.scrollTop = els.termScreen.scrollHeight;
+      }
+
+      function switchComputerTab(tabName) {
+        activeTab = tabName;
+        if (!computerOpen) {
+          computerOpen = true;
+          applyVisibility();
+        }
+        document.querySelectorAll(".comp-tab").forEach(function (btn) {
+          btn.classList.toggle("active", btn.getAttribute("data-tab") === tabName);
+        });
+        document.querySelectorAll(".comp-panel").forEach(function (panel) {
+          panel.classList.toggle("active", panel.id === "tab-" + tabName);
+        });
+        if (tabName === "files" && selectedProject) {
+          loadProjectFiles(selectedProject.name, currentFilesRelPath);
+        }
+      }
+
       function applyVisibility() {
         els.togglePlantModule.checked = showPlantModule;
+        els.showHydrogenCheck.checked = showHydrogen;
         els.plantSidebarSection.style.display = showPlantModule ? "block" : "none";
         els.workspaceModeBtn.style.display = showPlantModule ? "inline-flex" : "none";
         els.plantModeBtn.style.display = showPlantModule ? "inline-flex" : "none";
-        if (!showPlantModule && activeMode === "plant") {
-          activeMode = "agy";
-        }
+        if (!showPlantModule && activeMode === "plant") activeMode = "agy";
         const inPlant = showPlantModule && activeMode === "plant";
         els.agyComposerControls.style.display = inPlant ? "none" : "flex";
         els.plantComposerControls.style.display = inPlant ? "flex" : "none";
-        els.toggleInspectorBtn.style.display = inPlant ? "inline-flex" : "none";
-        els.layout.classList.toggle("show-inspector", inPlant && inspectorOpen);
+        els.openTermResumeBtn.style.display = (!inPlant && activeAgyId) ? "inline-flex" : "none";
+        els.layout.classList.toggle("computer-hidden", !computerOpen);
+        els.toggleComputerBtn.textContent = computerOpen ? "Ocultar Computador" : "Mostrar Computador";
         els.queryInput.placeholder = inPlant
           ? "Consulta de planta (ej. ¿Qué alarma apareció primero en la bomba 34?)"
           : "Escribe un prompt para Antigravity" + (selectedProject ? (" en " + selectedProject.name) : "") + " — Enter para enviar";
+      }
+
+      function updateRamPill() {
+        const parts = [];
+        if (browserRunning) parts.push("Navegador activo");
+        if (termWs && termWs.readyState === WebSocket.OPEN) parts.push("Terminal zsh");
+        if (parts.length === 0) {
+          els.compRamPill.className = "pill pill-ok";
+          els.compRamPill.textContent = "Modo ligero (0 MB idle)";
+        } else {
+          els.compRamPill.className = "pill pill-info";
+          els.compRamPill.textContent = parts.join(" + ");
+        }
+      }
+
+      function renderModelsSelect() {
+        const prev = els.agyModelSelect.value || modelsData.default_model || "gemini-4-carbon-low";
+        const visible = (modelsData.models || []).filter(function (m) {
+          return showHydrogen || !m.is_hydrogen;
+        });
+        if (visible.length === 0) {
+          els.agyModelSelect.innerHTML = '<option value="gemini-4-carbon-low">Gemini 4 Carbon (Low)</option>';
+          return;
+        }
+        els.agyModelSelect.innerHTML = visible.map(function (m) {
+          const suffix = m.is_hydrogen ? " (experimental)" : "";
+          return '<option value="' + esc(m.id) + '">' + esc(m.label + suffix) + '</option>';
+        }).join("");
+        const hasPrev = visible.some(function (m) { return m.id === prev; });
+        els.agyModelSelect.value = hasPrev ? prev : visible[0].id;
       }
 
       function renderSystemBadges() {
@@ -778,11 +887,10 @@
         if (systemInfo) {
           els.connDot.className = "brand-dot";
           badges.push('<span class="pill pill-ok">Servidor listo</span>');
-          if (agyData.hostname) {
-            badges.push('<span class="pill">' + esc(agyData.hostname) + '</span>');
-          }
-          if (showPlantModule) {
-            badges.push('<span class="pill pill-info">' + esc(systemInfo.backend_mode) + '</span>');
+          if (agyData.hostname) badges.push('<span class="pill">' + esc(agyData.hostname) + '</span>');
+          if (modelsData.models && modelsData.models.length) {
+            const count = modelsData.models.filter(function (m) { return showHydrogen || !m.is_hydrogen; }).length;
+            badges.push('<span class="pill pill-info">' + count + ' modelos</span>');
           }
         } else {
           els.connDot.className = "brand-dot offline";
@@ -816,10 +924,14 @@
           btn.addEventListener("click", function () {
             const name = btn.getAttribute("data-proj");
             selectedProject = name ? (items.find(function (x) { return x.name === name; }) || null) : null;
+            currentFilesRelPath = "";
             activeMode = "agy";
             renderProjects();
             renderWorkspaceThread();
-            applyVisibility();
+            if (selectedProject) {
+              loadProjectFiles(selectedProject.name, "");
+              if (activeTab === "files") switchComputerTab("files");
+            }
           });
         });
       }
@@ -827,7 +939,7 @@
       function renderAgyConversations() {
         const convs = agyData.conversations || [];
         if (convs.length === 0) {
-          els.agyList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:4px;">Sin transcripciones recientes.</div>';
+          els.agyList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:4px;">Sin sesiones recientes.</div>';
           return;
         }
         els.agyList.innerHTML = convs.map(function (c) {
@@ -847,7 +959,6 @@
             activeMode = "agy";
             renderAgyConversations();
             renderWorkspaceThread();
-            applyVisibility();
           });
         });
       }
@@ -862,7 +973,7 @@
 
         const projTitle = selectedProject ? ("Proyecto: " + selectedProject.name) : "Workspace general";
         els.topbarTitle.textContent = projTitle + (activeAgyId ? (" · " + activeAgyId.slice(0, 8)) : "");
-        els.agyContextLabel.textContent = selectedProject ? selectedProject.path : (projectsData.projects_root || "");
+        els.agyContextLabel.textContent = selectedProject ? selectedProject.name : "General";
 
         const resumeCmd = activeAgyId ? ("agy --resume " + activeAgyId) : "";
         const host = agyData.hostname || "Armandos-Mac-mini.local";
@@ -874,17 +985,15 @@
           '<div class="card card-hero">' +
             '<h1>' + esc(projTitle) + '</h1>' +
             '<p>' + (selectedProject
-              ? ('Trabajando en <code>' + esc(selectedProject.path) + '</code>. Selecciona un ID de Antigravity o escribe tu prompt abajo.')
-              : 'Elige un proyecto en la barra izquierda cuando lo necesites, o pega un ID de conversación Antigravity para continuarla.') +
+              ? ('Carpeta activa: <code>' + esc(selectedProject.path) + '</code>. Usa el chat aquí y el Navegador / Terminal / Archivos a la derecha.')
+              : 'Selecciona un proyecto, continúa una conversación Antigravity por ID o usa el Computador en Vivo a la derecha.') +
             '</p>' +
             (activeAgyId
-              ? ('<div class="cmd-strip">' +
-                  '<code>' + esc(resumeCmd) + '</code>' +
+              ? ('<div class="cmd-strip"><code>' + esc(resumeCmd) + '</code>' +
                   '<div style="display:flex;gap:6px;flex-shrink:0;">' +
-                    '<button id="copy-resume-btn" type="button" class="btn btn-sm">Copiar comando</button>' +
-                    '<button id="copy-ssh-btn" type="button" class="btn btn-sm">Copiar SSH</button>' +
-                  '</div>' +
-                '</div>')
+                    '<button id="copy-resume-btn" type="button" class="btn btn-sm">Copiar</button>' +
+                    '<button id="copy-ssh-btn" type="button" class="btn btn-sm">SSH</button>' +
+                  '</div></div>')
               : '') +
           '</div>'
         );
@@ -920,15 +1029,299 @@
 
         els.threadInner.innerHTML = blocks.join("");
         const copyBtn = document.getElementById("copy-resume-btn");
-        if (copyBtn) {
-          copyBtn.addEventListener("click", function () { copyText(resumeCmd, copyBtn); });
-        }
+        if (copyBtn) copyBtn.addEventListener("click", function () { copyText(resumeCmd, copyBtn); });
         const copySshBtn = document.getElementById("copy-ssh-btn");
-        if (copySshBtn) {
-          copySshBtn.addEventListener("click", function () { copyText(sshCmd, copySshBtn); });
+        if (copySshBtn) copySshBtn.addEventListener("click", function () { copyText(sshCmd, copySshBtn); });
+      }
+
+      /* ---------------- LIVE BROWSER WS ---------------- */
+      function ensureBrowserSocket(onReady) {
+        if (browserWs && browserWs.readyState === WebSocket.OPEN) {
+          if (onReady) onReady();
+          return;
+        }
+        browserWs = new WebSocket(wsUrl("/ws/browser"));
+        browserWs.onopen = function () {
+          if (onReady) onReady();
+        };
+        browserWs.onmessage = function (ev) {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "status") {
+              applyBrowserStatus(msg);
+            } else if (msg.type === "frame") {
+              applyBrowserStatus({ running: true, url: msg.url, title: msg.title });
+              els.brImg.src = "data:image/jpeg;base64," + msg.data;
+            } else if (msg.type === "error") {
+              els.brError.style.display = "block";
+              els.brError.textContent = msg.message || "Error de navegador";
+            }
+          } catch (_) {}
+        };
+        browserWs.onclose = function () {
+          browserWs = null;
+        };
+      }
+
+      function sendBrowserCmd(payload) {
+        els.brError.style.display = "none";
+        ensureBrowserSocket(function () {
+          if (browserWs && browserWs.readyState === WebSocket.OPEN) {
+            browserWs.send(JSON.stringify(payload));
+          }
+        });
+      }
+
+      function applyBrowserStatus(st) {
+        browserRunning = Boolean(st.running);
+        els.brStartBtn.style.display = browserRunning ? "none" : "inline-flex";
+        els.brStopBtn.style.display = browserRunning ? "inline-flex" : "none";
+        els.brPlaceholder.style.display = browserRunning ? "none" : "block";
+        els.brViewport.style.display = browserRunning ? "block" : "none";
+        if (st.url && document.activeElement !== els.brUrlInput) {
+          els.brUrlInput.value = st.url === "about:blank" ? "" : st.url;
+        }
+        updateRamPill();
+      }
+
+      function mapBrowserCoords(ev) {
+        const rect = els.brImg.getBoundingClientRect();
+        const x = rect.width > 0 ? ((ev.clientX - rect.left) * 1280) / rect.width : 0;
+        const y = rect.height > 0 ? ((ev.clientY - rect.top) * 800) / rect.height : 0;
+        return { x: Math.round(x), y: Math.round(y) };
+      }
+
+      els.brImg.addEventListener("click", function (ev) {
+        els.brViewport.focus();
+        const pos = mapBrowserCoords(ev);
+        sendBrowserCmd({ type: "click", x: pos.x, y: pos.y, button: "left" });
+      });
+      els.brImg.addEventListener("dblclick", function (ev) {
+        const pos = mapBrowserCoords(ev);
+        sendBrowserCmd({ type: "dblclick", x: pos.x, y: pos.y });
+      });
+      els.brImg.addEventListener("wheel", function (ev) {
+        ev.preventDefault();
+        sendBrowserCmd({ type: "wheel", dx: ev.deltaX, dy: ev.deltaY });
+      }, { passive: false });
+      els.brViewport.addEventListener("keydown", function (ev) {
+        if (ev.metaKey || ev.ctrlKey) return;
+        ev.preventDefault();
+        if (ev.key.length === 1) {
+          sendBrowserCmd({ type: "type", text: ev.key });
+        } else {
+          sendBrowserCmd({ type: "key", key: ev.key });
+        }
+      });
+
+      els.brStartBtn.addEventListener("click", function () {
+        sendBrowserCmd({ type: "start", url: els.brUrlInput.value.trim() || null });
+      });
+      els.brQuickStartBtn.addEventListener("click", function () {
+        sendBrowserCmd({ type: "start", url: null });
+      });
+      els.brQuickLocalBtn.addEventListener("click", function () {
+        els.brUrlInput.value = "127.0.0.1:8000";
+        sendBrowserCmd({ type: "navigate", url: "127.0.0.1:8000" });
+      });
+      els.brStopBtn.addEventListener("click", function () {
+        sendBrowserCmd({ type: "stop" });
+      });
+      els.brBackBtn.addEventListener("click", function () { sendBrowserCmd({ type: "back" }); });
+      els.brFwdBtn.addEventListener("click", function () { sendBrowserCmd({ type: "forward" }); });
+      els.brReloadBtn.addEventListener("click", function () { sendBrowserCmd({ type: "reload" }); });
+      els.brGoBtn.addEventListener("click", function () {
+        const u = els.brUrlInput.value.trim();
+        if (u) sendBrowserCmd({ type: "navigate", url: u });
+      });
+      els.brUrlInput.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") {
+          const u = els.brUrlInput.value.trim();
+          if (u) sendBrowserCmd({ type: "navigate", url: u });
+        }
+      });
+
+      /* ---------------- LIVE PTY TERMINAL WS ---------------- */
+      function connectTerminal(initialCmd) {
+        if (termWs && termWs.readyState === WebSocket.OPEN) {
+          if (initialCmd) termWs.send(JSON.stringify({ type: "input", data: initialCmd }));
+          return;
+        }
+        if (termWs) { termWs.close(); termWs = null; }
+        const q = selectedProject ? ("?project=" + encodeURIComponent(selectedProject.name)) : "";
+        termBuffer = "";
+        els.termScreen.textContent = "Conectando terminal...\n";
+        termWs = new WebSocket(wsUrl("/ws/terminal" + q));
+        termWs.onopen = function () {
+          els.termConnectBtn.style.display = "none";
+          els.termDisconnectBtn.style.display = "inline-flex";
+          updateRamPill();
+          termWs.send(JSON.stringify({ type: "resize", cols: 100, rows: 28 }));
+          if (initialCmd) {
+            setTimeout(function () {
+              if (termWs && termWs.readyState === WebSocket.OPEN) {
+                termWs.send(JSON.stringify({ type: "input", data: initialCmd }));
+              }
+            }, 300);
+          }
+        };
+        termWs.onmessage = function (ev) {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "ready") {
+              els.termCwdPill.textContent = msg.cwd || "~";
+            } else if (msg.type === "output") {
+              appendTermOutput(msg.data);
+            } else if (msg.type === "error") {
+              appendTermOutput("\n[ERROR] " + msg.message + "\n");
+            } else if (msg.type === "exit") {
+              appendTermOutput("\n[Sesión terminada]\n");
+            }
+          } catch (_) {}
+        };
+        termWs.onclose = function () {
+          termWs = null;
+          els.termConnectBtn.style.display = "inline-flex";
+          els.termDisconnectBtn.style.display = "none";
+          updateRamPill();
+        };
+      }
+
+      function sendTermInput(data) {
+        if (!termWs || termWs.readyState !== WebSocket.OPEN) return;
+        termWs.send(JSON.stringify({ type: "input", data: data }));
+      }
+
+      els.termConnectBtn.addEventListener("click", function () { connectTerminal(); });
+      els.termDisconnectBtn.addEventListener("click", function () {
+        if (termWs) termWs.close();
+      });
+      els.termGitBtn.addEventListener("click", function () {
+        if (!termWs || termWs.readyState !== WebSocket.OPEN) connectTerminal("git status\n");
+        else sendTermInput("git status\n");
+      });
+      els.termLsBtn.addEventListener("click", function () {
+        if (!termWs || termWs.readyState !== WebSocket.OPEN) connectTerminal("ls -la\n");
+        else sendTermInput("ls -la\n");
+      });
+      els.termCtrlcBtn.addEventListener("click", function () { sendTermInput("\x03"); });
+      els.termClearBtn.addEventListener("click", function () {
+        termBuffer = "";
+        els.termScreen.textContent = "";
+      });
+      els.termSendBtn.addEventListener("click", function () {
+        const cmd = els.termCmdInput.value;
+        els.termCmdInput.value = "";
+        if (!termWs || termWs.readyState !== WebSocket.OPEN) connectTerminal(cmd + "\n");
+        else sendTermInput(cmd + "\n");
+      });
+      els.termCmdInput.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") {
+          const cmd = els.termCmdInput.value;
+          els.termCmdInput.value = "";
+          if (!termWs || termWs.readyState !== WebSocket.OPEN) connectTerminal(cmd + "\n");
+          else sendTermInput(cmd + "\n");
+        }
+      });
+      els.termScreen.addEventListener("keydown", function (ev) {
+        if (!termWs || termWs.readyState !== WebSocket.OPEN) return;
+        if (ev.ctrlKey && ev.key.toLowerCase() === "c") {
+          ev.preventDefault();
+          sendTermInput("\x03");
+          return;
+        }
+        if (ev.metaKey) return;
+        ev.preventDefault();
+        if (ev.key === "Enter") sendTermInput("\r");
+        else if (ev.key === "Backspace") sendTermInput("\x7f");
+        else if (ev.key === "Tab") sendTermInput("\t");
+        else if (ev.key === "ArrowUp") sendTermInput("\x1b[A");
+        else if (ev.key === "ArrowDown") sendTermInput("\x1b[B");
+        else if (ev.key.length === 1) sendTermInput(ev.key);
+      });
+
+      els.openTermResumeBtn.addEventListener("click", function () {
+        if (!activeAgyId) return;
+        switchComputerTab("terminal");
+        connectTerminal("agy --resume " + activeAgyId + "\n");
+      });
+
+      /* ---------------- FILES EXPLORER ---------------- */
+      async function loadProjectFiles(projectName, relPath) {
+        if (!projectName) {
+          els.filesBreadcrumb.textContent = "/";
+          els.filesList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Selecciona un proyecto a la izquierda.</div>';
+          return;
+        }
+        try {
+          const data = await apiJson(
+            "/api/projects/" + encodeURIComponent(projectName) + "/files?path=" + encodeURIComponent(relPath || "")
+          );
+          currentFilesRelPath = data.rel_path || "";
+          currentParentPath = data.parent_path || "";
+          els.filesBreadcrumb.textContent = projectName + "/" + currentFilesRelPath;
+          const entries = data.entries || [];
+          els.filesList.innerHTML = entries.map(function (ent) {
+            const icon = ent.is_dir ? "📁" : "📄";
+            const size = ent.is_dir ? "dir" : (ent.size_bytes + " B");
+            return '<button type="button" class="file-row" data-rel="' + esc(ent.rel_path) + '" data-dir="' + (ent.is_dir ? "1" : "0") + '">' +
+              '<span>' + icon + ' ' + esc(ent.name) + '</span>' +
+              '<span style="color:var(--text-muted);font-family:var(--mono);font-size:11px;">' + esc(size) + '</span>' +
+            '</button>';
+          }).join("") || '<div style="color:var(--text-muted);font-size:12px;">Carpeta vacía.</div>';
+
+          els.filesList.querySelectorAll(".file-row").forEach(function (row) {
+            row.addEventListener("click", function () {
+              const rel = row.getAttribute("data-rel") || "";
+              if (row.getAttribute("data-dir") === "1") {
+                loadProjectFiles(projectName, rel);
+              } else {
+                openProjectFile(projectName, rel);
+              }
+            });
+          });
+        } catch (err) {
+          els.filesList.innerHTML = '<div class="banner banner-err">' + esc(err.message) + '</div>';
         }
       }
 
+      async function openProjectFile(projectName, relPath) {
+        els.fileViewer.textContent = "Cargando " + relPath + "...";
+        try {
+          const data = await apiJson(
+            "/api/projects/" + encodeURIComponent(projectName) + "/file?path=" + encodeURIComponent(relPath)
+          );
+          els.fileViewer.textContent = data.content + (data.truncated ? "\n\n... [truncado a 128 KB]" : "");
+        } catch (err) {
+          els.fileViewer.textContent = "[No disponible] " + err.message;
+        }
+      }
+
+      els.filesUpBtn.addEventListener("click", function () {
+        if (selectedProject) loadProjectFiles(selectedProject.name, currentParentPath);
+      });
+      els.filesRefreshBtn.addEventListener("click", function () {
+        if (selectedProject) loadProjectFiles(selectedProject.name, currentFilesRelPath);
+      });
+
+      /* ---------------- OPTIONAL VM (noVNC) ---------------- */
+      els.vmConnectBtn.addEventListener("click", function () {
+        let u = els.vmUrlInput.value.trim();
+        if (!u) return;
+        if (u.indexOf("://") < 0) u = "http://" + u;
+        els.vmPlaceholder.style.display = "none";
+        els.vmFrame.style.display = "block";
+        els.vmFrame.src = u;
+        els.vmDisconnectBtn.style.display = "inline-flex";
+      });
+      els.vmDisconnectBtn.addEventListener("click", function () {
+        els.vmFrame.src = "about:blank";
+        els.vmFrame.style.display = "none";
+        els.vmPlaceholder.style.display = "block";
+        els.vmDisconnectBtn.style.display = "none";
+      });
+
+      /* ---------------- PLANT DEMO (HIDDEN BY DEFAULT) ---------------- */
       function renderPlantWelcome() {
         activeMode = "plant";
         activeRunId = null;
@@ -937,42 +1330,15 @@
         els.topbarTitle.textContent = "Demo Planta · Nueva tarea";
         els.topbarStatus.style.display = "none";
         els.cancelTopBtn.style.display = "none";
-
         const starters = [
-          {
-            title: "Diagnóstico completo Bomba 34 (Área 1)",
-            desc: "Cruza alarmas SCADA y órdenes de mantenimiento en Playwright.",
-            query: "¿Qué alarma apareció primero en la bomba 34 y qué se cambió en su última intervención?",
-            areas: ["area-1"]
-          },
-          {
-            title: "Probar desambiguación humana",
-            desc: "Sin área fija: pausa en waiting_for_input para elegir Área.",
-            query: "¿Qué alarma apareció primero en la bomba 34 y qué se cambió en su última intervención?",
-            areas: []
-          },
-          {
-            title: "Inspeccionar alarmas y lecturas SCADA",
-            desc: "Consulta las lecturas recientes de la bomba 34.",
-            query: "Revisa las alarmas y lecturas actuales de la bomba 34",
-            areas: ["area-1"]
-          }
+          { title: "Diagnóstico Bomba 34 (Área 1)", desc: "Cruza SCADA y Mantenimiento.", query: "¿Qué alarma apareció primero en la bomba 34 y qué se cambió en su última intervención?", areas: ["area-1"] },
+          { title: "Desambiguación humana", desc: "Pausa en waiting_for_input.", query: "¿Qué alarma apareció primero en la bomba 34 y qué se cambió en su última intervención?", areas: [] }
         ];
-
         els.threadInner.innerHTML =
-          '<div class="card card-hero">' +
-            '<h1>Módulo Demo Planta</h1>' +
-            '<p>Flujo industrial verificable (SCADA + Maintenance + Playwright aislado). Requiere que los portales lab estén encendidos.</p>' +
-            '<div class="starter-grid">' +
-              starters.map(function (st, i) {
-                return '<button type="button" class="starter-card" data-idx="' + i + '">' +
-                  '<div class="starter-card-title">' + esc(st.title) + '</div>' +
-                  '<div class="starter-card-desc">' + esc(st.desc) + '</div>' +
-                '</button>';
-              }).join("") +
-            '</div>' +
-          '</div>';
-
+          '<div class="card card-hero"><h1>Módulo Demo Planta</h1><p>Flujo industrial verificable.</p><div class="starter-grid">' +
+          starters.map(function (st, i) {
+            return '<button type="button" class="starter-card" data-idx="' + i + '"><strong>' + esc(st.title) + '</strong><div style="font-size:12px;color:var(--text-dim);">' + esc(st.desc) + '</div></button>';
+          }).join("") + '</div></div>';
         els.threadInner.querySelectorAll(".starter-card").forEach(function (card) {
           card.addEventListener("click", function () {
             const st = starters[Number(card.getAttribute("data-idx"))];
@@ -981,125 +1347,59 @@
         });
       }
 
-      function renderBudgetMeter(label, used, limit, suffix) {
-        const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
-        const warn = pct >= 80 ? " warn" : "";
-        return '<div class="meter">' +
-          '<div class="meter-head"><span>' + esc(label) + '</span><span>' + esc(used) + ' / ' + esc(limit) + esc(suffix || "") + '</span></div>' +
-          '<div class="meter-track"><div class="meter-fill' + warn + '" style="width:' + pct + '%;"></div></div>' +
-        '</div>';
-      }
-
-      function renderPlantSnapshot(snap) {
-        activeMode = "plant";
-        applyVisibility();
-        const run = snap.run || {};
-        const task = snap.task || {};
-        const scope = task.scope || {};
-        const budget = snap.budget || {};
-        const cfg = budget.config || {};
-        const usage = budget.usage || {};
-        const transitions = Array.isArray(snap.transitions) ? snap.transitions : [];
-        const receipts = Array.isArray(snap.receipts) ? snap.receipts : [];
-        const result = snap.result || null;
-
-        els.topbarTitle.textContent = task.query || run.run_id;
-        els.topbarStatus.style.display = "inline-flex";
-        els.topbarStatus.className = statusPillClass(snap.status);
-        els.topbarStatus.textContent = snap.status;
-        els.cancelTopBtn.style.display = TERMINAL.has(snap.status) ? "none" : "inline-flex";
-
-        const totalTokens = Number(usage.prompt_tokens_used || 0) + Number(usage.completion_tokens_used || 0);
-        els.budgetPanel.innerHTML =
-          renderBudgetMeter("Tool calls", usage.tool_calls_used || 0, cfg.max_tool_calls || 16, "") +
-          renderBudgetMeter("Model calls", usage.model_calls_used || 0, cfg.max_model_calls || 8, "") +
-          renderBudgetMeter("Tokens", totalTokens, cfg.max_total_tokens || 24000, usage.usage_estimated ? " (est)" : "") +
-          renderBudgetMeter("Tiempo (s)", Number(usage.wall_seconds_elapsed || 0).toFixed(2), cfg.max_wall_seconds || 120, "s");
-
-        els.receiptsJsonPanel.innerHTML = receipts.length > 0
-          ? '<details><summary>Ver ' + receipts.length + ' recibo(s) JSON</summary><pre class="json-box">' + esc(JSON.stringify(receipts, null, 2)) + '</pre></details>'
-          : '<div style="color:var(--text-muted);font-size:12px;">Sin recibos aún.</div>';
-
-        const blocks = [];
-        blocks.push(
-          '<div class="card card-user">' +
-            '<div class="card-user-text">' + esc(task.query) + '</div>' +
-            '<div class="chip-row">' +
-              '<span class="pill">' + esc(run.run_id) + '</span>' +
-              '<span class="pill">' + esc(task.user_id) + '</span>' +
-              '<span class="pill">área: ' + esc((scope.allowed_areas && scope.allowed_areas.length) ? scope.allowed_areas.join(", ") : "auto") + '</span>' +
-            '</div>' +
-          '</div>'
-        );
-
-        if (snap.status === "waiting_for_input") {
-          const areas = (systemInfo && systemInfo.facility && systemInfo.facility.areas) || [{ area_id: "area-1", display_name: "Area 1" }];
-          blocks.push(
-            '<div class="card card-hitl">' +
-              '<div class="hitl-title">Intervención humana requerida</div>' +
-              '<div>' + esc(snap.required_action || snap.transition_reason || "Confirma el parámetro.") + '</div>' +
-              '<div class="hitl-actions">' +
-                areas.map(function (a) {
-                  return '<button type="button" class="btn btn-primary btn-sm hitl-choice-btn" data-choice="' + esc(a.area_id) + '">Elegir ' + esc(a.area_id) + '</button>';
-                }).join("") +
-                '<input id="hitl-custom-input" class="hitl-input" type="text" placeholder="Otro valor...">' +
-                '<button id="hitl-submit-btn" type="button" class="btn btn-sm">Reanudar</button>' +
-              '</div>' +
-            '</div>'
-          );
-        }
-
-        blocks.push(
-          '<div class="card"><strong>Trazabilidad</strong><div class="timeline-list">' +
-            transitions.map(function (t) {
-              return '<div class="timeline-row"><span><strong>' + esc(t.from_status || "init") + ' &rarr; ' + esc(t.to_status) + '</strong> · ' + esc(t.reason) + '</span><span style="font-family:var(--mono);font-size:11px;color:var(--text-muted);">' + esc(t.timestamp || "") + '</span></div>';
-            }).join("") +
-            receipts.map(function (r) {
-              return '<div class="timeline-row"><span><code>' + esc(r.tool_id) + '</code> · <span class="' + (r.outcome === "succeeded" ? "pill pill-ok" : "pill pill-warn") + '">' + esc(r.outcome) + '</span></span><span style="font-family:var(--mono);font-size:11px;color:var(--text-muted);">' + Number(r.duration_ms || 0).toFixed(1) + ' ms</span></div>';
-            }).join("") +
-          '</div></div>'
-        );
-
-        if (result) {
-          const obs = Array.isArray(result.verified_observations) ? result.verified_observations : [];
-          blocks.push(
-            '<div class="card">' +
-              '<div style="display:flex;justify-content:space-between;align-items:center;"><strong>Resultado</strong><span class="' + statusPillClass(result.status || snap.status) + '">' + esc(result.status || snap.status) + '</span></div>' +
-              '<div class="answer-box">' + esc(result.answer || "") + '</div>' +
-              (obs.length > 0 ? ('<table><thead><tr><th>Fuente</th><th>Activo</th><th>Valor</th><th>Unidad</th><th>Calidad</th><th>Área</th></tr></thead><tbody>' +
-                obs.map(function (o) {
-                  return '<tr><td>' + esc(o.source) + '</td><td><code>' + esc(o.asset_id) + '</code></td><td><strong>' + esc(o.value) + '</strong></td><td>' + esc(o.unit || "-") + '</td><td>' + esc(o.quality) + '</td><td>' + esc(o.area || "-") + '</td></tr>';
-                }).join("") + '</tbody></table>') : '') +
-            '</div>'
-          );
-        }
-        els.threadInner.innerHTML = blocks.join("");
-        els.threadInner.querySelectorAll(".hitl-choice-btn").forEach(function (btn) {
-          btn.addEventListener("click", function () { resumePlantRun(run.run_id, btn.getAttribute("data-choice")); });
-        });
-        const customBtn = document.getElementById("hitl-submit-btn");
-        const customInp = document.getElementById("hitl-custom-input");
-        if (customBtn && customInp) {
-          customBtn.addEventListener("click", function () {
-            if (customInp.value.trim()) resumePlantRun(run.run_id, customInp.value.trim());
-          });
-        }
-      }
-
       async function selectPlantRun(runId) {
         if (!runId) return;
         activeRunId = runId;
-        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        activeMode = "plant";
+        applyVisibility();
         try {
           const snap = await apiJson("/api/tasks/" + encodeURIComponent(runId));
-          renderPlantSnapshot(snap);
-          loadPlantRuns();
-          if (!TERMINAL.has(snap.status)) {
+          const run = snap.run || {};
+          const task = snap.task || {};
+          const result = snap.result || null;
+          els.topbarTitle.textContent = task.query || run.run_id;
+          els.topbarStatus.style.display = "inline-flex";
+          els.topbarStatus.className = statusPillClass(snap.status);
+          els.topbarStatus.textContent = snap.status;
+          els.cancelTopBtn.style.display = TERMINAL_STATUSES.has(snap.status) ? "none" : "inline-flex";
+          const blocks = ['<div class="card card-user"><div class="card-user-text">' + esc(task.query) + '</div><span class="pill">' + esc(run.run_id) + '</span></div>'];
+          if (snap.status === "waiting_for_input") {
+            blocks.push('<div class="card card-hitl"><strong>Intervención requerida:</strong> ' + esc(snap.required_action || "") + '<div style="margin-top:8px;"><button id="hitl-a1" class="btn btn-primary btn-sm" type="button">Elegir area-1</button></div></div>');
+          }
+          if (result) {
+            blocks.push('<div class="card"><strong>Resultado</strong><div class="answer-box">' + esc(result.answer || "") + '</div></div>');
+          }
+          els.threadInner.innerHTML = blocks.join("");
+          const hbtn = document.getElementById("hitl-a1");
+          if (hbtn) hbtn.addEventListener("click", async function () {
+            await apiJson("/api/tasks/" + encodeURIComponent(run.run_id) + "/resume", {
+              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ human_input: { choice: "area-1" } })
+            });
+            selectPlantRun(run.run_id);
+          });
+          if (!TERMINAL_STATUSES.has(snap.status)) {
             pollTimer = setTimeout(function () { selectPlantRun(runId); }, 1000);
           }
-        } catch (err) {
-          showError(err.message);
-        }
+        } catch (err) { showError(err.message); }
+      }
+
+      async function submitPlantTask(overrideQuery, overrideAreas) {
+        showError("");
+        const query = (overrideQuery != null ? overrideQuery : els.queryInput.value).trim();
+        if (!query) return;
+        const areaVal = els.areaSelect.value.trim();
+        const areas = overrideAreas != null ? overrideAreas : (areaVal ? [areaVal] : []);
+        const readOnly = Boolean(els.readonlyCheck.checked);
+        const facilityId = (systemInfo && systemInfo.facility && systemInfo.facility.facility_id) || "facility-a";
+        const apps = (systemInfo && systemInfo.facility && systemInfo.facility.apps) || [];
+        const origins = apps.filter(function (a) { return !readOnly || a.read_only; }).map(function (a) { return a.origin; });
+        const created = await apiJson("/api/tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: els.userSelect.value || "operator_ro", profile_id: "studio", facility_id: facilityId, allowed_origins: origins, allowed_areas: areas, read_only: readOnly, query: query })
+        });
+        if (overrideQuery == null) els.queryInput.value = "";
+        await selectPlantRun(created.run_id);
       }
 
       async function submitAgyPrompt() {
@@ -1123,7 +1423,8 @@
               prompt: prompt,
               conversation_id: activeAgyId || null,
               project_name: project,
-              model: model
+              model: model,
+              allow_hydrogen: showHydrogen
             })
           });
           agyTurns = agyTurns.filter(function (t) { return t.role !== "pending"; });
@@ -1147,70 +1448,28 @@
         }
       }
 
-      async function submitPlantTask(overrideQuery, overrideAreas) {
-        showError("");
-        const query = (overrideQuery != null ? overrideQuery : els.queryInput.value).trim();
-        if (!query) return;
-        const areaVal = els.areaSelect.value.trim();
-        const areas = overrideAreas != null ? overrideAreas : (areaVal ? [areaVal] : []);
-        const readOnly = Boolean(els.readonlyCheck.checked);
-        const facilityId = (systemInfo && systemInfo.facility && systemInfo.facility.facility_id) || "facility-a";
-        const apps = (systemInfo && systemInfo.facility && systemInfo.facility.apps) || [];
-        const origins = apps.filter(function (a) { return !readOnly || a.read_only; }).map(function (a) { return a.origin; });
-
-        els.sendBtn.disabled = true;
-        try {
-          const created = await apiJson("/api/tasks", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              user_id: els.userSelect.value || "operator_ro",
-              profile_id: "studio",
-              facility_id: facilityId,
-              allowed_origins: origins,
-              allowed_areas: areas,
-              read_only: readOnly,
-              query: query,
-              backend_mode: (systemInfo && systemInfo.backend_mode === "local_http") ? "local_http" : "emulated"
-            })
-          });
-          if (overrideQuery == null) els.queryInput.value = "";
-          await selectPlantRun(created.run_id);
-        } catch (err) {
-          showError(err.message);
-        } finally {
-          els.sendBtn.disabled = false;
-        }
-      }
-
-      async function resumePlantRun(runId, choice) {
-        try {
-          await apiJson("/api/tasks/" + encodeURIComponent(runId) + "/resume", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ human_input: { choice: choice } })
-          });
-          await selectPlantRun(runId);
-        } catch (err) { showError(err.message); }
-      }
-
       async function loadSystemInfo() {
         try {
           systemInfo = await apiJson("/api/system/info");
           renderSystemBadges();
           if (systemInfo.facility) {
             els.facilityLabel.textContent = systemInfo.facility.facility_name || systemInfo.facility.facility_id;
-            const apps = systemInfo.facility.apps || [];
-            els.portalsList.innerHTML = apps.map(function (a) {
+            els.portalsList.innerHTML = (systemInfo.facility.apps || []).map(function (a) {
               const hostLabel = String(a.origin || "").replace(/^https?:\/\//, "");
               return '<a class="portal-link" href="' + esc(a.origin) + '" target="_blank" rel="noopener noreferrer">' +
-                '<span>' + esc(a.app_id.toUpperCase()) + ' <span style="color:var(--text-muted);font-family:var(--mono);font-size:11px;">' + esc(hostLabel) + '</span></span>' +
-                '<span class="pill">' + (a.read_only ? "lectura" : "escritura") + '</span></a>';
+                '<span>' + esc(a.app_id.toUpperCase()) + ' · ' + esc(hostLabel) + '</span></a>';
             }).join("");
           }
-        } catch (_) {
-          systemInfo = null;
+        } catch (_) {}
+      }
+
+      async function loadModels(forceRefresh) {
+        try {
+          modelsData = await apiJson("/api/agy/models" + (forceRefresh ? "?refresh=1" : ""));
+          renderModelsSelect();
           renderSystemBadges();
+        } catch (_) {
+          renderModelsSelect();
         }
       }
 
@@ -1231,40 +1490,52 @@
         } catch (_) {}
       }
 
+      async function loadBrowserInitialStatus() {
+        try {
+          applyBrowserStatus(await apiJson("/api/browser/status"));
+        } catch (_) {}
+      }
+
       async function loadPlantRuns() {
         if (!showPlantModule) return;
         try {
           const data = await apiJson("/api/tasks");
           const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-          tasks.sort(function (a, b) {
-            return String((b.run && b.run.created_at) || "").localeCompare(String((a.run && a.run.created_at) || ""));
-          });
           els.runsList.innerHTML = tasks.map(function (snap) {
             const run = snap.run || {};
             const task = snap.task || {};
-            return '<button type="button" class="list-item' + (run.run_id === activeRunId ? ' active' : '') + '" data-run-id="' + esc(run.run_id) + '">' +
+            return '<button type="button" class="list-item" data-run-id="' + esc(run.run_id) + '">' +
               '<div class="list-item-title">' + esc(task.query || run.run_id) + '</div>' +
-              '<div class="list-item-sub">' + esc(snap.status) + ' · ' + esc(run.run_id) + '</div>' +
-            '</button>';
-          }).join("") || '<div style="color:var(--text-muted);font-size:12px;padding:4px;">Sin corridas.</div>';
+              '<div class="list-item-sub">' + esc(snap.status) + ' · ' + esc(run.run_id) + '</div></button>';
+          }).join("");
           els.runsList.querySelectorAll(".list-item").forEach(function (btn) {
             btn.addEventListener("click", function () { selectPlantRun(btn.getAttribute("data-run-id")); });
           });
         } catch (_) {}
       }
 
+      document.querySelectorAll(".comp-tab").forEach(function (btn) {
+        btn.addEventListener("click", function () { switchComputerTab(btn.getAttribute("data-tab")); });
+      });
+
+      els.toggleComputerBtn.addEventListener("click", function () {
+        computerOpen = !computerOpen;
+        applyVisibility();
+      });
       els.togglePlantModule.addEventListener("change", function () {
         showPlantModule = Boolean(els.togglePlantModule.checked);
         localStorage.setItem(PLANT_KEY, showPlantModule ? "true" : "false");
         applyVisibility();
-        renderSystemBadges();
-        if (showPlantModule) {
-          loadPlantRuns();
-        } else {
-          renderWorkspaceThread();
-        }
+        if (showPlantModule) loadPlantRuns();
+        else renderWorkspaceThread();
       });
-
+      els.showHydrogenCheck.addEventListener("change", function () {
+        showHydrogen = Boolean(els.showHydrogenCheck.checked);
+        localStorage.setItem(HYDROGEN_KEY, showHydrogen ? "true" : "false");
+        renderModelsSelect();
+        renderSystemBadges();
+      });
+      els.refreshModelsBtn.addEventListener("click", function () { loadModels(true); });
       els.cidUseBtn.addEventListener("click", function () {
         const val = els.cidInput.value.trim();
         if (!val) return;
@@ -1274,7 +1545,6 @@
         renderAgyConversations();
         renderWorkspaceThread();
       });
-
       els.newAgyBtn.addEventListener("click", function () {
         activeAgyId = "";
         els.cidInput.value = "";
@@ -1283,23 +1553,9 @@
         renderAgyConversations();
         renderWorkspaceThread();
       });
-
-      els.workspaceModeBtn.addEventListener("click", renderWorkspaceThread);
+      els.workspaceModeBtn.addEventListener("click", function () { activeMode = "agy"; renderWorkspaceThread(); });
       els.plantModeBtn.addEventListener("click", renderPlantWelcome);
       els.newPlantBtn.addEventListener("click", renderPlantWelcome);
-      els.toggleInspectorBtn.addEventListener("click", function () {
-        inspectorOpen = !inspectorOpen;
-        applyVisibility();
-      });
-      els.cancelTopBtn.addEventListener("click", async function () {
-        if (!activeRunId) return;
-        await apiJson("/api/tasks/" + encodeURIComponent(activeRunId) + "/cancel", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reason: "cancelled_by_studio_operator" })
-        });
-        selectPlantRun(activeRunId);
-      });
       els.sendBtn.addEventListener("click", function () {
         if (showPlantModule && activeMode === "plant") submitPlantTask();
         else submitAgyPrompt();
@@ -1311,18 +1567,14 @@
           else submitAgyPrompt();
         }
       });
-      els.refreshBtn.addEventListener("click", function () {
-        loadSystemInfo();
-        loadProjects();
-        loadAgyConversations();
-        if (showPlantModule) loadPlantRuns();
-      });
 
       applyVisibility();
       renderWorkspaceThread();
       loadSystemInfo();
+      loadModels(false);
       loadProjects();
       loadAgyConversations();
+      loadBrowserInitialStatus();
       if (showPlantModule) loadPlantRuns();
     })();
   </script>

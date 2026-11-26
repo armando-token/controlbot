@@ -95,3 +95,4 @@ class AgySendRequest(FrozenModel):
     conversation_id: str | None = None
     project_name: str | None = None
     model: NonEmptyStr = "gemini-4-carbon-low"
+    allow_hydrogen: bool = False
