@@ -395,6 +395,83 @@ def _serialize_snapshot(snapshot: TaskSnapshot) -> dict[str, Any]:
     return serialized
 
 
+def _extract_system_info(
+    coord: CoordinatorProtocol,
+    active_runtime: GrokbotRuntime | None,
+    resolved_db: Path | None,
+    app: FastAPI,
+) -> dict[str, Any]:
+    runtime_mode = "stub" if isinstance(coord, InMemoryCoordinatorStub) else "live_runtime"
+    facility_cfg = (
+        active_runtime.facility_config
+        if active_runtime is not None
+        else getattr(app.state, "facility_config", None) or getattr(coord, "_facility_config", None)
+    )
+
+    state_backend = getattr(app.state, "backend_mode", None)
+    if isinstance(state_backend, str) and state_backend:
+        backend_mode = state_backend
+    elif active_runtime is not None:
+        model_cls_name = type(active_runtime.model_client).__name__
+        backend_mode = "local_http" if "Http" in model_cls_name else "emulated"
+    elif runtime_mode == "stub":
+        backend_mode = "stub"
+    else:
+        backend_mode = "emulated"
+
+    llm_origin = (
+        getattr(app.state, "llm_origin", None)
+        or os.environ.get("GROKBOT_LLM_BASE_URL", "").strip()
+        or None
+    )
+    llm_model_id = (
+        getattr(app.state, "llm_model_id", None)
+        or os.environ.get("GROKBOT_LLM_MODEL_ID", "").strip()
+        or None
+    )
+
+    facility_payload: dict[str, Any] | None = None
+    if facility_cfg is not None:
+        facility_payload = {
+            "facility_id": facility_cfg.facility_id,
+            "facility_name": facility_cfg.facility_name,
+            "areas": [
+                {"area_id": area_id, "display_name": area_cfg.display_name}
+                for area_id, area_cfg in facility_cfg.areas.items()
+            ],
+            "apps": [
+                {
+                    "app_id": app_id,
+                    "origin": app_cfg.origin,
+                    "read_only": app_cfg.read_only,
+                    "adapter_type": app_cfg.adapter_type,
+                }
+                for app_id, app_cfg in facility_cfg.apps.items()
+            ],
+            "assets": [
+                {
+                    "asset_id": asset.asset_id,
+                    "canonical_label": asset.canonical_label,
+                    "area": asset.area,
+                    "aliases": list(asset.aliases),
+                }
+                for asset in facility_cfg.assets
+            ],
+        }
+
+    payload: dict[str, Any] = {
+        "service": "controlbot",
+        "runtime_mode": runtime_mode,
+        "backend_mode": backend_mode,
+        "llm_origin": llm_origin,
+        "llm_model_id": llm_model_id,
+        "db_path": str(resolved_db) if resolved_db is not None else None,
+        "facility": facility_payload,
+    }
+    serialized: dict[str, Any] = _scrub_and_verify(payload, label="SystemInfo")
+    return serialized
+
+
 def _serialize_ui_snapshot(snapshot: TaskSnapshot) -> dict[str, Any]:
     usage_dict = snapshot.budget_usage.model_dump(mode="json")
     usage_dict["total_tokens_used"] = snapshot.budget_usage.total_tokens_used
@@ -611,6 +688,13 @@ def create_app(
             },
         )
 
+    @app.get("/api/system/info")
+    async def api_system_info() -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_extract_system_info(coord, active_runtime, resolved_db, app),
+        )
+
     @app.post("/api/tasks", status_code=status.HTTP_201_CREATED)
     async def api_submit_task(payload: TaskSubmitRequest) -> JSONResponse:
         task_spec = payload.to_task_spec()
@@ -742,6 +826,10 @@ def create_app(
                 detail=str(_scrub_and_verify(str(exc), label="error")),
             ) from exc
         return JSONResponse(status_code=status.HTTP_200_OK, content=_serialize_session(state))
+
+    @app.get("/app", response_class=HTMLResponse)
+    async def ui_studio(request: Request) -> Response:
+        return templates.TemplateResponse(request, "studio.html", {})
 
     @app.get("/", response_class=HTMLResponse)
     async def ui_index(request: Request, error: str | None = None) -> Response:

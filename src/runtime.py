@@ -1128,6 +1128,12 @@ def build_runtime(
         coordinator=web_coordinator,
         session_manager=session_manager,
     )
+    app.state.facility_config = facility_config
+    app.state.backend_mode = backend_mode.value
+    app.state.llm_origin = local_http_config.origin if local_http_config is not None else None
+    app.state.llm_model_id = (
+        local_http_config.model_id if local_http_config is not None else None
+    )
 
     return GrokbotRuntime(
         db_path=resolved_db,

@@ -36,3 +36,9 @@ benchmarks/benchmark_report.json
 benchmarks/benchmark_report.md
 tests/acceptance/acceptance_evidence.jsonl
 deploy/release_manifest.json
+
+# Xcode / macOS native app build artifacts
+macos/build/
+macos/**/DerivedData/
+macos/**/*.xcodeproj/xcuserdata/
+macos/**/*.xcworkspace/xcuserdata/
