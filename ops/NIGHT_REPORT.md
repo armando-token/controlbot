@@ -2,7 +2,7 @@
 
 ## Estado verificable y siguiente acción
 - **Estado del producto**: **`flujo con emulador`**
-- **Estado general de cierre M0–M7**: **M1–M7 COMPLETO Y VERIFICADO en N1 + N2 (Darwin ARM64)** + **ControlBot Studio UX claro (`/app`) estilo Rakazo (Navegador Playwright en vivo conectado con Antigravity + Terminal PTY + Explorador de archivos + modelos `agy` dinámicos), servidor ligero (`make server` / `launchd`) y app nativa macOS Xcode (`macos/ControlBotApp/`)** sobre `main` (`5dd89cfb0ad5daa3c6743f9209bb3fc92dc31102`); **`M8_CAPSTONE` = `PAUSED / DEFERRED`** por instrucción explícita del usuario (`2026-11-25T21:31:15Z`, blueprints `c7b61f5c` y `5d5e2b7b` preservados para reanudar bajo demanda); **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
+- **Estado general de cierre M0–M7**: **M1–M7 COMPLETO Y VERIFICADO en N1 + N2 (Darwin ARM64)** + **ControlBot Studio UX claro (`/app`) estilo Rakazo (Navegador Playwright en vivo + streaming SSE + botón Detener + Terminal PTY + Explorador de archivos + modelos `agy` dinámicos), servidor ligero (`make server` / `launchd`) y app nativa macOS Xcode (`macos/ControlBotApp/`)** sobre `main` (`df45f4933753ac3f2342085f19f77f6aaf3042ca`); **`M8_CAPSTONE` = `PAUSED / DEFERRED`** por instrucción explícita del usuario (`2026-11-25T21:31:15Z`, blueprints `c7b61f5c` y `5d5e2b7b` preservados para reanudar bajo demanda); **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
 - **Siguiente acción ejecutable**: **Probar el software M1–M7 inmediatamente** (ver **Sección 8: Guía Rápida / Quickstart** abajo), completar **Sentinel Victory Audit** de cierre M1–M7 y ejecutar validación **N3** en host Linux destino (`./scripts/verify_n3_linux.sh`).
 
 ---
@@ -10,7 +10,8 @@
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas más reciente**: `5dd89cfb0ad5daa3c6743f9209bb3fc92dc31102` (`feat(studio): bridge live Playwright browser context & actions into Antigravity agent`)
+- **Commit de código y pruebas más reciente**: `df45f4933753ac3f2342085f19f77f6aaf3042ca` (`feat(studio): add SSE streaming progress, Stop button & direct browser action schema`)
+- **Commit anterior puente navegador vivo**: `5dd89cfb0ad5daa3c6743f9209bb3fc92dc31102` (`feat(studio): bridge live Playwright browser context & actions into Antigravity agent`)
 - **Commit anterior Studio UX (Navegador/PTY/Archivos)**: `72497bc5f9df2ea5804917230460cc6789b79f60` (`feat(studio): add Rakazo-style live browser/PTY terminal/files workspace & dynamic agy models`)
 - **Commit anterior Studio UX + servicio headless**: `64a0bf9a834211e3d9fb30505e98c0dbd15e35d3` (`feat(studio,macos): light mode, multi-project workspace, agy resume, hidden plant & headless service`)
 - **Commit anterior Studio UX + Xcode**: `70cafa363589f055d68cbaee1a3474a2e1890507` (`feat(ui,macos): add ControlBot Studio UX (/app), unified local server & Xcode macOS app`)
@@ -69,6 +70,7 @@
   - `b8c0a37` — `docs(night-report): update NIGHT_REPORT for light-mode studio, agy continuity & headless service commit 64a0bf9`
   - `72497bc` — `feat(studio): add Rakazo-style live browser/PTY terminal/files workspace & dynamic agy models`
   - `5dd89cf` — `feat(studio): bridge live Playwright browser context & actions into Antigravity agent`
+  - `df45f49` — `feat(studio): add SSE streaming progress, Stop button & direct browser action schema`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -139,7 +141,7 @@
 - **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`; `uv run ruff check .` también Exit `0`).
 - **`make typecheck`**: Exit `0` (`Success: no issues found in 105 source files`, `mypy --strict`).
 - **`make test-n1`**: Exit `0` (**`150 passed`**).
-- **`make test-n2`**: Exit `0` (**`54 passed, 4 deselected`**).
+- **`make test-n2`**: Exit `0` (**`55 passed, 5 deselected`**).
 - **`make test-acceptance`**: Exit `0` (**`19 passed, 2 deselected`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
 - **`make test-offline`**: Exit `0` (valida `deploy/install_config.yaml`, ejecuta **`26 passed, 20 deselected`** pruebas N1/N2 de `deploy`/loopback/egreso/fábrica + `make test-n3`, e imprime `[PENDING_N3_LINUX_ENV]`).
@@ -149,7 +151,7 @@
 - **`uv run pytest tests/e2e -m tier3 -v`**: Exit `0` (**`22 passed`** en `T3-01`–`T3-22`).
 - **`uv run pytest tests/e2e -m tier4 -v`**: Exit `0` (**`10 passed`** en `T4-01`–`T4-10`; **`230/230`** E2E completo).
 - **`uv run pytest -m tier5 -v`**: Exit `0` (**`30 passed, 421 deselected`** pruebas adversariales de caja blanca `T5-01`–`T5-25` + hallazgos R1/R2/R3/R4/R5).
-- **`deploy/release_manifest.json`**: regenerado sobre `5dd89cf` (`rel-0.1.0-5dd89cfb-20261126T023618Z`, `n3_status=PENDING_N3_LINUX_ENV`).
+- **`deploy/release_manifest.json`**: regenerado sobre `df45f49` (`rel-0.1.0-df45f493-20261126T024747Z`, `n3_status=PENDING_N3_LINUX_ENV`).
 - **Criterio Linux sin Internet (`A11`)**:
   - Verificado en N2: `validate_local_model_origin`, `ToolRegistry` y `DeployInstallConfig` bloquean orígenes externos (`https://api.openai.com`, `8.8.8.8`, redirecciones HTTP 3xx) antes de conectar; Playwright aborta subrecursos fuera de allowlist y la UI web no realiza peticiones CDN.
   - Pendiente N3 en Linux: aislamiento kernel `ip netns`/`nftables`/`iptables` e inferencia con pesos locales reales (`PENDING_N3_LINUX_ENV`; automatizado en `scripts/verify_n3_linux.sh` y documentado en `deploy/OFFLINE_RUNBOOK.md`).
