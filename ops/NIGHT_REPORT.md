@@ -2,7 +2,7 @@
 
 ## Estado verificable y siguiente acción
 - **Estado del producto**: **`flujo con emulador`**
-- **Estado general de cierre M0–M7**: **M1–M7 COMPLETO Y VERIFICADO en N1 + N2 (Darwin ARM64)** + **ControlBot Studio UX (`/app`), servidor unificado `src/local_server.py` (`make ui`) y app nativa macOS Xcode (`macos/ControlBotApp/`)** sobre `main` (`70cafa363589f055d68cbaee1a3474a2e1890507`); **`M8_CAPSTONE` = `PAUSED / DEFERRED`** por instrucción explícita del usuario (`2026-11-25T21:31:15Z`, blueprints `c7b61f5c` y `5d5e2b7b` preservados para reanudar bajo demanda); **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
+- **Estado general de cierre M0–M7**: **M1–M7 COMPLETO Y VERIFICADO en N1 + N2 (Darwin ARM64)** + **ControlBot Studio UX claro (`/app`), selector multi-proyecto, continuidad Antigravity (`agy`), servidor ligero (`make server` / `launchd`) y app nativa macOS Xcode con modo remoto (`macos/ControlBotApp/`)** sobre `main` (`64a0bf9a834211e3d9fb30505e98c0dbd15e35d3`); **`M8_CAPSTONE` = `PAUSED / DEFERRED`** por instrucción explícita del usuario (`2026-11-25T21:31:15Z`, blueprints `c7b61f5c` y `5d5e2b7b` preservados para reanudar bajo demanda); **N3 Linux (`A11` kernel `netns`/`iptables`, LLM local con pesos reales y AT-SPI/X11/Wayland) = `PENDING_N3_LINUX_ENV`**.
 - **Siguiente acción ejecutable**: **Probar el software M1–M7 inmediatamente** (ver **Sección 8: Guía Rápida / Quickstart** abajo), completar **Sentinel Victory Audit** de cierre M1–M7 y ejecutar validación **N3** en host Linux destino (`./scripts/verify_n3_linux.sh`).
 
 ---
@@ -10,7 +10,8 @@
 ## 1. Commit / Punto de recuperación y entorno ejecutado
 
 - **Rama activa**: `main`
-- **Commit de código y pruebas más reciente**: `70cafa363589f055d68cbaee1a3474a2e1890507` (`feat(ui,macos): add ControlBot Studio UX (/app), unified local server & Xcode macOS app`)
+- **Commit de código y pruebas más reciente**: `64a0bf9a834211e3d9fb30505e98c0dbd15e35d3` (`feat(studio,macos): light mode, multi-project workspace, agy resume, hidden plant & headless service`)
+- **Commit anterior Studio UX + Xcode**: `70cafa363589f055d68cbaee1a3474a2e1890507` (`feat(ui,macos): add ControlBot Studio UX (/app), unified local server & Xcode macOS app`)
 - **Commit de código y pruebas M7-T5 (R5) verificado**: `70ed485340f2bb8729c0a97649a5572a3aba5c79` (`fix(m7-t5): clear stale WAITING_FOR_INPUT result_json across cancel, wait-timeout, and resume (T5-25)`)
 - **Commit de backlog/gobernanza más reciente (no-reporte)**: `51ac97878f518fbe576f25830e5d330a5e7c46c0` (`docs(ops): refresh NIGHT_STATE and BACKLOG for M7-T5-R5 commit 70ed485`)
 - **Cadena de commits de hitos en `main`**:
@@ -61,6 +62,8 @@
   - `51ac978` — `docs(ops): refresh NIGHT_STATE and BACKLOG for M7-T5-R5 commit 70ed485`
   - `6d3e266` — `docs(night-report): update NIGHT_REPORT for M7-T5-R5 commit 70ed485 and NIGHT_STATE 51ac978`
   - `70cafa3` — `feat(ui,macos): add ControlBot Studio UX (/app), unified local server & Xcode macOS app`
+  - `37fc040` — `docs(night-report): update NIGHT_REPORT for ControlBot Studio UX & macOS app commit 70cafa3`
+  - `64a0bf9` — `feat(studio,macos): light mode, multi-project workspace, agy resume, hidden plant & headless service`
 - **Entorno ejecutado**:
   - **SO / Kernel**: `Darwin 27.0.0` (`RELEASE_ARM64_T8103`), `macOS 27.0.1` (`BuildVersion: 26A434`), arquitectura `arm64`
   - **Hardware**: Apple M1, `8` núcleos, `8 GB` RAM (`8589934592` B)
@@ -129,9 +132,9 @@
 - **`uv lock --check --offline`**: Exit `0` (`Resolved 41 packages in 3ms`, cero descargas).
 - **`make doctor`**: Exit `0` (`n1_ready=True`, `n2_ready=True`, `n3_status=PENDING_N3_LINUX_ENV`).
 - **`make lint`**: Exit `0` (`All checks passed!` en `src`, `lab`, `benchmarks`, `deploy`, `tests/unit`, `tests/integration`, `tests/acceptance`; `uv run ruff check .` también Exit `0`).
-- **`make typecheck`**: Exit `0` (`Success: no issues found in 102 source files`, `mypy --strict`).
+- **`make typecheck`**: Exit `0` (`Success: no issues found in 103 source files`, `mypy --strict`).
 - **`make test-n1`**: Exit `0` (**`150 passed`**).
-- **`make test-n2`**: Exit `0` (**`51 passed, 2 deselected`**).
+- **`make test-n2`**: Exit `0` (**`52 passed, 2 deselected`**).
 - **`make test-acceptance`**: Exit `0` (**`19 passed, 2 deselected`** en `tests/acceptance` con evidencia §6.3 JSONL).
 - **`make test-n3`**: Exit `0` (**`2 skipped`** con motivo explícito `PENDING_N3_LINUX_ENV`).
 - **`make test-offline`**: Exit `0` (valida `deploy/install_config.yaml`, ejecuta **`26 passed, 20 deselected`** pruebas N1/N2 de `deploy`/loopback/egreso/fábrica + `make test-n3`, e imprime `[PENDING_N3_LINUX_ENV]`).
@@ -205,12 +208,18 @@ make test-offline   # Validación offline deploy/ + loopback/egreso + fábrica M
 ```
 
 ### 8.2 Lanzar las aplicaciones de laboratorio + Consola Web de ControlBot (1 comando o App macOS)
+- **Servicio headless ligero (`launchd` / `make server`)**:
+  ```bash
+  ./scripts/install_macos_service.sh install        # loopback 127.0.0.1:8000 (--no-lab)
+  ./scripts/install_macos_service.sh install --lan  # Wi-Fi LAN 0.0.0.0:8000 (--no-lab)
+  make server                                       # ejecución manual ligera sin lab
+  ```
 - **App nativa macOS (`Xcode` / `ControlBot.app`)**:
   ```bash
   open /Users/armandosilva/Projects/Grokbotclon/macos/build/ControlBot.app
   # O abrir en Xcode IDE: open /Users/armandosilva/Projects/Grokbotclon/macos/ControlBotApp/ControlBot.xcodeproj
   ```
-- **Launcher unificado en 1 comando (`make ui`)**:
+- **Launcher completo con portales de planta (`make ui`)**:
   ```bash
   make ui
   # Abre http://127.0.0.1:8000/app (ControlBot Studio UX) o http://127.0.0.1:8000/ (Consola Clásica)
