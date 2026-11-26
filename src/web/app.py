@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,6 +43,7 @@ from src.storage.redaction import (
 )
 from src.web.protocols import CoordinatorProtocol, SessionManagerProtocol, TaskSnapshot, maybe_await
 from src.web.schemas import (
+    AgySendRequest,
     CancelRequest,
     ReleaseRequest,
     ResumeRequest,
@@ -49,6 +51,15 @@ from src.web.schemas import (
     TaskSubmitRequest,
 )
 from src.web.stub import InMemoryCoordinatorStub
+from src.web.workspace import (
+    default_agy_brain_root,
+    default_projects_root,
+    find_agy_executable,
+    list_agy_conversations,
+    list_local_projects,
+    resolve_project_dir,
+    send_agy_prompt,
+)
 
 if TYPE_CHECKING:
     from src.runtime import GrokbotRuntime
@@ -693,6 +704,71 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_extract_system_info(coord, active_runtime, resolved_db, app),
+        )
+
+    @app.get("/api/projects")
+    async def api_list_projects() -> JSONResponse:
+        root = default_projects_root()
+        payload = {
+            "projects_root": str(root),
+            "projects": list_local_projects(root),
+        }
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(payload, label="ProjectsList"),
+        )
+
+    @app.get("/api/agy/conversations")
+    async def api_list_agy_conversations() -> JSONResponse:
+        brain_root = default_agy_brain_root()
+        payload = {
+            "available": find_agy_executable() is not None,
+            "hostname": socket.gethostname(),
+            "conversations": list_agy_conversations(brain_root),
+        }
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(payload, label="AgyConversations"),
+        )
+
+    @app.post("/api/agy/send")
+    async def api_agy_send(payload: AgySendRequest) -> JSONResponse:
+        project_dir: Path | None = None
+        if payload.project_name is not None and payload.project_name.strip():
+            try:
+                project_dir = resolve_project_dir(default_projects_root(), payload.project_name)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=str(_scrub_and_verify(str(exc), label="error")),
+                ) from exc
+
+        try:
+            result = await send_agy_prompt(
+                prompt=payload.prompt,
+                conversation_id=payload.conversation_id,
+                project_dir=project_dir,
+                model=payload.model,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        except (TimeoutError, RuntimeError, OSError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(result, label="AgySendResult"),
         )
 
     @app.post("/api/tasks", status_code=status.HTTP_201_CREATED)

@@ -5,6 +5,19 @@ import Foundation
 final class ServerManager: ObservableObject {
     static let shared = ServerManager()
 
+    enum ConnectionMode: String, CaseIterable, Identifiable {
+        case local
+        case remote
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .local: return "Local (esta Mac)"
+            case .remote: return "Remoto (Mac mini servidor)"
+            }
+        }
+    }
+
     enum ServerState: Equatable {
         case stopped
         case starting
@@ -14,20 +27,37 @@ final class ServerManager: ObservableObject {
         var label: String {
             switch self {
             case .stopped: return "Detenido"
-            case .starting: return "Iniciando..."
+            case .starting: return "Conectando..."
             case .running: return "Activo"
             case .failed: return "Error"
             }
         }
     }
 
+    private enum DefaultsKey {
+        static let connectionMode = "controlbot.connectionMode"
+        static let remoteBaseURL = "controlbot.remoteBaseURL"
+        static let enablePlantLab = "controlbot.enablePlantLab"
+    }
+
     @Published private(set) var state: ServerState = .stopped
     @Published private(set) var logs: [String] = []
     @Published private(set) var attachedToExisting = false
+    @Published var connectionMode: ConnectionMode
+    @Published var remoteBaseURLString: String
+    @Published var enablePlantLab: Bool
 
-    let studioURL = URL(string: "http://127.0.0.1:8000/app")!
-    let classicURL = URL(string: "http://127.0.0.1:8000/")!
-    let healthURL = URL(string: "http://127.0.0.1:8000/health")!
+    var activeBaseURL: URL {
+        if connectionMode == .remote,
+           let parsed = Self.normalizeBaseURL(remoteBaseURLString) {
+            return parsed
+        }
+        return URL(string: "http://127.0.0.1:8000")!
+    }
+
+    var studioURL: URL { activeBaseURL.appendingPathComponent("app") }
+    var classicURL: URL { activeBaseURL }
+    var healthURL: URL { activeBaseURL.appendingPathComponent("health") }
     let scadaURL = URL(string: "http://127.0.0.1:8101")!
     let maintenanceURL = URL(string: "http://127.0.0.1:8102")!
 
@@ -37,7 +67,44 @@ final class ServerManager: ObservableObject {
     private var bootTask: Task<Void, Never>?
     private var intentionalStop = false
 
-    private init() {}
+    private init() {
+        let defaults = UserDefaults.standard
+        let rawMode = defaults.string(forKey: DefaultsKey.connectionMode) ?? "local"
+        self.connectionMode = ConnectionMode(rawValue: rawMode) ?? .local
+        self.remoteBaseURLString =
+            defaults.string(forKey: DefaultsKey.remoteBaseURL)
+            ?? "http://Armandos-Mac-mini.local:8000"
+        self.enablePlantLab = defaults.bool(forKey: DefaultsKey.enablePlantLab)
+    }
+
+    static func normalizeBaseURL(_ raw: String) -> URL? {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if !trimmed.contains("://") {
+            trimmed = "http://\(trimmed)"
+        }
+        while trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https", url.host != nil else {
+            return nil
+        }
+        return url
+    }
+
+    func applyConnectionSettings(mode: ConnectionMode, remoteURL: String, enablePlantLab: Bool) {
+        let defaults = UserDefaults.standard
+        defaults.set(mode.rawValue, forKey: DefaultsKey.connectionMode)
+        defaults.set(remoteURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: DefaultsKey.remoteBaseURL)
+        defaults.set(enablePlantLab, forKey: DefaultsKey.enablePlantLab)
+
+        stop()
+        self.connectionMode = mode
+        self.remoteBaseURLString = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.enablePlantLab = enablePlantLab
+        start()
+    }
 
     func resolveProjectDirectory() -> URL {
         if let envDir = ProcessInfo.processInfo.environment["CONTROLBOT_PROJECT_DIR"],
@@ -64,23 +131,21 @@ final class ServerManager: ObservableObject {
     }
 
     private func resolveCommand(projectDir: URL) -> (executable: String, arguments: [String])? {
+        var pythonArgs = ["-m", "src.local_server", "--host", "127.0.0.1", "--port", "8000"]
+        if !enablePlantLab {
+            pythonArgs.append("--no-lab")
+        }
         let uvCandidates = [
             "/Users/armandosilva/.local/bin/uv",
             "/opt/homebrew/bin/uv",
             "/usr/local/bin/uv",
         ]
         for candidate in uvCandidates where FileManager.default.isExecutableFile(atPath: candidate) {
-            return (
-                candidate,
-                ["run", "python", "-m", "src.local_server", "--host", "127.0.0.1", "--port", "8000"]
-            )
+            return (candidate, ["run", "python"] + pythonArgs)
         }
         let venvPython = projectDir.appendingPathComponent(".venv/bin/python").path
         if FileManager.default.isExecutableFile(atPath: venvPython) {
-            return (
-                venvPython,
-                ["-m", "src.local_server", "--host", "127.0.0.1", "--port", "8000"]
-            )
+            return (venvPython, pythonArgs)
         }
         return nil
     }
@@ -109,21 +174,47 @@ final class ServerManager: ObservableObject {
         intentionalStop = false
         attachedToExisting = false
         state = .starting
-        appendLog("[ControlBot.app] Verificando servidor local en http://127.0.0.1:8000...")
+
+        let targetHealth = healthURL
+        let targetStudio = studioURL
+        appendLog("[ControlBot.app] Conectando con \(activeBaseURL.absoluteString)...")
+
+        if connectionMode == .remote {
+            attachedToExisting = true
+            bootTask = Task { [weak self] in
+                guard let self else { return }
+                for _ in 0..<8 {
+                    if Task.isCancelled { return }
+                    if await self.checkHealth(url: targetHealth, timeout: 2.0) {
+                        self.state = .running
+                        self.appendLog("[ControlBot.app] Conectado al servidor remoto: \(targetStudio.absoluteString)")
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                }
+                self.state = .failed(
+                    "No se pudo conectar con \(self.activeBaseURL.absoluteString). "
+                    + "Verifica que el servicio esté activo en tu Mac mini (--lan o túnel SSH)."
+                )
+            }
+            return
+        }
 
         bootTask = Task { [weak self] in
             guard let self else { return }
-            if await self.checkHealth(timeout: 1.5) {
+            if await self.checkHealth(url: targetHealth, timeout: 1.5) {
                 self.attachedToExisting = true
                 self.state = .running
-                self.appendLog("[ControlBot.app] Servidor ControlBot ya activo; conectado sin duplicar procesos.")
+                self.appendLog("[ControlBot.app] Adjuntado al servidor headless ya activo en 127.0.0.1:8000.")
                 return
             }
 
             let projectDir = self.resolveProjectDirectory()
             guard let command = self.resolveCommand(projectDir: projectDir) else {
-                self.state = .failed("No se encontró 'uv' ni '.venv/bin/python' en \(projectDir.path).")
-                self.appendLog("[ERROR] Ejecutable uv/python no encontrado.")
+                self.state = .failed(
+                    "No se encontró el proyecto local en \(projectDir.path). "
+                    + "Si estás en tu otra MacBook, cambia Conexión a 'Remoto'."
+                )
                 return
             }
 
@@ -172,7 +263,6 @@ final class ServerManager: ObservableObject {
                     }
                     if !self.intentionalStop {
                         self.state = .failed("El servidor local finalizó inesperadamente (código \(status)).")
-                        self.appendLog("[ControlBot.app] Proceso terminado con código \(status).")
                     } else if case .starting = self.state {
                         self.state = .stopped
                     }
@@ -184,7 +274,7 @@ final class ServerManager: ObservableObject {
                 self.process = proc
                 self.stdoutPipe = outPipe
                 self.stderrPipe = errPipe
-                self.appendLog("[ControlBot.app] Lanzado \(command.executable) \(command.arguments.joined(separator: " "))")
+                self.appendLog("[ControlBot.app] Servidor local iniciado (\(self.enablePlantLab ? "con lab" : "modo ligero --no-lab"))")
             } catch {
                 self.cleanupPipes()
                 self.state = .failed("No se pudo iniciar el servidor local: \(error.localizedDescription)")
@@ -194,9 +284,9 @@ final class ServerManager: ObservableObject {
             for _ in 0..<85 {
                 if Task.isCancelled { return }
                 if case .failed = self.state { return }
-                if await self.checkHealth(timeout: 1.0) {
+                if await self.checkHealth(url: targetHealth, timeout: 1.0) {
                     self.state = .running
-                    self.appendLog("[ControlBot.app] Studio UX y laboratorios listos en http://127.0.0.1:8000/app")
+                    self.appendLog("[ControlBot.app] Studio listo en \(targetStudio.absoluteString)")
                     return
                 }
                 try? await Task.sleep(nanoseconds: 300_000_000)
@@ -213,7 +303,7 @@ final class ServerManager: ObservableObject {
         bootTask = nil
         intentionalStop = true
         if let proc = process, proc.isRunning, !attachedToExisting {
-            appendLog("[ControlBot.app] Deteniendo servidor local ControlBot...")
+            appendLog("[ControlBot.app] Deteniendo servidor local...")
             proc.terminate()
         }
         cleanupPipes()
@@ -223,13 +313,9 @@ final class ServerManager: ObservableObject {
     }
 
     func restart() {
-        let wasAttached = attachedToExisting
         stop()
-        if wasAttached {
-            appendLog("[ControlBot.app] El servidor previo es externo; reintentando conexión...")
-        }
         Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 600_000_000)
+            try? await Task.sleep(nanoseconds: 500_000_000)
             self?.start()
         }
     }
@@ -259,8 +345,8 @@ final class ServerManager: ObservableObject {
         stderrPipe = nil
     }
 
-    private func checkHealth(timeout: TimeInterval) async -> Bool {
-        var req = URLRequest(url: healthURL)
+    private func checkHealth(url: URL, timeout: TimeInterval) async -> Bool {
+        var req = URLRequest(url: url)
         req.timeoutInterval = timeout
         do {
             let (_, response) = try await URLSession.shared.data(for: req)

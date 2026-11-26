@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: doctor test test-n1 test-n2 test-n3 test-acceptance demo test-offline bench lint typecheck check ui
+.PHONY: doctor test test-n1 test-n2 test-n3 test-acceptance demo test-offline bench lint typecheck check ui server
 
 doctor:
 	$(UV) run python -m src.doctor
@@ -44,3 +44,6 @@ bench:
 
 ui:
 	$(UV) run python -m src.local_server
+
+server:
+	$(UV) run python -m src.local_server --no-lab

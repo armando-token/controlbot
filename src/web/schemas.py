@@ -86,3 +86,12 @@ class ReleaseRequest(FrozenModel):
     """API request payload for POST /api/sessions/{session_id}/release."""
 
     owner: NonEmptyStr | None = None
+
+
+class AgySendRequest(FrozenModel):
+    """API request payload for POST /api/agy/send."""
+
+    prompt: NonEmptyStr
+    conversation_id: str | None = None
+    project_name: str | None = None
+    model: NonEmptyStr = "gemini-4-carbon-low"

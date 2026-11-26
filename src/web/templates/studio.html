@@ -3,48 +3,62 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
   <title>ControlBot Studio</title>
   <style>
     :root {
-      --bg: #0b0f17;
-      --bg-elev: #111827;
-      --bg-card: #161f30;
-      --bg-hover: #1e293b;
-      --border: #263248;
-      --text: #f1f5f9;
-      --text-dim: #94a3b8;
+      color-scheme: light;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --surface-subtle: #f1f5f9;
+      --surface-hover: #e2e8f0;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #0f172a;
+      --text-dim: #475569;
       --text-muted: #64748b;
-      --accent: #10b981;
-      --accent-soft: rgba(16, 185, 129, 0.14);
-      --blue: #38bdf8;
-      --blue-soft: rgba(56, 189, 248, 0.14);
-      --amber: #f59e0b;
-      --amber-soft: rgba(245, 158, 11, 0.16);
-      --rose: #f43f5e;
-      --rose-soft: rgba(244, 63, 94, 0.16);
+      --accent: #0f766e;
+      --accent-hover: #115e59;
+      --accent-soft: #ccfbf1;
+      --accent-text: #115e59;
+      --blue: #0284c7;
+      --blue-soft: #e0f2fe;
+      --amber: #b45309;
+      --amber-soft: #fef3c7;
+      --rose: #be123c;
+      --rose-soft: #ffe4e6;
       --radius: 10px;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
     }
 
     * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+    }
     a { color: var(--blue); text-decoration: none; }
     a:hover { text-decoration: underline; }
     code, pre { font-family: var(--mono); font-size: 12px; }
 
     .layout {
       display: grid;
-      grid-template-columns: 276px minmax(0, 1fr) 320px;
+      grid-template-columns: 300px minmax(0, 1fr) 0px;
       height: 100vh;
       overflow: hidden;
     }
-    .layout.inspector-hidden {
-      grid-template-columns: 276px minmax(0, 1fr) 0px;
+    .layout.show-inspector {
+      grid-template-columns: 300px minmax(0, 1fr) 320px;
     }
 
     .sidebar, .inspector {
-      background: var(--bg-elev);
+      background: var(--surface);
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
@@ -54,7 +68,7 @@
       border-right: none;
       border-left: 1px solid var(--border);
     }
-    .layout.inspector-hidden .inspector {
+    .layout:not(.show-inspector) .inspector {
       border-left: none;
       visibility: hidden;
     }
@@ -67,27 +81,33 @@
       justify-content: space-between;
       gap: 8px;
       flex-shrink: 0;
+      background: var(--surface);
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: 9px;
+      gap: 8px;
       font-weight: 700;
       font-size: 15px;
       letter-spacing: -0.01em;
+      color: var(--text);
     }
     .brand-dot {
       width: 9px;
       height: 9px;
       border-radius: 50%;
-      background: var(--accent);
-      box-shadow: 0 0 8px var(--accent);
+      background: #10b981;
+      box-shadow: 0 0 0 3px #d1fae5;
     }
-    .brand-dot.offline { background: var(--rose); box-shadow: 0 0 8px var(--rose); }
+    .brand-dot.offline {
+      background: var(--rose);
+      box-shadow: 0 0 0 3px var(--rose-soft);
+    }
 
     .badge-row {
-      padding: 10px 16px;
+      padding: 8px 16px;
       border-bottom: 1px solid var(--border);
+      background: var(--bg);
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
@@ -96,20 +116,20 @@
     .pill {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
+      gap: 4px;
       padding: 2px 8px;
       border-radius: 999px;
       font-size: 11px;
       font-weight: 600;
-      background: var(--bg-card);
+      background: var(--surface-subtle);
       border: 1px solid var(--border);
       color: var(--text-dim);
       white-space: nowrap;
     }
-    .pill-ok { background: var(--accent-soft); border-color: rgba(16, 185, 129, 0.35); color: #6ee7b7; }
-    .pill-info { background: var(--blue-soft); border-color: rgba(56, 189, 248, 0.35); color: #7dd3fc; }
-    .pill-warn { background: var(--amber-soft); border-color: rgba(245, 158, 11, 0.4); color: #fcd34d; }
-    .pill-err { background: var(--rose-soft); border-color: rgba(244, 63, 94, 0.4); color: #fda4af; }
+    .pill-ok { background: var(--accent-soft); border-color: #99f6e4; color: var(--accent-text); }
+    .pill-info { background: var(--blue-soft); border-color: #bae6fd; color: #0369a1; }
+    .pill-warn { background: var(--amber-soft); border-color: #fde68a; color: var(--amber); }
+    .pill-err { background: var(--rose-soft); border-color: #fecdd3; color: var(--rose); }
 
     .btn {
       display: inline-flex;
@@ -118,28 +138,27 @@
       gap: 6px;
       padding: 7px 12px;
       border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      background: var(--surface);
       color: var(--text);
       font-size: 12.5px;
       font-weight: 600;
       cursor: pointer;
       transition: background 0.14s, border-color 0.14s;
     }
-    .btn:hover:not(:disabled) { background: var(--bg-hover); border-color: #3b4b68; }
+    .btn:hover:not(:disabled) { background: var(--surface-subtle); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-primary {
       background: var(--accent);
       border-color: var(--accent);
-      color: #052e16;
+      color: #ffffff;
     }
-    .btn-primary:hover:not(:disabled) { background: #34d399; border-color: #34d399; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
     .btn-danger {
       background: var(--rose-soft);
-      border-color: rgba(244, 63, 94, 0.45);
-      color: #fda4af;
+      border-color: #fecdd3;
+      color: var(--rose);
     }
-    .btn-danger:hover:not(:disabled) { background: rgba(244, 63, 94, 0.25); }
     .btn-sm { padding: 4px 9px; font-size: 11.5px; }
 
     .sidebar-body, .inspector-body {
@@ -147,48 +166,84 @@
       overflow-y: auto;
       padding: 12px;
     }
+    .sidebar-footer {
+      padding: 10px 14px;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+      font-size: 12px;
+      color: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .sidebar-footer label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+
     .section-label {
       font-size: 11px;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.06em;
       color: var(--text-muted);
-      margin: 12px 4px 8px;
+      margin: 14px 4px 7px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     .section-label:first-child { margin-top: 2px; }
 
-    .run-item {
+    .list-item {
       width: 100%;
       text-align: left;
-      padding: 9px 10px;
+      padding: 8px 10px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: transparent;
       color: var(--text);
       cursor: pointer;
-      margin-bottom: 4px;
+      margin-bottom: 3px;
       display: block;
     }
-    .run-item:hover { background: var(--bg-card); }
-    .run-item.active { background: var(--bg-card); border-color: rgba(16, 185, 129, 0.45); }
-    .run-item-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 6px;
-      margin-bottom: 3px;
+    .list-item:hover { background: var(--surface-subtle); }
+    .list-item.active {
+      background: var(--accent-soft);
+      border-color: #99f6e4;
+      color: var(--accent-text);
     }
-    .run-item-query {
+    .list-item-title {
       font-size: 12.5px;
-      color: var(--text-dim);
+      font-weight: 600;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .run-item-meta {
+    .list-item-sub {
       font-size: 11px;
       color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
       font-family: var(--mono);
+    }
+
+    .cid-box {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .cid-input {
+      flex: 1;
+      min-width: 0;
+      padding: 6px 8px;
+      border-radius: 7px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11.5px;
     }
 
     .portal-link {
@@ -198,12 +253,12 @@
       padding: 7px 10px;
       border-radius: 8px;
       border: 1px solid var(--border);
-      background: var(--bg-card);
+      background: var(--surface);
       margin-bottom: 6px;
       color: var(--text);
       font-size: 12px;
     }
-    .portal-link:hover { background: var(--bg-hover); text-decoration: none; }
+    .portal-link:hover { background: var(--surface-subtle); text-decoration: none; }
 
     .main {
       display: flex;
@@ -213,9 +268,9 @@
       background: var(--bg);
     }
     .topbar {
-      padding: 12px 20px;
+      padding: 11px 20px;
       border-bottom: 1px solid var(--border);
-      background: var(--bg-elev);
+      background: var(--surface);
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -223,80 +278,61 @@
       flex-shrink: 0;
     }
     .topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
-    .topbar-title { font-weight: 700; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .topbar-title {
+      font-weight: 700;
+      font-size: 14px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .topbar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 
     .thread {
       flex: 1;
       overflow-y: auto;
-      padding: 24px 28px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
+      padding: 22px 26px;
     }
     .thread-inner {
       width: 100%;
-      max-width: 920px;
+      max-width: 900px;
       margin: 0 auto;
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
-
-    .welcome-hero {
-      margin-top: 24px;
-      padding: 24px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: linear-gradient(160deg, #111827 0%, #0f172a 100%);
-    }
-    .welcome-hero h1 { margin: 0 0 8px; font-size: 22px; letter-spacing: -0.02em; }
-    .welcome-hero p { margin: 0; color: var(--text-dim); max-width: 680px; }
-
-    .starter-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 12px;
-      margin-top: 18px;
-    }
-    .starter-card {
-      text-align: left;
-      padding: 14px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--bg-card);
-      color: var(--text);
-      cursor: pointer;
-      transition: transform 0.12s, border-color 0.14s, background 0.14s;
-    }
-    .starter-card:hover { background: var(--bg-hover); border-color: var(--accent); transform: translateY(-1px); }
-    .starter-card-title { font-weight: 700; font-size: 13px; margin-bottom: 4px; color: #e2e8f0; }
-    .starter-card-desc { font-size: 12px; color: var(--text-dim); }
 
     .card {
       border-radius: var(--radius);
       border: 1px solid var(--border);
-      background: var(--bg-elev);
+      background: var(--surface);
       padding: 15px 18px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
     }
+    .card-hero {
+      background: linear-gradient(135deg, #ffffff 0%, #f0fdfa 100%);
+      border-color: #cbd5e1;
+    }
+    .card-hero h1 { margin: 0 0 6px; font-size: 20px; letter-spacing: -0.02em; }
+    .card-hero p { margin: 0; color: var(--text-dim); }
+
     .card-user {
-      background: #142238;
-      border-color: #243b5e;
+      background: #eff6ff;
+      border-color: #bfdbfe;
       align-self: flex-end;
-      max-width: 82%;
+      max-width: 84%;
     }
-    .card-user-text { font-size: 14.5px; font-weight: 500; margin-bottom: 8px; }
+    .card-user-text { font-size: 14px; font-weight: 500; margin-bottom: 6px; white-space: pre-wrap; }
     .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
 
     .card-hitl {
-      border-color: rgba(245, 158, 11, 0.55);
-      background: rgba(245, 158, 11, 0.08);
+      border-color: #f59e0b;
+      background: #fffbeb;
     }
-    .hitl-title { font-weight: 700; color: #fcd34d; margin-bottom: 6px; font-size: 14px; }
-    .hitl-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+    .hitl-title { font-weight: 700; color: var(--amber); margin-bottom: 6px; font-size: 14px; }
+    .hitl-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
     .hitl-input {
-      background: var(--bg);
-      border: 1px solid var(--border);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
       border-radius: 8px;
       color: var(--text);
       padding: 6px 10px;
@@ -304,18 +340,54 @@
       min-width: 180px;
     }
 
+    .cmd-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 12px;
+      border-radius: 8px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      margin-top: 10px;
+    }
+    .cmd-strip code {
+      overflow-x: auto;
+      white-space: nowrap;
+      color: var(--text);
+    }
+
+    .starter-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .starter-card {
+      text-align: left;
+      padding: 12px 14px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .starter-card:hover { background: var(--surface-subtle); border-color: var(--accent); }
+    .starter-card-title { font-weight: 700; font-size: 13px; margin-bottom: 3px; }
+    .starter-card-desc { font-size: 12px; color: var(--text-dim); }
+
     .banner {
       padding: 10px 12px;
       border-radius: 8px;
       margin-top: 10px;
       font-size: 12.5px;
     }
-    .banner-warn { background: var(--amber-soft); border: 1px solid rgba(245, 158, 11, 0.4); color: #fde68a; }
-    .banner-err { background: var(--rose-soft); border: 1px solid rgba(244, 63, 94, 0.4); color: #fecdd3; }
+    .banner-warn { background: var(--amber-soft); border: 1px solid #fde68a; color: #92400e; }
+    .banner-err { background: var(--rose-soft); border: 1px solid #fecdd3; color: #9f1239; }
 
     .answer-box {
-      font-size: 14.5px;
-      color: #f8fafc;
+      font-size: 14px;
+      color: var(--text);
       white-space: pre-wrap;
       line-height: 1.6;
       margin-top: 8px;
@@ -324,7 +396,7 @@
     table {
       width: 100%;
       border-collapse: collapse;
-      margin-top: 12px;
+      margin-top: 10px;
       font-size: 12px;
     }
     th, td {
@@ -349,30 +421,27 @@
       gap: 10px;
       padding: 6px 9px;
       border-radius: 7px;
-      background: var(--bg-card);
+      background: var(--surface-subtle);
       font-size: 12px;
     }
 
     .composer-wrap {
       border-top: 1px solid var(--border);
-      background: var(--bg-elev);
-      padding: 12px 24px 16px;
+      background: var(--surface);
+      padding: 12px 24px 14px;
       flex-shrink: 0;
     }
-    .composer-inner {
-      max-width: 920px;
-      margin: 0 auto;
-    }
+    .composer-inner { max-width: 900px; margin: 0 auto; }
     .composer-box {
       display: flex;
       gap: 10px;
       align-items: flex-end;
       background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      padding: 9px 12px;
     }
-    .composer-box:focus-within { border-color: var(--accent); }
+    .composer-box:focus-within { border-color: var(--accent); background: var(--surface); }
     .composer-box textarea {
       flex: 1;
       background: transparent;
@@ -382,7 +451,7 @@
       font-family: var(--sans);
       font-size: 14px;
       resize: none;
-      min-height: 40px;
+      min-height: 38px;
       max-height: 140px;
     }
     .composer-controls {
@@ -395,8 +464,8 @@
       color: var(--text-dim);
     }
     .composer-controls select {
-      background: var(--bg);
-      border: 1px solid var(--border);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
       color: var(--text);
       border-radius: 6px;
       padding: 4px 8px;
@@ -406,34 +475,32 @@
 
     .meter { margin-bottom: 10px; }
     .meter-head { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-dim); margin-bottom: 3px; }
-    .meter-track { height: 6px; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; }
+    .meter-track { height: 6px; border-radius: 999px; background: var(--surface-subtle); border: 1px solid var(--border); overflow: hidden; }
     .meter-fill { height: 100%; background: var(--accent); transition: width 0.25s; }
-    .meter-fill.warn { background: var(--amber); }
+    .meter-fill.warn { background: #d97706; }
 
     .session-card {
       padding: 9px 10px;
       border-radius: 8px;
       border: 1px solid var(--border);
-      background: var(--bg-card);
+      background: var(--bg);
       margin-bottom: 8px;
       font-size: 12px;
     }
     .session-card-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-bottom: 4px; }
-
-    details summary { cursor: pointer; color: var(--text-dim); font-size: 12px; font-weight: 600; }
     pre.json-box {
-      background: var(--bg);
+      background: var(--surface-subtle);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 10px;
       overflow-x: auto;
-      max-height: 260px;
+      max-height: 240px;
       margin: 8px 0 0;
-      color: #cbd5e1;
+      color: var(--text);
     }
 
-    @media (max-width: 1120px) {
-      .layout { grid-template-columns: 240px minmax(0, 1fr) 0px; }
+    @media (max-width: 1080px) {
+      .layout.show-inspector { grid-template-columns: 270px minmax(0, 1fr) 0px; }
       .inspector { display: none; }
     }
     @media (max-width: 760px) {
@@ -450,34 +517,66 @@
           <span id="conn-dot" class="brand-dot"></span>
           <span>ControlBot Studio</span>
         </div>
-        <button id="new-task-btn" class="btn btn-primary btn-sm" type="button">+ Nueva</button>
+        <button id="new-agy-btn" class="btn btn-primary btn-sm" type="button">+ Nuevo chat</button>
       </div>
       <div id="system-badges" class="badge-row">
         <span class="pill">Conectando...</span>
       </div>
+
       <div class="sidebar-body">
-        <div class="section-label">Historial de tareas</div>
-        <div id="runs-list">
-          <div style="color: var(--text-muted); font-size: 12px; padding: 6px 4px;">Cargando tareas...</div>
+        <div class="section-label">
+          <span>Proyectos</span>
+          <span id="projects-count" class="pill">0</span>
         </div>
-        <div class="section-label">Portales conectados</div>
-        <div id="portals-list"></div>
-        <a class="portal-link" href="/">
-          <span>Consola HTML Clásica</span>
-          <span class="pill">/</span>
-        </a>
+        <div id="projects-list">
+          <div style="color:var(--text-muted);font-size:12px;padding:4px;">Cargando proyectos...</div>
+        </div>
+
+        <div class="section-label">
+          <span>Conversaciones Antigravity (agy)</span>
+        </div>
+        <div class="cid-box">
+          <input id="cid-input" class="cid-input" type="text" placeholder="Pegar ID de conversación...">
+          <button id="cid-use-btn" class="btn btn-sm" type="button">Usar</button>
+        </div>
+        <div id="agy-list">
+          <div style="color:var(--text-muted);font-size:12px;padding:4px;">Cargando sesiones...</div>
+        </div>
+
+        <div id="plant-sidebar-section" style="display:none;">
+          <div class="section-label">
+            <span>Demo Planta · Tareas</span>
+            <button id="new-plant-btn" class="btn btn-sm" type="button">+ Tarea</button>
+          </div>
+          <div id="runs-list"></div>
+          <div class="section-label"><span>Portales Lab</span></div>
+          <div id="portals-list"></div>
+          <a class="portal-link" href="/">
+            <span>Consola HTML Clásica</span>
+            <span class="pill">/</span>
+          </a>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <label>
+          <input id="toggle-plant-module" type="checkbox">
+          <span>Mostrar módulo Planta (Demo)</span>
+        </label>
       </div>
     </aside>
 
     <main class="main">
       <div class="topbar">
         <div class="topbar-left">
-          <span id="topbar-title" class="topbar-title">Nueva tarea industrial</span>
-          <span id="topbar-status" class="pill" style="display:none;"></span>
+          <span id="topbar-title" class="topbar-title">Workspace · Antigravity</span>
+          <span id="topbar-status" class="pill pill-info" style="display:none;"></span>
         </div>
         <div class="topbar-actions">
+          <button id="workspace-mode-btn" class="btn btn-sm" type="button" style="display:none;">Workspace / agy</button>
+          <button id="plant-mode-btn" class="btn btn-sm" type="button" style="display:none;">Demo Planta</button>
           <button id="cancel-top-btn" class="btn btn-danger btn-sm" type="button" style="display:none;">Cancelar</button>
-          <button id="toggle-inspector-btn" class="btn btn-sm" type="button">Inspector</button>
+          <button id="toggle-inspector-btn" class="btn btn-sm" type="button" style="display:none;">Inspector</button>
         </div>
       </div>
 
@@ -487,12 +586,23 @@
 
       <div class="composer-wrap">
         <div class="composer-inner">
-          <div id="submit-error" class="banner banner-err" style="display:none; margin-top:0; margin-bottom:10px;"></div>
+          <div id="submit-error" class="banner banner-err" style="display:none;margin-top:0;margin-bottom:10px;"></div>
           <div class="composer-box">
-            <textarea id="query-input" rows="2" placeholder="Describe la tarea industrial (ej. ¿Qué alarma apareció primero en la bomba 34?) — Enter para enviar"></textarea>
+            <textarea id="query-input" rows="2" placeholder="Escribe un prompt para el proyecto/conversación actual — Enter para enviar"></textarea>
             <button id="send-btn" class="btn btn-primary" type="button">Enviar</button>
           </div>
-          <div class="composer-controls">
+          <div id="agy-composer-controls" class="composer-controls">
+            <span>Modelo Antigravity:
+              <select id="agy-model-select">
+                <option value="gemini-4-carbon-low" selected>Gemini 4 Carbon (Low)</option>
+                <option value="gemini-4-carbon-medium">Gemini 4 Carbon (Medium)</option>
+                <option value="gemini-4-neon-low">Gemini 4 Neon (Low)</option>
+                <option value="gemini-4-neon-medium">Gemini 4 Neon (Medium)</option>
+              </select>
+            </span>
+            <span id="agy-context-label" style="margin-left:auto;color:var(--text-muted);"></span>
+          </div>
+          <div id="plant-composer-controls" class="composer-controls" style="display:none;">
             <span>Área:
               <select id="area-select">
                 <option value="">Auto (preguntar si es ambiguo)</option>
@@ -507,7 +617,7 @@
               </select>
             </span>
             <label><input id="readonly-check" type="checkbox" checked> Solo lectura</label>
-            <span id="facility-label" style="margin-left:auto; color:var(--text-muted);"></span>
+            <span id="facility-label" style="margin-left:auto;color:var(--text-muted);"></span>
           </div>
         </div>
       </div>
@@ -515,22 +625,22 @@
 
     <aside class="inspector">
       <div class="panel-header">
-        <strong style="font-size: 13px;">Inspector en vivo</strong>
+        <strong style="font-size:13px;">Inspector Planta</strong>
         <button id="refresh-btn" class="btn btn-sm" type="button">Actualizar</button>
       </div>
       <div class="inspector-body">
-        <div class="section-label">Presupuesto de corrida</div>
-        <div id="budget-panel" style="color: var(--text-muted); font-size: 12px;">
-          Selecciona o envía una tarea para inspeccionar su presupuesto.
+        <div class="section-label"><span>Presupuesto de corrida</span></div>
+        <div id="budget-panel" style="color:var(--text-muted);font-size:12px;">
+          Selecciona una corrida de planta para ver sus métricas.
         </div>
 
-        <div class="section-label">Sesiones Playwright &amp; Takeover</div>
-        <div id="sessions-panel" style="color: var(--text-muted); font-size: 12px;">
+        <div class="section-label"><span>Sesiones Playwright &amp; Takeover</span></div>
+        <div id="sessions-panel" style="color:var(--text-muted);font-size:12px;">
           Sin sesiones activas todavía.
         </div>
 
-        <div class="section-label">Recibos redactados (JSON)</div>
-        <div id="receipts-json-panel" style="color: var(--text-muted); font-size: 12px;">
+        <div class="section-label"><span>Recibos redactados (JSON)</span></div>
+        <div id="receipts-json-panel" style="color:var(--text-muted);font-size:12px;">
           Sin recibos en esta vista.
         </div>
       </div>
@@ -540,25 +650,48 @@
   <script>
     (function () {
       const TERMINAL = new Set(["succeeded", "failed", "partial", "cancelled"]);
+      const PLANT_KEY = "controlbot.showPlantModule";
       let systemInfo = null;
+      let projectsData = { projects_root: "", projects: [] };
+      let agyData = { available: false, hostname: "Mac-mini", conversations: [] };
+      let showPlantModule = localStorage.getItem(PLANT_KEY) === "true";
+      let activeMode = "agy"; // "agy" | "plant"
+      let selectedProject = null; // null or project object
+      let activeAgyId = "";
+      let agyTurns = [];
       let activeRunId = null;
-      let activeSnapshot = null;
       let pollTimer = null;
+      let inspectorOpen = false;
 
       const els = {
         layout: document.getElementById("layout"),
         connDot: document.getElementById("conn-dot"),
         systemBadges: document.getElementById("system-badges"),
+        projectsCount: document.getElementById("projects-count"),
+        projectsList: document.getElementById("projects-list"),
+        cidInput: document.getElementById("cid-input"),
+        cidUseBtn: document.getElementById("cid-use-btn"),
+        agyList: document.getElementById("agy-list"),
+        newAgyBtn: document.getElementById("new-agy-btn"),
+        togglePlantModule: document.getElementById("toggle-plant-module"),
+        plantSidebarSection: document.getElementById("plant-sidebar-section"),
+        newPlantBtn: document.getElementById("new-plant-btn"),
         runsList: document.getElementById("runs-list"),
         portalsList: document.getElementById("portals-list"),
         topbarTitle: document.getElementById("topbar-title"),
         topbarStatus: document.getElementById("topbar-status"),
+        workspaceModeBtn: document.getElementById("workspace-mode-btn"),
+        plantModeBtn: document.getElementById("plant-mode-btn"),
         cancelTopBtn: document.getElementById("cancel-top-btn"),
         toggleInspectorBtn: document.getElementById("toggle-inspector-btn"),
         threadInner: document.getElementById("thread-inner"),
         submitError: document.getElementById("submit-error"),
         queryInput: document.getElementById("query-input"),
         sendBtn: document.getElementById("send-btn"),
+        agyComposerControls: document.getElementById("agy-composer-controls"),
+        agyModelSelect: document.getElementById("agy-model-select"),
+        agyContextLabel: document.getElementById("agy-context-label"),
+        plantComposerControls: document.getElementById("plant-composer-controls"),
         areaSelect: document.getElementById("area-select"),
         userSelect: document.getElementById("user-select"),
         readonlyCheck: document.getElementById("readonly-check"),
@@ -566,7 +699,6 @@
         budgetPanel: document.getElementById("budget-panel"),
         sessionsPanel: document.getElementById("sessions-panel"),
         receiptsJsonPanel: document.getElementById("receipts-json-panel"),
-        newTaskBtn: document.getElementById("new-task-btn"),
         refreshBtn: document.getElementById("refresh-btn")
       };
 
@@ -586,7 +718,7 @@
         return "pill pill-info";
       }
 
-      function showSubmitError(msg) {
+      function showError(msg) {
         if (!msg) {
           els.submitError.style.display = "none";
           els.submitError.textContent = "";
@@ -602,186 +734,235 @@
         let data = {};
         try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { detail: text }; }
         if (!resp.ok) {
-          const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : ("HTTP " + resp.status);
+          const detail = data && data.detail
+            ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
+            : ("HTTP " + resp.status);
           throw new Error(detail);
         }
         return data;
       }
 
-      function renderSystemInfo() {
-        if (!systemInfo) return;
-        els.connDot.className = "brand-dot";
+      async function copyText(txt, btnEl) {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(txt);
+          }
+          if (btnEl) {
+            const orig = btnEl.textContent;
+            btnEl.textContent = "Copiado";
+            setTimeout(function () { btnEl.textContent = orig; }, 1200);
+          }
+        } catch (_) {}
+      }
+
+      function applyVisibility() {
+        els.togglePlantModule.checked = showPlantModule;
+        els.plantSidebarSection.style.display = showPlantModule ? "block" : "none";
+        els.workspaceModeBtn.style.display = showPlantModule ? "inline-flex" : "none";
+        els.plantModeBtn.style.display = showPlantModule ? "inline-flex" : "none";
+        if (!showPlantModule && activeMode === "plant") {
+          activeMode = "agy";
+        }
+        const inPlant = showPlantModule && activeMode === "plant";
+        els.agyComposerControls.style.display = inPlant ? "none" : "flex";
+        els.plantComposerControls.style.display = inPlant ? "flex" : "none";
+        els.toggleInspectorBtn.style.display = inPlant ? "inline-flex" : "none";
+        els.layout.classList.toggle("show-inspector", inPlant && inspectorOpen);
+        els.queryInput.placeholder = inPlant
+          ? "Consulta de planta (ej. ¿Qué alarma apareció primero en la bomba 34?)"
+          : "Escribe un prompt para Antigravity" + (selectedProject ? (" en " + selectedProject.name) : "") + " — Enter para enviar";
+      }
+
+      function renderSystemBadges() {
         const badges = [];
-        badges.push('<span class="pill pill-ok">' + esc(systemInfo.runtime_mode) + '</span>');
-        badges.push('<span class="pill pill-info">modelo: ' + esc(systemInfo.backend_mode) + '</span>');
-        if (systemInfo.facility && systemInfo.facility.facility_id) {
-          badges.push('<span class="pill">' + esc(systemInfo.facility.facility_id) + '</span>');
-          els.facilityLabel.textContent = systemInfo.facility.facility_name || systemInfo.facility.facility_id;
+        if (systemInfo) {
+          els.connDot.className = "brand-dot";
+          badges.push('<span class="pill pill-ok">Servidor listo</span>');
+          if (agyData.hostname) {
+            badges.push('<span class="pill">' + esc(agyData.hostname) + '</span>');
+          }
+          if (showPlantModule) {
+            badges.push('<span class="pill pill-info">' + esc(systemInfo.backend_mode) + '</span>');
+          }
         } else {
-          els.facilityLabel.textContent = "Modo stub";
+          els.connDot.className = "brand-dot offline";
+          badges.push('<span class="pill pill-err">Sin conexión</span>');
         }
         els.systemBadges.innerHTML = badges.join("");
+      }
 
-        const areas = (systemInfo.facility && systemInfo.facility.areas) || [];
-        if (areas.length > 0) {
-          const prev = els.areaSelect.value;
-          const opts = ['<option value="">Auto (preguntar si es ambiguo)</option>'];
-          areas.forEach(function (a, idx) {
-            const sel = prev ? (prev === a.area_id ? " selected" : "") : (idx === 0 ? " selected" : "");
-            opts.push('<option value="' + esc(a.area_id) + '"' + sel + '>' + esc(a.area_id) + ' — ' + esc(a.display_name) + '</option>');
+      function renderProjects() {
+        const items = projectsData.projects || [];
+        els.projectsCount.textContent = String(items.length);
+        const rows = [];
+        rows.push(
+          '<button type="button" class="list-item' + (!selectedProject ? ' active' : '') + '" data-proj="">' +
+            '<div class="list-item-title">General (sin carpeta fija)</div>' +
+            '<div class="list-item-sub">Contexto libre</div>' +
+          '</button>'
+        );
+        items.forEach(function (p) {
+          const isAct = selectedProject && selectedProject.name === p.name;
+          const tags = [p.is_git ? "git" : "", p.has_readme ? "README" : ""].filter(Boolean).join(" · ");
+          rows.push(
+            '<button type="button" class="list-item' + (isAct ? ' active' : '') + '" data-proj="' + esc(p.name) + '">' +
+              '<div class="list-item-title">' + esc(p.name) + '</div>' +
+              '<div class="list-item-sub">' + esc(tags || "carpeta") + '</div>' +
+            '</button>'
+          );
+        });
+        els.projectsList.innerHTML = rows.join("");
+        els.projectsList.querySelectorAll(".list-item").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            const name = btn.getAttribute("data-proj");
+            selectedProject = name ? (items.find(function (x) { return x.name === name; }) || null) : null;
+            activeMode = "agy";
+            renderProjects();
+            renderWorkspaceThread();
+            applyVisibility();
           });
-          els.areaSelect.innerHTML = opts.join("");
+        });
+      }
+
+      function renderAgyConversations() {
+        const convs = agyData.conversations || [];
+        if (convs.length === 0) {
+          els.agyList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:4px;">Sin transcripciones recientes.</div>';
+          return;
         }
-
-        const apps = (systemInfo.facility && systemInfo.facility.apps) || [];
-        els.portalsList.innerHTML = apps.map(function (a) {
-          const badge = a.read_only ? "solo lectura" : "escritura";
-          return '<a class="portal-link" href="' + esc(a.origin) + '" target="_blank" rel="noopener noreferrer">' +
-            '<span>' + esc(a.app_id.toUpperCase()) + ' <span style="color:var(--text-muted);font-family:var(--mono);font-size:11px;">' + esc(a.origin.replace("http://", "")) + '</span></span>' +
-            '<span class="pill">' + esc(badge) + '</span>' +
-            '</a>';
-        }).join("") || '<div style="color:var(--text-muted);font-size:12px;">Sin portales configurados.</div>';
-      }
-
-      function getDefaultOrigins(readOnly) {
-        const apps = (systemInfo && systemInfo.facility && systemInfo.facility.apps) || [];
-        return apps
-          .filter(function (a) { return !readOnly || a.read_only; })
-          .map(function (a) { return a.origin; });
-      }
-
-      async function loadSystemInfo() {
-        try {
-          systemInfo = await apiJson("/api/system/info");
-          renderSystemInfo();
-        } catch (err) {
-          els.connDot.className = "brand-dot offline";
-          els.systemBadges.innerHTML = '<span class="pill pill-err">Sin conexión</span>';
-        }
-      }
-
-      async function loadRunsList() {
-        try {
-          const data = await apiJson("/api/tasks");
-          const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-          tasks.sort(function (a, b) {
-            const ta = (a.run && a.run.created_at) || "";
-            const tb = (b.run && b.run.created_at) || "";
-            return tb.localeCompare(ta);
+        els.agyList.innerHTML = convs.map(function (c) {
+          const isAct = activeAgyId === c.conversation_id;
+          const label = c.preview || ("Sesión " + c.conversation_id.slice(0, 8));
+          const tag = c.is_user_explicit ? "chat" : "agente";
+          return '<button type="button" class="list-item' + (isAct ? ' active' : '') + '" data-cid="' + esc(c.conversation_id) + '">' +
+            '<div class="list-item-title">' + esc(label) + '</div>' +
+            '<div class="list-item-sub">' + esc(tag) + ' · ' + esc(c.conversation_id.slice(0, 13)) + '...</div>' +
+          '</button>';
+        }).join("");
+        els.agyList.querySelectorAll(".list-item").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            activeAgyId = btn.getAttribute("data-cid") || "";
+            els.cidInput.value = activeAgyId;
+            agyTurns = [];
+            activeMode = "agy";
+            renderAgyConversations();
+            renderWorkspaceThread();
+            applyVisibility();
           });
-          if (tasks.length === 0) {
-            els.runsList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:6px 4px;">Aún no hay corridas.</div>';
-            return;
-          }
-          els.runsList.innerHTML = tasks.map(function (snap) {
-            const run = snap.run || {};
-            const task = snap.task || {};
-            const usage = (snap.budget && snap.budget.usage) || {};
-            const isActive = run.run_id === activeRunId;
-            return '<button type="button" class="run-item' + (isActive ? ' active' : '') + '" data-run-id="' + esc(run.run_id) + '">' +
-              '<div class="run-item-top">' +
-                '<span class="' + statusPillClass(snap.status) + '">' + esc(snap.status) + '</span>' +
-                '<span class="run-item-meta">tools:' + esc(usage.tool_calls_used || 0) + '</span>' +
-              '</div>' +
-              '<div class="run-item-query">' + esc(task.query || run.run_id) + '</div>' +
-              '<div class="run-item-meta">' + esc(run.run_id) + '</div>' +
-            '</button>';
-          }).join("");
-          els.runsList.querySelectorAll(".run-item").forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              selectRun(btn.getAttribute("data-run-id"));
-            });
-          });
-        } catch (_) {}
+        });
       }
 
-      async function loadSessions() {
-        try {
-          const data = await apiJson("/api/sessions");
-          const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-          if (sessions.length === 0) {
-            els.sessionsPanel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Sin sesiones Playwright activas aún.</div>';
-            return;
-          }
-          els.sessionsPanel.innerHTML = sessions.map(function (s) {
-            const actionBtn = s.takeover_active
-              ? '<button type="button" class="btn btn-primary btn-sm session-release-btn" data-sid="' + esc(s.session_id) + '" data-owner="' + esc(s.takeover_owner || "operator") + '">Release</button>'
-              : '<button type="button" class="btn btn-sm session-takeover-btn" data-sid="' + esc(s.session_id) + '">Takeover</button>';
-            return '<div class="session-card">' +
-              '<div class="session-card-head">' +
-                '<strong>' + esc(s.app_id) + '</strong>' +
-                (s.takeover_active ? '<span class="pill pill-warn">Takeover</span>' : (s.active_lease ? '<span class="pill pill-info">En uso</span>' : '<span class="pill">Libre</span>')) +
-              '</div>' +
-              '<div style="color:var(--text-dim);font-family:var(--mono);font-size:11px;word-break:break-all;margin-bottom:6px;">' + esc(s.session_id) + '</div>' +
-              '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-                '<span style="color:var(--text-muted);font-size:11px;">user: ' + esc(s.user_id) + '</span>' +
-                actionBtn +
-              '</div>' +
-            '</div>';
-          }).join("");
-
-          els.sessionsPanel.querySelectorAll(".session-takeover-btn").forEach(function (btn) {
-            btn.addEventListener("click", async function () {
-              try {
-                await apiJson("/api/sessions/" + encodeURIComponent(btn.getAttribute("data-sid")) + "/takeover", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ owner: els.userSelect.value || "operator", reason: "manual_studio_takeover" })
-                });
-                loadSessions();
-              } catch (err) { showSubmitError(err.message); }
-            });
-          });
-          els.sessionsPanel.querySelectorAll(".session-release-btn").forEach(function (btn) {
-            btn.addEventListener("click", async function () {
-              try {
-                await apiJson("/api/sessions/" + encodeURIComponent(btn.getAttribute("data-sid")) + "/release", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ owner: btn.getAttribute("data-owner") || "operator" })
-                });
-                loadSessions();
-              } catch (err) { showSubmitError(err.message); }
-            });
-          });
-        } catch (_) {}
-      }
-
-      function renderWelcome() {
-        activeRunId = null;
-        activeSnapshot = null;
+      function renderWorkspaceThread() {
+        applyVisibility();
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-        els.topbarTitle.textContent = "Nueva tarea industrial";
+        els.cancelTopBtn.style.display = "none";
+        els.topbarStatus.style.display = "inline-flex";
+        els.topbarStatus.className = "pill pill-ok";
+        els.topbarStatus.textContent = activeAgyId ? ("ID: " + activeAgyId.slice(0, 8)) : "Nueva sesión";
+
+        const projTitle = selectedProject ? ("Proyecto: " + selectedProject.name) : "Workspace general";
+        els.topbarTitle.textContent = projTitle + (activeAgyId ? (" · " + activeAgyId.slice(0, 8)) : "");
+        els.agyContextLabel.textContent = selectedProject ? selectedProject.path : (projectsData.projects_root || "");
+
+        const resumeCmd = activeAgyId ? ("agy --resume " + activeAgyId) : "";
+        const host = agyData.hostname || "Armandos-Mac-mini.local";
+        const sshHost = host.endsWith(".local") ? host : (host + ".local");
+        const sshCmd = activeAgyId ? ("ssh -t " + sshHost + " 'agy --resume " + activeAgyId + "'") : "";
+
+        const blocks = [];
+        blocks.push(
+          '<div class="card card-hero">' +
+            '<h1>' + esc(projTitle) + '</h1>' +
+            '<p>' + (selectedProject
+              ? ('Trabajando en <code>' + esc(selectedProject.path) + '</code>. Selecciona un ID de Antigravity o escribe tu prompt abajo.')
+              : 'Elige un proyecto en la barra izquierda cuando lo necesites, o pega un ID de conversación Antigravity para continuarla.') +
+            '</p>' +
+            (activeAgyId
+              ? ('<div class="cmd-strip">' +
+                  '<code>' + esc(resumeCmd) + '</code>' +
+                  '<div style="display:flex;gap:6px;flex-shrink:0;">' +
+                    '<button id="copy-resume-btn" type="button" class="btn btn-sm">Copiar comando</button>' +
+                    '<button id="copy-ssh-btn" type="button" class="btn btn-sm">Copiar SSH</button>' +
+                  '</div>' +
+                '</div>')
+              : '') +
+          '</div>'
+        );
+
+        agyTurns.forEach(function (t) {
+          if (t.role === "user") {
+            blocks.push(
+              '<div class="card card-user">' +
+                '<div class="card-user-text">' + esc(t.text) + '</div>' +
+                '<div class="chip-row">' +
+                  (t.project ? ('<span class="pill">' + esc(t.project) + '</span>') : '') +
+                  '<span class="pill">' + esc(t.model) + '</span>' +
+                '</div>' +
+              '</div>'
+            );
+          } else if (t.role === "pending") {
+            blocks.push('<div class="card" style="color:var(--text-dim);">Ejecutando turno con Antigravity CLI...</div>');
+          } else if (t.role === "error") {
+            blocks.push('<div class="card"><div class="banner banner-err" style="margin-top:0;">' + esc(t.text) + '</div></div>');
+          } else {
+            const usage = t.usage || {};
+            blocks.push(
+              '<div class="card">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">' +
+                  '<strong>Respuesta Antigravity</strong>' +
+                  '<span class="pill pill-ok">' + esc(t.model) + (usage.total_tokens ? (' · ' + usage.total_tokens + ' tokens') : '') + '</span>' +
+                '</div>' +
+                '<div class="answer-box">' + esc(t.text) + '</div>' +
+              '</div>'
+            );
+          }
+        });
+
+        els.threadInner.innerHTML = blocks.join("");
+        const copyBtn = document.getElementById("copy-resume-btn");
+        if (copyBtn) {
+          copyBtn.addEventListener("click", function () { copyText(resumeCmd, copyBtn); });
+        }
+        const copySshBtn = document.getElementById("copy-ssh-btn");
+        if (copySshBtn) {
+          copySshBtn.addEventListener("click", function () { copyText(sshCmd, copySshBtn); });
+        }
+      }
+
+      function renderPlantWelcome() {
+        activeMode = "plant";
+        activeRunId = null;
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        applyVisibility();
+        els.topbarTitle.textContent = "Demo Planta · Nueva tarea";
         els.topbarStatus.style.display = "none";
         els.cancelTopBtn.style.display = "none";
-        els.budgetPanel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Envía o selecciona una corrida para ver sus métricas.</div>';
-        els.receiptsJsonPanel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Sin recibos aún.</div>';
 
         const starters = [
           {
             title: "Diagnóstico completo Bomba 34 (Área 1)",
-            desc: "Cruza alarmas SCADA y órdenes de mantenimiento en Playwright aislado.",
+            desc: "Cruza alarmas SCADA y órdenes de mantenimiento en Playwright.",
             query: "¿Qué alarma apareció primero en la bomba 34 y qué se cambió en su última intervención?",
             areas: ["area-1"]
           },
           {
             title: "Probar desambiguación humana",
-            desc: "Envía sin área fija: el agente pausa en waiting_for_input para confirmar.",
+            desc: "Sin área fija: pausa en waiting_for_input para elegir Área.",
             query: "¿Qué alarma apareció primero en la bomba 34 y qué se cambió en su última intervención?",
             areas: []
           },
           {
             title: "Inspeccionar alarmas y lecturas SCADA",
-            desc: "Consulta las lecturas recientes y calidad de datos de la bomba 34.",
+            desc: "Consulta las lecturas recientes de la bomba 34.",
             query: "Revisa las alarmas y lecturas actuales de la bomba 34",
             areas: ["area-1"]
           }
         ];
 
         els.threadInner.innerHTML =
-          '<div class="welcome-hero">' +
-            '<h1>ControlBot Studio</h1>' +
-            '<p>Consola local verificable sobre Playwright aislado, SQLite WAL y contratos estrictos. Envía una consulta abajo o prueba uno de estos flujos reales:</p>' +
+          '<div class="card card-hero">' +
+            '<h1>Módulo Demo Planta</h1>' +
+            '<p>Flujo industrial verificable (SCADA + Maintenance + Playwright aislado). Requiere que los portales lab estén encendidos.</p>' +
             '<div class="starter-grid">' +
               starters.map(function (st, i) {
                 return '<button type="button" class="starter-card" data-idx="' + i + '">' +
@@ -795,12 +976,9 @@
         els.threadInner.querySelectorAll(".starter-card").forEach(function (card) {
           card.addEventListener("click", function () {
             const st = starters[Number(card.getAttribute("data-idx"))];
-            els.queryInput.value = st.query;
-            els.areaSelect.value = st.areas.length > 0 ? st.areas[0] : "";
-            submitTask(st.query, st.areas);
+            submitPlantTask(st.query, st.areas);
           });
         });
-        loadRunsList();
       }
 
       function renderBudgetMeter(label, used, limit, suffix) {
@@ -812,8 +990,9 @@
         '</div>';
       }
 
-      function renderActiveSnapshot(snap) {
-        activeSnapshot = snap;
+      function renderPlantSnapshot(snap) {
+        activeMode = "plant";
+        applyVisibility();
         const run = snap.run || {};
         const task = snap.task || {};
         const scope = task.scope || {};
@@ -831,28 +1010,24 @@
         els.cancelTopBtn.style.display = TERMINAL.has(snap.status) ? "none" : "inline-flex";
 
         const totalTokens = Number(usage.prompt_tokens_used || 0) + Number(usage.completion_tokens_used || 0);
-        const estSuffix = usage.usage_estimated ? " (est)" : "";
         els.budgetPanel.innerHTML =
           renderBudgetMeter("Tool calls", usage.tool_calls_used || 0, cfg.max_tool_calls || 16, "") +
           renderBudgetMeter("Model calls", usage.model_calls_used || 0, cfg.max_model_calls || 8, "") +
-          renderBudgetMeter("Tokens", totalTokens, cfg.max_total_tokens || 24000, estSuffix) +
-          renderBudgetMeter("Tiempo (s)", Number(usage.wall_seconds_elapsed || 0).toFixed(2), cfg.max_wall_seconds || 120, "s") +
-          renderBudgetMeter("Reintentos", usage.transient_retries_used || 0, cfg.max_transient_retries || 1, "");
+          renderBudgetMeter("Tokens", totalTokens, cfg.max_total_tokens || 24000, usage.usage_estimated ? " (est)" : "") +
+          renderBudgetMeter("Tiempo (s)", Number(usage.wall_seconds_elapsed || 0).toFixed(2), cfg.max_wall_seconds || 120, "s");
 
         els.receiptsJsonPanel.innerHTML = receipts.length > 0
           ? '<details><summary>Ver ' + receipts.length + ' recibo(s) JSON</summary><pre class="json-box">' + esc(JSON.stringify(receipts, null, 2)) + '</pre></details>'
           : '<div style="color:var(--text-muted);font-size:12px;">Sin recibos aún.</div>';
 
         const blocks = [];
-        const areasText = (scope.allowed_areas && scope.allowed_areas.length) ? scope.allowed_areas.join(", ") : "auto";
         blocks.push(
           '<div class="card card-user">' +
             '<div class="card-user-text">' + esc(task.query) + '</div>' +
             '<div class="chip-row">' +
               '<span class="pill">' + esc(run.run_id) + '</span>' +
               '<span class="pill">' + esc(task.user_id) + '</span>' +
-              '<span class="pill">área: ' + esc(areasText) + '</span>' +
-              '<span class="pill">' + (scope.read_only ? "solo lectura" : "escritura") + '</span>' +
+              '<span class="pill">área: ' + esc((scope.allowed_areas && scope.allowed_areas.length) ? scope.allowed_areas.join(", ") : "auto") + '</span>' +
             '</div>' +
           '</div>'
         );
@@ -862,123 +1037,126 @@
           blocks.push(
             '<div class="card card-hitl">' +
               '<div class="hitl-title">Intervención humana requerida</div>' +
-              '<div>' + esc(snap.required_action || snap.transition_reason || "Confirma el parámetro para continuar.") + '</div>' +
+              '<div>' + esc(snap.required_action || snap.transition_reason || "Confirma el parámetro.") + '</div>' +
               '<div class="hitl-actions">' +
                 areas.map(function (a) {
                   return '<button type="button" class="btn btn-primary btn-sm hitl-choice-btn" data-choice="' + esc(a.area_id) + '">Elegir ' + esc(a.area_id) + '</button>';
                 }).join("") +
-                '<input id="hitl-custom-input" class="hitl-input" type="text" placeholder="Otro valor (ej. area-1)">' +
+                '<input id="hitl-custom-input" class="hitl-input" type="text" placeholder="Otro valor...">' +
                 '<button id="hitl-submit-btn" type="button" class="btn btn-sm">Reanudar</button>' +
               '</div>' +
             '</div>'
           );
         }
 
-        const timelineHtml = transitions.map(function (t) {
-          return '<div class="timeline-row">' +
-            '<span><strong>' + esc(t.from_status || "init") + ' &rarr; ' + esc(t.to_status) + '</strong> · <span style="color:var(--text-dim);">' + esc(t.reason) + '</span></span>' +
-            '<span style="color:var(--text-muted);font-family:var(--mono);font-size:11px;">' + esc(t.timestamp || "") + '</span>' +
-          '</div>';
-        }).join("");
-
-        const receiptsHtml = receipts.map(function (r) {
-          return '<div class="timeline-row">' +
-            '<span><code>' + esc(r.tool_id) + '</code> · <span class="' + (r.outcome === "succeeded" ? "pill pill-ok" : "pill pill-warn") + '">' + esc(r.outcome) + '</span></span>' +
-            '<span style="color:var(--text-muted);font-family:var(--mono);font-size:11px;">' + Number(r.duration_ms || 0).toFixed(1) + ' ms</span>' +
-          '</div>';
-        }).join("");
-
         blocks.push(
-          '<div class="card">' +
-            '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-              '<strong>Trazabilidad de ejecución</strong>' +
-              '<span style="color:var(--text-muted);font-size:12px;">' + esc(snap.transition_reason || "") + '</span>' +
-            '</div>' +
-            '<div class="timeline-list">' + timelineHtml + receiptsHtml + '</div>' +
-          '</div>'
+          '<div class="card"><strong>Trazabilidad</strong><div class="timeline-list">' +
+            transitions.map(function (t) {
+              return '<div class="timeline-row"><span><strong>' + esc(t.from_status || "init") + ' &rarr; ' + esc(t.to_status) + '</strong> · ' + esc(t.reason) + '</span><span style="font-family:var(--mono);font-size:11px;color:var(--text-muted);">' + esc(t.timestamp || "") + '</span></div>';
+            }).join("") +
+            receipts.map(function (r) {
+              return '<div class="timeline-row"><span><code>' + esc(r.tool_id) + '</code> · <span class="' + (r.outcome === "succeeded" ? "pill pill-ok" : "pill pill-warn") + '">' + esc(r.outcome) + '</span></span><span style="font-family:var(--mono);font-size:11px;color:var(--text-muted);">' + Number(r.duration_ms || 0).toFixed(1) + ' ms</span></div>';
+            }).join("") +
+          '</div></div>'
         );
 
         if (result) {
           const obs = Array.isArray(result.verified_observations) ? result.verified_observations : [];
-          const contradictions = Array.isArray(result.contradictions) ? result.contradictions : [];
-          let resultInner = '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-            '<strong>Resultado verificado</strong>' +
-            '<span class="' + statusPillClass(result.status || snap.status) + '">' + esc(result.status || snap.status) + '</span>' +
-          '</div>' +
-          '<div class="answer-box">' + esc(result.answer || "") + '</div>';
-
-          if (result.partial_info) {
-            resultInner += '<div class="banner banner-warn"><strong>Disponibilidad parcial:</strong> ' + esc(JSON.stringify(result.partial_info)) + '</div>';
-          }
-          if (contradictions.length > 0) {
-            resultInner += '<div class="banner banner-err"><strong>Contradicciones detectadas (' + contradictions.length + '):</strong> ' +
-              contradictions.map(function (c) { return esc(c.summary); }).join(" | ") + '</div>';
-          }
-          if (obs.length > 0) {
-            resultInner += '<table><thead><tr>' +
-              '<th>Fuente</th><th>Activo</th><th>Valor</th><th>Unidad</th><th>Hora fuente</th><th>Calidad</th><th>Área</th>' +
-              '</tr></thead><tbody>' +
-              obs.map(function (o) {
-                return '<tr>' +
-                  '<td><span class="pill">' + esc(o.source) + '</span></td>' +
-                  '<td><code>' + esc(o.asset_id) + '</code></td>' +
-                  '<td><strong>' + esc(o.value) + '</strong></td>' +
-                  '<td>' + esc(o.unit || "-") + '</td>' +
-                  '<td><code>' + esc(o.source_time || "-") + '</code></td>' +
-                  '<td>' + esc(o.quality) + '</td>' +
-                  '<td>' + esc(o.area || "-") + '</td>' +
-                '</tr>';
-              }).join("") +
-              '</tbody></table>';
-          }
-          blocks.push('<div class="card">' + resultInner + '</div>');
-        } else if (!TERMINAL.has(snap.status) && snap.status !== "waiting_for_input") {
-          blocks.push('<div class="card" style="color:var(--text-dim);">Ejecutando agente en navegadores aislados...</div>');
+          blocks.push(
+            '<div class="card">' +
+              '<div style="display:flex;justify-content:space-between;align-items:center;"><strong>Resultado</strong><span class="' + statusPillClass(result.status || snap.status) + '">' + esc(result.status || snap.status) + '</span></div>' +
+              '<div class="answer-box">' + esc(result.answer || "") + '</div>' +
+              (obs.length > 0 ? ('<table><thead><tr><th>Fuente</th><th>Activo</th><th>Valor</th><th>Unidad</th><th>Calidad</th><th>Área</th></tr></thead><tbody>' +
+                obs.map(function (o) {
+                  return '<tr><td>' + esc(o.source) + '</td><td><code>' + esc(o.asset_id) + '</code></td><td><strong>' + esc(o.value) + '</strong></td><td>' + esc(o.unit || "-") + '</td><td>' + esc(o.quality) + '</td><td>' + esc(o.area || "-") + '</td></tr>';
+                }).join("") + '</tbody></table>') : '') +
+            '</div>'
+          );
         }
-
         els.threadInner.innerHTML = blocks.join("");
-
         els.threadInner.querySelectorAll(".hitl-choice-btn").forEach(function (btn) {
-          btn.addEventListener("click", function () {
-            resumeRun(run.run_id, btn.getAttribute("data-choice"));
-          });
+          btn.addEventListener("click", function () { resumePlantRun(run.run_id, btn.getAttribute("data-choice")); });
         });
         const customBtn = document.getElementById("hitl-submit-btn");
         const customInp = document.getElementById("hitl-custom-input");
         if (customBtn && customInp) {
           customBtn.addEventListener("click", function () {
-            if (customInp.value.trim()) resumeRun(run.run_id, customInp.value.trim());
+            if (customInp.value.trim()) resumePlantRun(run.run_id, customInp.value.trim());
           });
         }
       }
 
-      async function selectRun(runId) {
+      async function selectPlantRun(runId) {
         if (!runId) return;
         activeRunId = runId;
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
         try {
           const snap = await apiJson("/api/tasks/" + encodeURIComponent(runId));
-          renderActiveSnapshot(snap);
-          loadRunsList();
-          loadSessions();
+          renderPlantSnapshot(snap);
+          loadPlantRuns();
           if (!TERMINAL.has(snap.status)) {
-            pollTimer = setTimeout(function () { selectRun(runId); }, 1000);
+            pollTimer = setTimeout(function () { selectPlantRun(runId); }, 1000);
           }
         } catch (err) {
-          showSubmitError(err.message);
+          showError(err.message);
         }
       }
 
-      async function submitTask(overrideQuery, overrideAreas) {
-        showSubmitError("");
+      async function submitAgyPrompt() {
+        showError("");
+        const prompt = els.queryInput.value.trim();
+        if (!prompt) return;
+        const model = els.agyModelSelect.value || "gemini-4-carbon-low";
+        const project = selectedProject ? selectedProject.name : null;
+
+        els.queryInput.value = "";
+        agyTurns.push({ role: "user", text: prompt, project: project, model: model });
+        agyTurns.push({ role: "pending", text: "" });
+        renderWorkspaceThread();
+        els.sendBtn.disabled = true;
+
+        try {
+          const res = await apiJson("/api/agy/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: prompt,
+              conversation_id: activeAgyId || null,
+              project_name: project,
+              model: model
+            })
+          });
+          agyTurns = agyTurns.filter(function (t) { return t.role !== "pending"; });
+          if (res.conversation_id) {
+            activeAgyId = res.conversation_id;
+            els.cidInput.value = activeAgyId;
+          }
+          agyTurns.push({
+            role: "assistant",
+            text: res.response || "",
+            model: res.model || model,
+            usage: res.usage || {}
+          });
+          loadAgyConversations();
+        } catch (err) {
+          agyTurns = agyTurns.filter(function (t) { return t.role !== "pending"; });
+          agyTurns.push({ role: "error", text: err.message });
+        } finally {
+          els.sendBtn.disabled = false;
+          renderWorkspaceThread();
+        }
+      }
+
+      async function submitPlantTask(overrideQuery, overrideAreas) {
+        showError("");
         const query = (overrideQuery != null ? overrideQuery : els.queryInput.value).trim();
         if (!query) return;
         const areaVal = els.areaSelect.value.trim();
         const areas = overrideAreas != null ? overrideAreas : (areaVal ? [areaVal] : []);
         const readOnly = Boolean(els.readonlyCheck.checked);
         const facilityId = (systemInfo && systemInfo.facility && systemInfo.facility.facility_id) || "facility-a";
-        const allowedOrigins = getDefaultOrigins(readOnly);
-        const backendMode = (systemInfo && systemInfo.backend_mode === "local_http") ? "local_http" : "emulated";
+        const apps = (systemInfo && systemInfo.facility && systemInfo.facility.apps) || [];
+        const origins = apps.filter(function (a) { return !readOnly || a.read_only; }).map(function (a) { return a.origin; });
 
         els.sendBtn.disabled = true;
         try {
@@ -989,75 +1167,163 @@
               user_id: els.userSelect.value || "operator_ro",
               profile_id: "studio",
               facility_id: facilityId,
-              allowed_origins: allowedOrigins,
+              allowed_origins: origins,
               allowed_areas: areas,
               read_only: readOnly,
               query: query,
-              backend_mode: backendMode
+              backend_mode: (systemInfo && systemInfo.backend_mode === "local_http") ? "local_http" : "emulated"
             })
           });
           if (overrideQuery == null) els.queryInput.value = "";
-          await selectRun(created.run_id);
+          await selectPlantRun(created.run_id);
         } catch (err) {
-          showSubmitError(err.message);
+          showError(err.message);
         } finally {
           els.sendBtn.disabled = false;
         }
       }
 
-      async function resumeRun(runId, choice) {
-        showSubmitError("");
+      async function resumePlantRun(runId, choice) {
         try {
           await apiJson("/api/tasks/" + encodeURIComponent(runId) + "/resume", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ human_input: { choice: choice } })
           });
-          await selectRun(runId);
-        } catch (err) {
-          showSubmitError(err.message);
-        }
+          await selectPlantRun(runId);
+        } catch (err) { showError(err.message); }
       }
 
-      async function cancelActiveRun() {
-        if (!activeRunId) return;
+      async function loadSystemInfo() {
         try {
-          await apiJson("/api/tasks/" + encodeURIComponent(activeRunId) + "/cancel", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ reason: "cancelled_by_studio_operator" })
-          });
-          await selectRun(activeRunId);
-        } catch (err) {
-          showSubmitError(err.message);
+          systemInfo = await apiJson("/api/system/info");
+          renderSystemBadges();
+          if (systemInfo.facility) {
+            els.facilityLabel.textContent = systemInfo.facility.facility_name || systemInfo.facility.facility_id;
+            const apps = systemInfo.facility.apps || [];
+            els.portalsList.innerHTML = apps.map(function (a) {
+              const hostLabel = String(a.origin || "").replace(/^https?:\/\//, "");
+              return '<a class="portal-link" href="' + esc(a.origin) + '" target="_blank" rel="noopener noreferrer">' +
+                '<span>' + esc(a.app_id.toUpperCase()) + ' <span style="color:var(--text-muted);font-family:var(--mono);font-size:11px;">' + esc(hostLabel) + '</span></span>' +
+                '<span class="pill">' + (a.read_only ? "lectura" : "escritura") + '</span></a>';
+            }).join("");
+          }
+        } catch (_) {
+          systemInfo = null;
+          renderSystemBadges();
         }
       }
 
-      els.sendBtn.addEventListener("click", function () { submitTask(); });
+      async function loadProjects() {
+        try {
+          projectsData = await apiJson("/api/projects");
+          renderProjects();
+          if (activeMode === "agy") renderWorkspaceThread();
+        } catch (_) {}
+      }
+
+      async function loadAgyConversations() {
+        try {
+          agyData = await apiJson("/api/agy/conversations");
+          renderSystemBadges();
+          renderAgyConversations();
+          if (activeMode === "agy") renderWorkspaceThread();
+        } catch (_) {}
+      }
+
+      async function loadPlantRuns() {
+        if (!showPlantModule) return;
+        try {
+          const data = await apiJson("/api/tasks");
+          const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+          tasks.sort(function (a, b) {
+            return String((b.run && b.run.created_at) || "").localeCompare(String((a.run && a.run.created_at) || ""));
+          });
+          els.runsList.innerHTML = tasks.map(function (snap) {
+            const run = snap.run || {};
+            const task = snap.task || {};
+            return '<button type="button" class="list-item' + (run.run_id === activeRunId ? ' active' : '') + '" data-run-id="' + esc(run.run_id) + '">' +
+              '<div class="list-item-title">' + esc(task.query || run.run_id) + '</div>' +
+              '<div class="list-item-sub">' + esc(snap.status) + ' · ' + esc(run.run_id) + '</div>' +
+            '</button>';
+          }).join("") || '<div style="color:var(--text-muted);font-size:12px;padding:4px;">Sin corridas.</div>';
+          els.runsList.querySelectorAll(".list-item").forEach(function (btn) {
+            btn.addEventListener("click", function () { selectPlantRun(btn.getAttribute("data-run-id")); });
+          });
+        } catch (_) {}
+      }
+
+      els.togglePlantModule.addEventListener("change", function () {
+        showPlantModule = Boolean(els.togglePlantModule.checked);
+        localStorage.setItem(PLANT_KEY, showPlantModule ? "true" : "false");
+        applyVisibility();
+        renderSystemBadges();
+        if (showPlantModule) {
+          loadPlantRuns();
+        } else {
+          renderWorkspaceThread();
+        }
+      });
+
+      els.cidUseBtn.addEventListener("click", function () {
+        const val = els.cidInput.value.trim();
+        if (!val) return;
+        activeAgyId = val;
+        agyTurns = [];
+        activeMode = "agy";
+        renderAgyConversations();
+        renderWorkspaceThread();
+      });
+
+      els.newAgyBtn.addEventListener("click", function () {
+        activeAgyId = "";
+        els.cidInput.value = "";
+        agyTurns = [];
+        activeMode = "agy";
+        renderAgyConversations();
+        renderWorkspaceThread();
+      });
+
+      els.workspaceModeBtn.addEventListener("click", renderWorkspaceThread);
+      els.plantModeBtn.addEventListener("click", renderPlantWelcome);
+      els.newPlantBtn.addEventListener("click", renderPlantWelcome);
+      els.toggleInspectorBtn.addEventListener("click", function () {
+        inspectorOpen = !inspectorOpen;
+        applyVisibility();
+      });
+      els.cancelTopBtn.addEventListener("click", async function () {
+        if (!activeRunId) return;
+        await apiJson("/api/tasks/" + encodeURIComponent(activeRunId) + "/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "cancelled_by_studio_operator" })
+        });
+        selectPlantRun(activeRunId);
+      });
+      els.sendBtn.addEventListener("click", function () {
+        if (showPlantModule && activeMode === "plant") submitPlantTask();
+        else submitAgyPrompt();
+      });
       els.queryInput.addEventListener("keydown", function (ev) {
         if (ev.key === "Enter" && !ev.shiftKey) {
           ev.preventDefault();
-          submitTask();
+          if (showPlantModule && activeMode === "plant") submitPlantTask();
+          else submitAgyPrompt();
         }
-      });
-      els.newTaskBtn.addEventListener("click", renderWelcome);
-      els.cancelTopBtn.addEventListener("click", cancelActiveRun);
-      els.toggleInspectorBtn.addEventListener("click", function () {
-        els.layout.classList.toggle("inspector-hidden");
       });
       els.refreshBtn.addEventListener("click", function () {
         loadSystemInfo();
-        loadRunsList();
-        loadSessions();
-        if (activeRunId) selectRun(activeRunId);
+        loadProjects();
+        loadAgyConversations();
+        if (showPlantModule) loadPlantRuns();
       });
 
-      renderWelcome();
+      applyVisibility();
+      renderWorkspaceThread();
       loadSystemInfo();
-      loadRunsList();
-      loadSessions();
-      setInterval(loadRunsList, 3000);
-      setInterval(loadSessions, 4000);
+      loadProjects();
+      loadAgyConversations();
+      if (showPlantModule) loadPlantRuns();
     })();
   </script>
 </body>

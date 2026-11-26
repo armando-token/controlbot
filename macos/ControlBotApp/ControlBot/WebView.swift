@@ -7,7 +7,7 @@ struct ControlBotWebView: NSViewRepresentable {
     let reloadToken: UUID
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(initialReloadToken: reloadToken)
+        Coordinator(initialURL: url, initialReloadToken: reloadToken)
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -22,6 +22,13 @@ struct ControlBotWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.allowedHost = (url.host ?? "").lowercased()
+        if context.coordinator.lastURL != url {
+            context.coordinator.lastURL = url
+            context.coordinator.lastReloadToken = reloadToken
+            webView.load(URLRequest(url: url))
+            return
+        }
         if context.coordinator.lastReloadToken != reloadToken {
             context.coordinator.lastReloadToken = reloadToken
             if webView.url != nil {
@@ -33,10 +40,14 @@ struct ControlBotWebView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        var lastURL: URL
         var lastReloadToken: UUID
+        var allowedHost: String
 
-        init(initialReloadToken: UUID) {
+        init(initialURL: URL, initialReloadToken: UUID) {
+            self.lastURL = initialURL
             self.lastReloadToken = initialReloadToken
+            self.allowedHost = (initialURL.host ?? "").lowercased()
         }
 
         func webView(
@@ -50,7 +61,11 @@ struct ControlBotWebView: NSViewRepresentable {
             }
             let host = (targetURL.host ?? "").lowercased()
             let scheme = (targetURL.scheme ?? "").lowercased()
-            if scheme == "about" || host == "127.0.0.1" || host == "localhost" || host == "::1" {
+            if scheme == "about"
+                || host == allowedHost
+                || host == "127.0.0.1"
+                || host == "localhost"
+                || host == "::1" {
                 decisionHandler(.allow)
                 return
             }
