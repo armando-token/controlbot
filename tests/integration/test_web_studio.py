@@ -16,7 +16,11 @@ from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.local_server import running_local_stack
 from src.storage.redaction import contains_unredacted_secret_strict
 from src.web import create_app
-from src.web.workspace import build_agy_prompt_with_browser_context, parse_agy_models_output
+from src.web.workspace import (
+    build_agy_prompt_with_browser_context,
+    parse_agy_models_output,
+    parse_agy_stream_event,
+)
 from starlette.testclient import TestClient
 
 
@@ -62,6 +66,7 @@ async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Pat
         assert "computador en vivo" in body_low
         assert "mostrar hydrogen" in body_low
         assert "share-browser-check" in body_low
+        assert "/api/agy/stream" in body_low
         assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
         assert "https://" not in body_low
 
@@ -304,9 +309,142 @@ def test_build_agy_prompt_with_browser_context() -> None:
     assert "Controlador N1200 — Precio: $245.00 USD" in enriched
     assert 'source="untrusted_webpage"' in enriched
     assert "/api/browser/action" in enriched
+    assert '"type":"navigate"' in enriched
+    assert '"type":"click"' in enriched
+    assert "NO busques ni leas" in enriched
     assert "/tmp/live_browser_latest.jpg" in enriched
     assert "[SOLICITUD DEL USUARIO]" in enriched
     assert "¿Cuál es el precio del N1200?" in enriched
+
+
+@pytest.mark.n1
+def test_parse_agy_stream_event_redacts_and_normalizes() -> None:
+    assert parse_agy_stream_event("") is None
+    assert parse_agy_stream_event("not-json") is None
+
+    init_ev = parse_agy_stream_event(
+        json.dumps(
+            {
+                "event": "init",
+                "conversation_id": "conv-123",
+                "init": {"model": "gemini-4-carbon-low"},
+            }
+        )
+    )
+    assert init_ev == {
+        "type": "init",
+        "conversation_id": "conv-123",
+        "model": "gemini-4-carbon-low",
+    }
+
+    tool_ev = parse_agy_stream_event(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_index": 2,
+                    "state": "ACTIVE",
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": {
+                        "parameters": {"CommandLine": "curl -H sk-secret-abcdef12345 http://x"}
+                    },
+                },
+            }
+        )
+    )
+    assert tool_ev is not None
+    assert tool_ev["type"] == "tool"
+    assert tool_ev["state"] == "ACTIVE"
+    assert "sk-secret-abcdef12345" not in tool_ev["summary"]
+
+    delta_ev = parse_agy_stream_event(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_index": 3,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "Precio S/ 299",
+                },
+            }
+        )
+    )
+    assert delta_ev == {"type": "delta", "text": "Precio S/ 299"}
+
+    done_ev = parse_agy_stream_event(
+        json.dumps(
+            {
+                "event": "result",
+                "result": {
+                    "conversation_id": "conv-123",
+                    "status": "SUCCESS",
+                    "response": "Total S/ 299",
+                    "duration_seconds": 4.2,
+                    "usage": {"total_tokens": 100},
+                },
+            }
+        )
+    )
+    assert done_ev is not None
+    assert done_ev["type"] == "done"
+    assert done_ev["resume_command"] == "agy --resume conv-123"
+
+
+@pytest.mark.n2
+def test_agy_stream_endpoint_sse_and_browser_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_stream_agy_prompt(**kwargs: Any) -> Any:
+        yield {"type": "init", "conversation_id": "conv-stream-1", "model": kwargs["model"]}
+        yield {
+            "type": "tool",
+            "step_index": 1,
+            "state": "ACTIVE",
+            "tool_name": "run_command",
+            "summary": "POST /api/browser/action",
+        }
+        yield {"type": "delta", "text": "Precio: "}
+        yield {
+            "type": "done",
+            "conversation_id": "conv-stream-1",
+            "status": "SUCCESS",
+            "response": "Precio: S/ 299",
+            "model": kwargs["model"],
+            "usage": {"total_tokens": 50},
+            "resume_command": "agy --resume conv-stream-1",
+        }
+
+    monkeypatch.setattr(web_app_mod, "stream_agy_prompt", _fake_stream_agy_prompt)
+    monkeypatch.setattr(web_app_mod, "find_agy_executable", lambda: "/usr/local/bin/agy")
+
+    app = create_app(db_path=tmp_path / "stream.sqlite3")
+    with TestClient(app) as client:
+        bad = client.post(
+            "/api/agy/stream",
+            json={"prompt": "hola", "model": "gemini-4-hydrogen-low"},
+        )
+        assert bad.status_code == 422
+
+        with client.stream(
+            "POST",
+            "/api/agy/stream",
+            json={"prompt": "Dame el precio", "model": "gemini-4-carbon-low"},
+        ) as resp:
+            assert resp.status_code == 200
+            assert "text/event-stream" in resp.headers["content-type"].lower()
+            raw_body = "".join(resp.iter_text())
+
+        events: list[dict[str, Any]] = []
+        for line in raw_body.splitlines():
+            if line.startswith("data:"):
+                events.append(json.loads(line[5:].strip()))
+
+        assert [e["type"] for e in events] == ["started", "init", "tool", "delta", "done"]
+        assert events[-1]["response"] == "Precio: S/ 299"
+        assert events[-1]["browser_context_used"] is False
 
 
 @pytest.mark.n2

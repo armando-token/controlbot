@@ -426,6 +426,23 @@
     th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; }
     th { color: var(--text-muted); font-size: 11px; text-transform: uppercase; }
     .portal-link { display: flex; justify-content: space-between; align-items: center; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; margin-bottom: 5px; font-size: 11.5px; color: var(--text); }
+    .stream-steps { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+    .stream-step {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-family: var(--mono);
+      color: var(--text-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .stream-step.active { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-soft); }
 
     @media (max-width: 1120px) {
       .layout { grid-template-columns: 230px minmax(0, 1fr) 0px; }
@@ -658,6 +675,8 @@
       let selectedProject = null;
       let activeAgyId = "";
       let agyTurns = [];
+      let agyAbortCtrl = null;
+      let agyTimerId = null;
       let activeRunId = null;
       let pollTimer = null;
 
@@ -969,6 +988,29 @@
         });
       }
 
+      function renderStepsHtml(steps) {
+        return (steps || []).map(function (st) {
+          const isAct = st.state === "ACTIVE";
+          return '<div class="stream-step' + (isAct ? ' active' : '') + '">' +
+            '<span>' + (isAct ? '⏳' : '✓') + '</span>' +
+            '<strong>' + esc(st.tool_name || "herramienta") + '</strong>' +
+            '<span>' + esc(st.summary || "") + '</span>' +
+          '</div>';
+        }).join("");
+      }
+
+      function updateStreamingDom(streamTurn) {
+        const stepsEl = document.getElementById("agy-stream-steps");
+        if (stepsEl) stepsEl.innerHTML = renderStepsHtml(streamTurn.steps);
+        const textEl = document.getElementById("agy-stream-text");
+        if (textEl) {
+          textEl.style.display = streamTurn.text ? "block" : "none";
+          textEl.textContent = streamTurn.text || "";
+        }
+        const th = document.getElementById("thread");
+        if (th) th.scrollTop = th.scrollHeight;
+      }
+
       function renderWorkspaceThread() {
         applyVisibility();
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
@@ -1015,8 +1057,25 @@
                 '</div>' +
               '</div>'
             );
-          } else if (t.role === "pending") {
-            blocks.push('<div class="card" style="color:var(--text-dim);">Ejecutando turno con Antigravity CLI...</div>');
+          } else if (t.role === "streaming" || t.role === "pending") {
+            blocks.push(
+              '<div id="agy-stream-card" class="card">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
+                  '<div style="display:flex;align-items:center;gap:8px;">' +
+                    '<strong>Antigravity trabajando...</strong>' +
+                    (t.browserUsed ? ('<span class="pill pill-info">Vio: ' + esc(shortBrowserLabel(t.browserUrl, "")) + '</span>') : '') +
+                  '</div>' +
+                  '<div style="display:flex;align-items:center;gap:6px;">' +
+                    '<span id="agy-stream-timer" class="pill">' + esc(String(t.elapsedSec || 0) + 's') + '</span>' +
+                    '<button id="agy-stop-btn" class="btn btn-danger btn-sm" type="button">Detener</button>' +
+                  '</div>' +
+                '</div>' +
+                '<div id="agy-stream-steps" class="stream-steps">' + renderStepsHtml(t.steps) + '</div>' +
+                '<div id="agy-stream-text" class="answer-box" style="' + (t.text ? '' : 'display:none;') + '">' + esc(t.text || "") + '</div>' +
+              '</div>'
+            );
+          } else if (t.role === "cancelled") {
+            blocks.push('<div class="card"><div class="banner" style="margin-top:0;background:var(--surface-subtle);border-color:var(--border);">' + esc(t.text) + '</div></div>');
           } else if (t.role === "error") {
             blocks.push('<div class="card"><div class="banner banner-err" style="margin-top:0;">' + esc(t.text) + '</div></div>');
           } else {
@@ -1044,10 +1103,18 @@
         });
 
         els.threadInner.innerHTML = blocks.join("");
+        const stopBtn = document.getElementById("agy-stop-btn");
+        if (stopBtn) {
+          stopBtn.addEventListener("click", function () {
+            if (agyAbortCtrl) agyAbortCtrl.abort();
+          });
+        }
         const copyBtn = document.getElementById("copy-resume-btn");
         if (copyBtn) copyBtn.addEventListener("click", function () { copyText(resumeCmd, copyBtn); });
         const copySshBtn = document.getElementById("copy-ssh-btn");
         if (copySshBtn) copySshBtn.addEventListener("click", function () { copyText(sshCmd, copySshBtn); });
+        const th = document.getElementById("thread");
+        if (th && agyTurns.length > 0) th.scrollTop = th.scrollHeight;
       }
 
       /* ---------------- LIVE BROWSER WS ---------------- */
@@ -1443,20 +1510,86 @@
       }
 
       async function submitAgyPrompt() {
+        if (agyAbortCtrl) return;
         showError("");
         const prompt = els.queryInput.value.trim();
         if (!prompt) return;
         const model = els.agyModelSelect.value || "gemini-4-carbon-low";
         const project = selectedProject ? selectedProject.name : null;
+        const includeBrowser = Boolean(els.shareBrowserCheck && els.shareBrowserCheck.checked);
 
         els.queryInput.value = "";
         agyTurns.push({ role: "user", text: prompt, project: project, model: model });
-        agyTurns.push({ role: "pending", text: "" });
+        const streamTurn = {
+          role: "streaming",
+          text: "",
+          steps: [],
+          elapsedSec: 0,
+          browserUsed: browserRunning && includeBrowser,
+          browserUrl: els.brUrlInput.value.trim()
+        };
+        agyTurns.push(streamTurn);
         renderWorkspaceThread();
         els.sendBtn.disabled = true;
 
+        agyAbortCtrl = new AbortController();
+        const startedAt = Date.now();
+        agyTimerId = setInterval(function () {
+          streamTurn.elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+          const timerEl = document.getElementById("agy-stream-timer");
+          if (timerEl) timerEl.textContent = streamTurn.elapsedSec + "s";
+        }, 1000);
+
+        let finished = false;
+        let sawError = false;
+        let lastBrowserUsed = streamTurn.browserUsed;
+        let lastBrowserUrl = streamTurn.browserUrl;
+
+        function handleStreamEvent(ev) {
+          if (!ev || typeof ev !== "object") return;
+          if (ev.type === "started") {
+            lastBrowserUsed = Boolean(ev.browser_context_used);
+            lastBrowserUrl = ev.browser_url || "";
+            streamTurn.browserUsed = lastBrowserUsed;
+            streamTurn.browserUrl = lastBrowserUrl;
+          } else if (ev.type === "init" && ev.conversation_id) {
+            activeAgyId = ev.conversation_id;
+            els.cidInput.value = activeAgyId;
+          } else if (ev.type === "tool") {
+            const idx = streamTurn.steps.findIndex(function (s) {
+              return s.step_index === ev.step_index;
+            });
+            if (idx >= 0) streamTurn.steps[idx] = ev;
+            else streamTurn.steps.push(ev);
+            updateStreamingDom(streamTurn);
+          } else if (ev.type === "delta" && ev.text) {
+            streamTurn.text += ev.text;
+            updateStreamingDom(streamTurn);
+          } else if (ev.type === "done") {
+            finished = true;
+            agyTurns = agyTurns.filter(function (t) { return t !== streamTurn; });
+            if (ev.conversation_id) {
+              activeAgyId = ev.conversation_id;
+              els.cidInput.value = activeAgyId;
+            }
+            agyTurns.push({
+              role: "assistant",
+              text: ev.response || streamTurn.text || "",
+              model: ev.model || model,
+              usage: ev.usage || {},
+              browserUsed: Boolean(ev.browser_context_used != null ? ev.browser_context_used : lastBrowserUsed),
+              browserUrl: ev.browser_url || lastBrowserUrl
+            });
+            loadAgyConversations();
+          } else if (ev.type === "error") {
+            sawError = true;
+            agyTurns = agyTurns.filter(function (t) { return t !== streamTurn; });
+            agyTurns.push({ role: "error", text: ev.message || "Error de Antigravity CLI" });
+          }
+        }
+
         try {
-          const res = await apiJson("/api/agy/send", {
+          const resp = await fetch("/api/agy/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1465,27 +1598,80 @@
               project_name: project,
               model: model,
               allow_hydrogen: showHydrogen,
-              include_browser_context: Boolean(els.shareBrowserCheck && els.shareBrowserCheck.checked)
-            })
+              include_browser_context: includeBrowser
+            }),
+            signal: agyAbortCtrl.signal
           });
-          agyTurns = agyTurns.filter(function (t) { return t.role !== "pending"; });
-          if (res.conversation_id) {
-            activeAgyId = res.conversation_id;
-            els.cidInput.value = activeAgyId;
+          if (!resp.ok || !resp.body) {
+            const errTxt = await resp.text();
+            let detail = errTxt || ("HTTP " + resp.status);
+            try {
+              const parsedErr = JSON.parse(errTxt);
+              if (parsedErr && parsedErr.detail) {
+                detail = typeof parsedErr.detail === "string" ? parsedErr.detail : JSON.stringify(parsedErr.detail);
+              }
+            } catch (_) {}
+            throw new Error(detail);
           }
-          agyTurns.push({
-            role: "assistant",
-            text: res.response || "",
-            model: res.model || model,
-            usage: res.usage || {},
-            browserUsed: Boolean(res.browser_context_used),
-            browserUrl: res.browser_url || ""
-          });
-          loadAgyConversations();
+
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+          while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            const blocks = buffer.split("\n\n");
+            buffer = blocks.pop() || "";
+            blocks.forEach(function (blk) {
+              blk.split("\n").forEach(function (ln) {
+                if (ln.startsWith("data:")) {
+                  const raw = ln.slice(5).trim();
+                  if (raw) {
+                    try { handleStreamEvent(JSON.parse(raw)); } catch (_) {}
+                  }
+                }
+              });
+            });
+          }
+          if (buffer.trim()) {
+            buffer.split("\n").forEach(function (ln) {
+              if (ln.startsWith("data:")) {
+                const raw = ln.slice(5).trim();
+                if (raw) {
+                  try { handleStreamEvent(JSON.parse(raw)); } catch (_) {}
+                }
+              }
+            });
+          }
+          if (!finished && !sawError) {
+            agyTurns = agyTurns.filter(function (t) { return t !== streamTurn; });
+            if (streamTurn.text) {
+              agyTurns.push({
+                role: "assistant",
+                text: streamTurn.text,
+                model: model,
+                usage: {},
+                browserUsed: lastBrowserUsed,
+                browserUrl: lastBrowserUrl
+              });
+            } else {
+              agyTurns.push({ role: "error", text: "El stream terminó sin respuesta final." });
+            }
+          }
         } catch (err) {
-          agyTurns = agyTurns.filter(function (t) { return t.role !== "pending"; });
-          agyTurns.push({ role: "error", text: err.message });
+          agyTurns = agyTurns.filter(function (t) { return t !== streamTurn; });
+          if (err && err.name === "AbortError") {
+            agyTurns.push({
+              role: "cancelled",
+              text: "Turno detenido por el usuario" + (streamTurn.text ? (": " + streamTurn.text) : ".")
+            });
+          } else {
+            agyTurns.push({ role: "error", text: (err && err.message) ? err.message : String(err) });
+          }
         } finally {
+          if (agyTimerId) { clearInterval(agyTimerId); agyTimerId = null; }
+          agyAbortCtrl = null;
           els.sendBtn.disabled = false;
           renderWorkspaceThread();
         }

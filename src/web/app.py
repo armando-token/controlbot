@@ -17,7 +17,13 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
 from pydantic import ValidationError
@@ -66,6 +72,7 @@ from src.web.workspace import (
     read_project_file,
     resolve_project_dir,
     send_agy_prompt,
+    stream_agy_prompt,
 )
 
 if TYPE_CHECKING:
@@ -795,8 +802,22 @@ def create_app(
             content=_scrub_and_verify(payload, label="AgyConversations"),
         )
 
-    @app.post("/api/agy/send")
-    async def api_agy_send(payload: AgySendRequest) -> JSONResponse:
+    async def _prepare_agy_turn(
+        payload: AgySendRequest,
+    ) -> tuple[Path | None, dict[str, Any] | None]:
+        if not payload.prompt.strip():
+            raise HTTPException(status_code=422, detail="prompt must not be empty.")
+        if "hydrogen" in payload.model.lower() and not payload.allow_hydrogen:
+            raise HTTPException(
+                status_code=422,
+                detail="Hydrogen models are disabled by policy; enable opt-in or use carbon/neon.",
+            )
+        if find_agy_executable() is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Antigravity CLI ('agy') is not installed on this host.",
+            )
+
         project_dir: Path | None = None
         if payload.project_name is not None and payload.project_name.strip():
             try:
@@ -812,6 +833,11 @@ def create_app(
             browser_ctx = await live_browser.extract_page_context(
                 screenshot_path=live_profile_root.parent / "live_browser_latest.jpg"
             )
+        return project_dir, browser_ctx
+
+    @app.post("/api/agy/send")
+    async def api_agy_send(payload: AgySendRequest) -> JSONResponse:
+        project_dir, browser_ctx = await _prepare_agy_turn(payload)
 
         try:
             result = await send_agy_prompt(
@@ -845,6 +871,51 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(result, label="AgySendResult"),
+        )
+
+    @app.post("/api/agy/stream")
+    async def api_agy_stream(payload: AgySendRequest) -> StreamingResponse:
+        project_dir, browser_ctx = await _prepare_agy_turn(payload)
+        browser_url = str(browser_ctx.get("url", "")) if browser_ctx is not None else None
+
+        def _sse_line(ev: dict[str, Any]) -> str:
+            scrubbed = _scrub_and_verify(ev, label="AgyStreamEvent")
+            return f"data: {json.dumps(scrubbed, ensure_ascii=False)}\n\n"
+
+        async def _event_stream() -> AsyncIterator[str]:
+            yield _sse_line(
+                {
+                    "type": "started",
+                    "model": payload.model,
+                    "browser_context_used": browser_ctx is not None,
+                    "browser_url": browser_url,
+                }
+            )
+            gen = stream_agy_prompt(
+                prompt=payload.prompt,
+                conversation_id=payload.conversation_id,
+                project_dir=project_dir,
+                model=payload.model,
+                allow_hydrogen=payload.allow_hydrogen,
+                browser_context=browser_ctx,
+            )
+            try:
+                async for ev in gen:
+                    if ev.get("type") == "done":
+                        ev["browser_context_used"] = browser_ctx is not None
+                        ev["browser_url"] = browser_url
+                    yield _sse_line(ev)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                yield _sse_line({"type": "error", "message": str(exc)[:300]})
+            finally:
+                await gen.aclose()
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/api/browser/status")

@@ -50,6 +50,7 @@ _EXTRACT_JS = r"""(maxElements) => {
       .slice(0, 120);
     const placeholder = (el.getAttribute("placeholder") || "").trim().slice(0, 80);
     const href = tag === "a" ? (el.getAttribute("href") || "").trim().slice(0, 160) : "";
+    if (!text && !placeholder && !href) continue;
     els.push({
       tag,
       text,

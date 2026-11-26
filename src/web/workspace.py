@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import shutil
 import time
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -238,7 +240,7 @@ def build_agy_prompt_with_browser_context(
     raw_elements = browser_context.get("elements")
     element_lines: list[str] = []
     if isinstance(raw_elements, list):
-        for item in raw_elements[:25]:
+        for item in raw_elements[:40]:
             if not isinstance(item, dict):
                 continue
             tag = str(item.get("tag", "")).strip()
@@ -269,29 +271,119 @@ def build_agy_prompt_with_browser_context(
         lines.append("")
         lines.append("[Elementos interactivos visibles (x, y en viewport 1280x800)]")
         lines.extend(element_lines)
-    lines.append("</LIVE_BROWSER_PAGE_CONTENT>")
-    lines.append(
-        f"Si necesitas navegar o hacer clic en otro elemento del navegador vivo de Studio, "
-        f"puedes consultar GET {base_url}/api/browser/context o enviar acciones JSON a "
-        f"POST {base_url}/api/browser/action."
+    lines.extend(
+        [
+            "</LIVE_BROWSER_PAGE_CONTENT>",
+            f"Control directo del Navegador en Vivo (API local en {base_url}):",
+            "- NO busques ni leas el código fuente de ControlBot para usar el navegador.",
+            "- Si el dato pedido ya está arriba, respóndelo directo sin usar herramientas.",
+            f"- Ver estado/DOM actualizado: GET {base_url}/api/browser/context",
+            f"- Mover el navegador en vivo: POST {base_url}/api/browser/action con JSON:",
+            '  · Navegar: {"type":"navigate","url":"https://..."}',
+            '  · Clic en (x, y): {"type":"click","x":123,"y":456}',
+            '  · Escribir: {"type":"type","text":"..."} · Tecla: {"type":"key","key":"Enter"}',
+            '  · Scroll: {"type":"wheel","dx":0,"dy":500} · Atrás: {"type":"back"}',
+            "",
+            "[SOLICITUD DEL USUARIO]",
+            cleaned,
+        ]
     )
-    lines.append("")
-    lines.append("[SOLICITUD DEL USUARIO]")
-    lines.append(cleaned)
     return "\n".join(lines)
 
 
-async def send_agy_prompt(
+def _summarize_tool_params(params: Any) -> str:
+    if not isinstance(params, dict) or not params:
+        return ""
+    for key in ("toolSummary", "CommandLine", "url", "Path", "Query", "SearchQuery"):
+        raw = params.get(key)
+        if raw is None:
+            continue
+        cleaned = re.sub(r"\s+", " ", str(raw)).strip().strip('"')
+        if cleaned:
+            return _scrub_text(cleaned)[:120]
+    first_k = next(iter(params))
+    val = re.sub(r"\s+", " ", str(params[first_k])).strip()
+    return _scrub_text(f"{first_k}={val}")[:120]
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def parse_agy_stream_event(raw_line: str) -> dict[str, Any] | None:
+    """Parse one NDJSON line from `agy --output-format stream-json` into a scrubbed UI event."""
+    stripped = raw_line.strip()
+    if not stripped:
+        return None
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    ev_type = str(obj.get("event", "")).strip()
+    out: dict[str, Any] | None = None
+    if ev_type == "init":
+        init_meta = _as_dict(obj.get("init"))
+        out = {
+            "type": "init",
+            "conversation_id": str(obj.get("conversation_id") or ""),
+            "model": str(init_meta.get("model") or ""),
+        }
+    elif ev_type == "step_update":
+        su = obj.get("step_update")
+        if not isinstance(su, dict):
+            return None
+        step_type = str(su.get("step_type", ""))
+        if step_type == "tool":
+            tool_info = _as_dict(su.get("tool_info"))
+            tool_name = str(su.get("tool_name") or tool_info.get("name") or "tool")
+            out = {
+                "type": "tool",
+                "step_index": int(su.get("step_index", 0)),
+                "state": str(su.get("state", "ACTIVE")),
+                "tool_name": _scrub_text(tool_name)[:60],
+                "summary": _summarize_tool_params(tool_info.get("parameters")),
+            }
+        elif step_type == "agent_response":
+            delta = su.get("text_delta")
+            if isinstance(delta, str) and delta:
+                out = {"type": "delta", "text": _scrub_text(delta)}
+    elif ev_type == "result":
+        res = _as_dict(obj.get("result"))
+        status_val = str(res.get("status", ""))
+        cid = str(res.get("conversation_id") or obj.get("conversation_id") or "")
+        if status_val == "SUCCESS":
+            out = {
+                "type": "done",
+                "conversation_id": cid,
+                "status": status_val,
+                "response": _scrub_text(str(res.get("response", ""))),
+                "duration_seconds": res.get("duration_seconds"),
+                "usage": _as_dict(res.get("usage")),
+                "resume_command": f"agy --resume {cid}" if cid else "",
+            }
+        else:
+            err_msg = _scrub_text(str(res.get("error") or f"status={status_val or 'FAILED'}"))
+            out = {"type": "error", "message": err_msg[:300]}
+
+    if out is None:
+        return None
+    scrubbed: dict[str, Any] = redact_payload_strict(out)
+    return scrubbed
+
+
+def _prepare_agy_command(
     *,
     prompt: str,
-    conversation_id: str | None = None,
-    project_dir: Path | None = None,
-    model: str = "gemini-4-carbon-low",
-    allow_hydrogen: bool = False,
-    browser_context: dict[str, Any] | None = None,
-    timeout_s: float = 120.0,
-) -> dict[str, Any]:
-    """Execute one Antigravity CLI turn, optionally resuming conversation_id."""
+    conversation_id: str | None,
+    model: str,
+    allow_hydrogen: bool,
+    browser_context: dict[str, Any] | None,
+    timeout_s: float,
+    output_format: str,
+) -> tuple[list[str], str, str | None, int]:
     cleaned_prompt = prompt.strip()
     if not cleaned_prompt:
         raise ValueError("prompt must not be empty.")
@@ -323,17 +415,41 @@ async def send_agy_prompt(
         "--model",
         cleaned_model,
         "--output-format",
-        "json",
+        output_format,
         "--disable-slash-commands",
         "--print-timeout",
         f"{bounded_timeout}s",
     ]
     if cleaned_cid is not None:
         args.extend(["--conversation", cleaned_cid])
+    return args, cleaned_model, cleaned_cid, bounded_timeout
+
+
+async def send_agy_prompt(
+    *,
+    prompt: str,
+    conversation_id: str | None = None,
+    project_dir: Path | None = None,
+    model: str = "gemini-4-carbon-low",
+    allow_hydrogen: bool = False,
+    browser_context: dict[str, Any] | None = None,
+    timeout_s: float = 120.0,
+) -> dict[str, Any]:
+    """Execute one Antigravity CLI turn, optionally resuming conversation_id."""
+    args, cleaned_model, cleaned_cid, bounded_timeout = _prepare_agy_command(
+        prompt=prompt,
+        conversation_id=conversation_id,
+        model=model,
+        allow_hydrogen=allow_hydrogen,
+        browser_context=browser_context,
+        timeout_s=timeout_s,
+        output_format="json",
+    )
 
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=str(project_dir) if project_dir is not None else None,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -385,6 +501,81 @@ async def send_agy_prompt(
     if contains_unredacted_secret_strict(scrubbed):
         raise RuntimeError("agy response failed strict secret redaction check.")
     return scrubbed
+
+
+async def stream_agy_prompt(
+    *,
+    prompt: str,
+    conversation_id: str | None = None,
+    project_dir: Path | None = None,
+    model: str = "gemini-4-carbon-low",
+    allow_hydrogen: bool = False,
+    browser_context: dict[str, Any] | None = None,
+    timeout_s: float = 180.0,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Stream normalized NDJSON progress & response events from agy CLI."""
+    args, cleaned_model, cleaned_cid, bounded_timeout = _prepare_agy_command(
+        prompt=prompt,
+        conversation_id=conversation_id,
+        model=model,
+        allow_hydrogen=allow_hydrogen,
+        browser_context=browser_context,
+        timeout_s=timeout_s,
+        output_format="stream-json",
+    )
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=str(project_dir) if project_dir is not None else None,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=1024 * 1024,
+    )
+    deadline = time.monotonic() + float(bounded_timeout + 15)
+    saw_done = False
+    saw_error = False
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"agy execution exceeded {bounded_timeout}s timeout.")
+            raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            if not raw_line:
+                break
+            parsed = parse_agy_stream_event(raw_line.decode("utf-8", errors="replace"))
+            if parsed is None:
+                continue
+            if parsed.get("type") == "done":
+                parsed["model"] = cleaned_model
+                if not parsed.get("conversation_id") and cleaned_cid:
+                    parsed["conversation_id"] = cleaned_cid
+                    parsed["resume_command"] = f"agy --resume {cleaned_cid}"
+                saw_done = True
+            elif parsed.get("type") == "error":
+                saw_error = True
+            if contains_unredacted_secret_strict(parsed):
+                raise RuntimeError("agy stream event failed strict secret redaction check.")
+            yield parsed
+
+        stderr_b = await asyncio.wait_for(proc.stderr.read(), timeout=5.0)
+        rc = await asyncio.wait_for(proc.wait(), timeout=5.0)
+        if not saw_done and not saw_error:
+            stderr_txt = _scrub_text(stderr_b.decode("utf-8", errors="replace").strip())
+            msg = stderr_txt[:300] if stderr_txt else f"agy exited with status {rc}"
+            yield {"type": "error", "message": msg}
+    except TimeoutError:
+        yield {
+            "type": "error",
+            "message": f"agy execution exceeded {bounded_timeout}s timeout.",
+        }
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
 
 
 def parse_agy_models_output(raw_text: str) -> list[dict[str, Any]]:
