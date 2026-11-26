@@ -67,6 +67,7 @@ async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Pat
         assert "mostrar hydrogen" in body_low
         assert "share-browser-check" in body_low
         assert "/api/agy/stream" in body_low
+        assert "withauthtoken" in body_low
         assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
         assert "https://" not in body_low
 
@@ -494,6 +495,7 @@ def test_live_browser_context_action_and_agy_bridge(
         }
 
     monkeypatch.setattr(web_app_mod, "send_agy_prompt", _fake_send_agy_prompt)
+    monkeypatch.setattr(web_app_mod, "find_agy_executable", lambda: "/usr/local/bin/agy")
     monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles"))
 
     try:

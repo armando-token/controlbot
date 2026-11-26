@@ -777,9 +777,17 @@
         return "pill pill-info";
       }
 
+      const URL_AUTH_TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+
+      function withAuthToken(path) {
+        if (!URL_AUTH_TOKEN) return path;
+        const sep = path.indexOf("?") >= 0 ? "&" : "?";
+        return path + sep + "token=" + encodeURIComponent(URL_AUTH_TOKEN);
+      }
+
       function wsUrl(path) {
         const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        return proto + "//" + window.location.host + path;
+        return proto + "//" + window.location.host + withAuthToken(path);
       }
 
       function showError(msg) {
@@ -793,7 +801,7 @@
       }
 
       async function apiJson(url, opts) {
-        const resp = await fetch(url, opts);
+        const resp = await fetch(withAuthToken(url), opts);
         const text = await resp.text();
         let data = {};
         try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { detail: text }; }
@@ -1589,7 +1597,7 @@
         }
 
         try {
-          const resp = await fetch("/api/agy/stream", {
+          const resp = await fetch(withAuthToken("/api/agy/stream"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({

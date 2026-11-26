@@ -812,11 +812,6 @@ def create_app(
                 status_code=422,
                 detail="Hydrogen models are disabled by policy; enable opt-in or use carbon/neon.",
             )
-        if find_agy_executable() is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Antigravity CLI ('agy') is not installed on this host.",
-            )
 
         project_dir: Path | None = None
         if payload.project_name is not None and payload.project_name.strip():
@@ -827,6 +822,12 @@ def create_app(
                     status_code=422,
                     detail=str(_scrub_and_verify(str(exc), label="error")),
                 ) from exc
+
+        if find_agy_executable() is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Antigravity CLI ('agy') is not installed on this host.",
+            )
 
         browser_ctx: dict[str, Any] | None = None
         if payload.include_browser_context and live_browser.running:
