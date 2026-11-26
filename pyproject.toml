@@ -36,6 +36,9 @@ packages = ["src"]
 pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette\\.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
 markers = [
     "n1: deterministic unit tests with controlled clock and emulated model",
     "n2: local multi-process, SQLite WAL, Playwright, and synthetic lab integration tests",
@@ -58,6 +61,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 python_version = "3.12"
 strict = true
 mypy_path = "."
+explicit_package_bases = true
 plugins = ["pydantic.mypy"]
 files = ["src", "lab", "benchmarks", "deploy", "tests"]
 exclude = ["^tests/e2e/"]

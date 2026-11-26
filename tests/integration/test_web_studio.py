@@ -53,41 +53,44 @@ def test_parse_agy_models_output_handles_spinner_and_hydrogen_flag() -> None:
 @pytest.mark.n2
 async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Path) -> None:
     app = create_app(db_path=tmp_path / "stub.sqlite3")
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
-        studio_resp = await client.get("/app")
-        assert studio_resp.status_code == 200
-        assert "text/html" in studio_resp.headers["content-type"].lower()
-        body_low = studio_resp.text.lower()
-        assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
-        assert ('id="root"' in body_low) or ("controlbot studio" in body_low)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1:8000"
+        ) as client:
+            studio_resp = await client.get("/app")
+            assert studio_resp.status_code == 200
+            assert "text/html" in studio_resp.headers["content-type"].lower()
+            body_low = studio_resp.text.lower()
+            assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
+            assert ('id="root"' in body_low) or ("controlbot studio" in body_low)
 
-        legacy_resp = await client.get("/studio-legacy")
-        assert legacy_resp.status_code == 200
-        legacy_low = legacy_resp.text.lower()
-        assert "controlbot studio" in legacy_low
-        assert "color-scheme: light" in legacy_low
-        assert "#f8fafc" in legacy_low
-        assert "controlbot.showplantmodule" in legacy_low
-        assert "computador en vivo" in legacy_low
-        assert "mostrar hydrogen" in legacy_low
-        assert "share-browser-check" in legacy_low
-        assert "/api/agy/stream" in legacy_low
-        assert "withauthtoken" in legacy_low
-        assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', legacy_low)
-        assert "https://" not in legacy_low
+            legacy_resp = await client.get("/studio-legacy")
+            assert legacy_resp.status_code == 200
+            legacy_low = legacy_resp.text.lower()
+            assert "controlbot studio" in legacy_low
+            assert "color-scheme: light" in legacy_low
+            assert "#f8fafc" in legacy_low
+            assert "controlbot.showplantmodule" in legacy_low
+            assert "computador en vivo" in legacy_low
+            assert "mostrar hydrogen" in legacy_low
+            assert "share-browser-check" in legacy_low
+            assert "/api/agy/stream" in legacy_low
+            assert "withauthtoken" in legacy_low
+            assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', legacy_low)
+            assert "https://" not in legacy_low
 
-        root_resp = await client.get("/")
-        assert root_resp.status_code == 200
-        assert "/app" in root_resp.text
+            root_resp = await client.get("/")
+            assert root_resp.status_code == 200
+            assert "/app" in root_resp.text
 
-        info_resp = await client.get("/api/system/info")
-        assert info_resp.status_code == 200
-        info = info_resp.json()
-        assert info["service"] == "controlbot"
-        assert info["runtime_mode"] == "stub"
-        assert info["backend_mode"] == "stub"
-        assert not contains_unredacted_secret_strict(info)
+            info_resp = await client.get("/api/system/info")
+            assert info_resp.status_code == 200
+            info = info_resp.json()
+            assert info["service"] == "controlbot"
+            assert info["runtime_mode"] == "stub"
+            assert info["backend_mode"] == "stub"
+            assert not contains_unredacted_secret_strict(info)
 
 
 @pytest.mark.n2
@@ -130,57 +133,64 @@ async def test_projects_files_models_and_agy_workspace_apis(
     monkeypatch.setenv("CONTROLBOT_AGY_BRAIN_ROOT", str(brain_dir))
 
     app = create_app(db_path=tmp_path / "ws.sqlite3")
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
-        proj_resp = await client.get("/api/projects")
-        assert proj_resp.status_code == 200
-        proj_json = proj_resp.json()
-        assert [p["name"] for p in proj_json["projects"]] == ["AlphaApp"]
-        assert proj_json["projects"][0]["has_readme"] is True
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1:8000"
+        ) as client:
+            proj_resp = await client.get("/api/projects")
+            assert proj_resp.status_code == 200
+            proj_json = proj_resp.json()
+            assert [p["name"] for p in proj_json["projects"]] == ["AlphaApp"]
+            assert proj_json["projects"][0]["has_readme"] is True
 
-        files_resp = await client.get("/api/projects/AlphaApp/files")
-        assert files_resp.status_code == 200
-        entry_names = [e["name"] for e in files_resp.json()["entries"]]
-        assert "README.md" in entry_names
-        assert "src" in entry_names
+            files_resp = await client.get("/api/projects/AlphaApp/files")
+            assert files_resp.status_code == 200
+            entry_names = [e["name"] for e in files_resp.json()["entries"]]
+            assert "README.md" in entry_names
+            assert "src" in entry_names
 
-        read_resp = await client.get("/api/projects/AlphaApp/file", params={"path": "README.md"})
-        assert read_resp.status_code == 200
-        assert "secret-readme-999" not in read_resp.json()["content"]
-        assert REDACTED_PLACEHOLDER in read_resp.json()["content"]
+            read_resp = await client.get(
+                "/api/projects/AlphaApp/file", params={"path": "README.md"}
+            )
+            assert read_resp.status_code == 200
+            assert "secret-readme-999" not in read_resp.json()["content"]
+            assert REDACTED_PLACEHOLDER in read_resp.json()["content"]
 
-        env_blocked = await client.get("/api/projects/AlphaApp/file", params={"path": ".env"})
-        assert env_blocked.status_code == 422
+            env_blocked = await client.get("/api/projects/AlphaApp/file", params={"path": ".env"})
+            assert env_blocked.status_code == 422
 
-        trav_blocked = await client.get("/api/projects/AlphaApp/file", params={"path": "../etc"})
-        assert trav_blocked.status_code == 422
+            trav_blocked = await client.get(
+                "/api/projects/AlphaApp/file", params={"path": "../etc"}
+            )
+            assert trav_blocked.status_code == 422
 
-        models_resp = await client.get("/api/agy/models")
-        assert models_resp.status_code == 200
-        models_json = models_resp.json()
-        assert models_json["default_model"] == "gemini-4-carbon-low"
-        assert len(models_json["models"]) >= 5
+            models_resp = await client.get("/api/agy/models")
+            assert models_resp.status_code == 200
+            models_json = models_resp.json()
+            assert models_json["default_model"] == "gemini-4-carbon-low"
+            assert len(models_json["models"]) >= 5
 
-        convs_resp = await client.get("/api/agy/conversations")
-        assert convs_resp.status_code == 200
-        convs = convs_resp.json()["conversations"]
-        assert len(convs) == 1
-        assert convs[0]["conversation_id"] == conv_uuid
-        assert "mysecret123" not in convs[0]["preview"]
-        assert "sk-secret-abc123456" not in convs[0]["preview"]
-        assert convs[0]["resume_command"] == f"agy --resume {conv_uuid}"
+            convs_resp = await client.get("/api/agy/conversations")
+            assert convs_resp.status_code == 200
+            convs = convs_resp.json()["conversations"]
+            assert len(convs) == 1
+            assert convs[0]["conversation_id"] == conv_uuid
+            assert "mysecret123" not in convs[0]["preview"]
+            assert "sk-secret-abc123456" not in convs[0]["preview"]
+            assert convs[0]["resume_command"] == f"agy --resume {conv_uuid}"
 
-        bad_model = await client.post(
-            "/api/agy/send",
-            json={"prompt": "hola", "model": "gemini-4-hydrogen-low"},
-        )
-        assert bad_model.status_code == 422
+            bad_model = await client.post(
+                "/api/agy/send",
+                json={"prompt": "hola", "model": "gemini-4-hydrogen-low"},
+            )
+            assert bad_model.status_code == 422
 
-        bad_proj = await client.post(
-            "/api/agy/send",
-            json={"prompt": "hola", "project_name": "../etc", "model": "gemini-4-carbon-low"},
-        )
-        assert bad_proj.status_code == 422
+            bad_proj = await client.post(
+                "/api/agy/send",
+                json={"prompt": "hola", "project_name": "../etc", "model": "gemini-4-carbon-low"},
+            )
+            assert bad_proj.status_code == 422
 
 
 @pytest.mark.n2
@@ -229,11 +239,14 @@ async def test_system_info_redacts_secret_in_llm_url(
 ) -> None:
     monkeypatch.setenv("GROKBOT_LLM_BASE_URL", "http://127.0.0.1:11434/v1?api_key=sk-secret-xyz")
     app = create_app(db_path=tmp_path / "stub2.sqlite3")
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
-        info = (await client.get("/api/system/info")).json()
-        assert "sk-secret-xyz" not in str(info)
-        assert REDACTED_PLACEHOLDER in str(info["llm_origin"]) or info["llm_origin"] is None
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1:8000"
+        ) as client:
+            info = (await client.get("/api/system/info")).json()
+            assert "sk-secret-xyz" not in str(info)
+            assert REDACTED_PLACEHOLDER in str(info["llm_origin"]) or info["llm_origin"] is None
 
 
 @pytest.mark.n2

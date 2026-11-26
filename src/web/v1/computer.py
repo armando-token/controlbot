@@ -44,6 +44,7 @@ from src.web.v1.rfb_gate import (
     perform_client_none_handshake,
 )
 from src.web.workspace import (
+    _has_git_segment,
     _is_sensitive_filename,
     _resolve_relative_project_path,
     default_projects_root,
@@ -1299,6 +1300,20 @@ def _resolve_project_name(gateway: ComputerGateway, project: str | None) -> str:
     return gateway.default_project
 
 
+def _file_access_error_code(msg: str, *, allow_not_found: bool = False) -> int:
+    low_msg = msg.lower()
+    if (
+        "restricted" in low_msg
+        or "forbidden" in low_msg
+        or "escapes" in low_msg
+        or "escaping" in low_msg
+    ):
+        return status.HTTP_403_FORBIDDEN
+    if allow_not_found and "not found" in low_msg:
+        return status.HTTP_404_NOT_FOUND
+    return status.HTTP_400_BAD_REQUEST
+
+
 def _validate_file_target(
     gateway: ComputerGateway,
     project: str | None,
@@ -1309,7 +1324,10 @@ def _validate_file_target(
 ) -> tuple[str, Path, Path]:
     project_name = _resolve_project_name(gateway, project)
     project_dir = resolve_project_dir(gateway.projects_root, project_name)
-    resolved_root = project_dir.resolve()
+    try:
+        resolved_root = project_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
     cleaned_rel = rel_path.strip().lstrip("/")
     if not cleaned_rel and not allow_root:
         raise ValueError("path must not be empty.")
@@ -1318,15 +1336,31 @@ def _validate_file_target(
         cleaned_rel,
         follow_symlinks=follow_symlinks,
     )
-    if not allow_root and (
-        target == resolved_root or (follow_symlinks and target.resolve() == resolved_root)
-    ):
+    try:
+        is_root = target == resolved_root or (
+            follow_symlinks and target.resolve() == resolved_root
+        )
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
+    if not allow_root and is_root:
         raise ValueError("Operation on project root is forbidden.")
     if cleaned_rel:
-        parts = Path(cleaned_rel).parts
-        if ".git" in parts:
+        rel_obj = Path(cleaned_rel)
+        try:
+            resolved_target = target.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
+        if not resolved_target.is_relative_to(resolved_root):
+            raise ValueError(f"Path escapes project root: {rel_path!r}")
+        if _has_git_segment(rel_obj) or _has_git_segment(
+            resolved_target.relative_to(resolved_root)
+        ):
             raise ValueError("Access to .git metadata is restricted.")
-        if _is_sensitive_filename(target) or _is_sensitive_filename(Path(cleaned_rel)):
+        if (
+            _is_sensitive_filename(target)
+            or _is_sensitive_filename(rel_obj)
+            or _is_sensitive_filename(resolved_target)
+        ):
             raise ValueError(f"Access to sensitive file {target.name!r} is restricted.")
     return project_name, resolved_root, target
 
@@ -1566,20 +1600,7 @@ def create_computer_router(
             file_data = read_project_file(gateway.projects_root, project_name, path)
         except ValueError as exc:
             msg = str(exc)
-            low_msg = msg.lower()
-            code = (
-                status.HTTP_403_FORBIDDEN
-                if (
-                    "restricted" in low_msg
-                    or "forbidden" in low_msg
-                    or "escapes" in low_msg
-                )
-                else (
-                    status.HTTP_404_NOT_FOUND
-                    if "not found" in low_msg
-                    else status.HTTP_400_BAD_REQUEST
-                )
-            )
+            code = _file_access_error_code(msg, allow_not_found=True)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
         return JSONResponse(status_code=status.HTTP_200_OK, content=file_data)
 
@@ -1594,15 +1615,7 @@ def create_computer_router(
             _, _, target = _validate_file_target(gateway, project, path)
         except ValueError as exc:
             msg = str(exc)
-            code = (
-                status.HTTP_403_FORBIDDEN
-                if (
-                    "restricted" in msg.lower()
-                    or "forbidden" in msg.lower()
-                    or "escapes" in msg.lower()
-                )
-                else status.HTTP_400_BAD_REQUEST
-            )
+            code = _file_access_error_code(msg)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
         if not target.is_file():
             raise HTTPException(
@@ -1645,15 +1658,7 @@ def create_computer_router(
             _, _, target = _validate_file_target(gateway, project, rel_join)
         except ValueError as exc:
             msg = str(exc)
-            code = (
-                status.HTTP_403_FORBIDDEN
-                if (
-                    "restricted" in msg.lower()
-                    or "forbidden" in msg.lower()
-                    or "escapes" in msg.lower()
-                )
-                else status.HTTP_400_BAD_REQUEST
-            )
+            code = _file_access_error_code(msg)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
 
         parent_dir.mkdir(parents=True, exist_ok=True)
@@ -1698,15 +1703,7 @@ def create_computer_router(
             _, resolved_root, target = _validate_file_target(gateway, project, rel_path)
         except ValueError as exc:
             msg = str(exc)
-            code = (
-                status.HTTP_403_FORBIDDEN
-                if (
-                    "restricted" in msg.lower()
-                    or "forbidden" in msg.lower()
-                    or "escapes" in msg.lower()
-                )
-                else status.HTTP_400_BAD_REQUEST
-            )
+            code = _file_access_error_code(msg)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
         try:
             target.mkdir(parents=True, exist_ok=True)
@@ -1737,15 +1734,7 @@ def create_computer_router(
             _, resolved_root, target = _validate_file_target(gateway, project, rel_path)
         except ValueError as exc:
             msg = str(exc)
-            code = (
-                status.HTTP_403_FORBIDDEN
-                if (
-                    "restricted" in msg.lower()
-                    or "forbidden" in msg.lower()
-                    or "escapes" in msg.lower()
-                )
-                else status.HTTP_400_BAD_REQUEST
-            )
+            code = _file_access_error_code(msg)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
 
         encoded = raw_content.encode("utf-8")
@@ -1784,15 +1773,7 @@ def create_computer_router(
             )
         except ValueError as exc:
             msg = str(exc)
-            code = (
-                status.HTTP_403_FORBIDDEN
-                if (
-                    "restricted" in msg.lower()
-                    or "forbidden" in msg.lower()
-                    or "escapes" in msg.lower()
-                )
-                else status.HTTP_400_BAD_REQUEST
-            )
+            code = _file_access_error_code(msg)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
         try:
             st = target.lstat()
@@ -1809,7 +1790,7 @@ def create_computer_router(
 
         try:
             resolved_target = target.resolve()
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Deletion outside project root is forbidden.",

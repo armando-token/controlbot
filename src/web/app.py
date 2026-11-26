@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from html.parser import HTMLParser
@@ -47,6 +48,7 @@ from src.contracts.common import (
 from src.contracts.models import ActionReceipt, Run, TaskSpec
 from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.storage.errors import ConflictError, NotFoundError
+from src.storage.memory import MemoryStore
 from src.storage.redaction import (
     contains_unredacted_secret_strict,
     is_sensitive_key_strict,
@@ -81,6 +83,7 @@ from src.web.v1 import (
     create_computer_router,
     create_v1_router,
 )
+from src.web.v1.memory_routes import create_memory_router
 from src.web.workspace import (
     default_agy_brain_root,
     default_projects_root,
@@ -847,11 +850,43 @@ def create_app(
     )
     live_browser = LiveBrowserController(profile_root=live_profile_root)
     workspace_store = WorkspaceStore(db_path=resolved_db)
-    event_bus = EventBus()
+    event_bus = EventBus(store=workspace_store)
+
+    def _memory_audit_fn(
+        conn: sqlite3.Connection,
+        *,
+        actor: str,
+        action: str,
+        entity_type: str,
+        entity_id: str | None = None,
+        decision: str = "allow",
+        detail: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return workspace_store.append_audit_event(
+            actor=actor,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            decision=decision,
+            detail=detail,
+            conn=conn,
+        )
+
+    memory_store = MemoryStore(
+        workspace_store.db_path,
+        lock=workspace_store._lock,
+        audit_fn=_memory_audit_fn,
+    )
     uploads_dir = (
         resolved_db.parent / "uploads"
         if resolved_db is not None
         else Path("var") / "uploads"
+    )
+    computer_gateway = ComputerGateway(
+        projects_root=default_projects_root(),
+        screenshot_path=live_profile_root.parent / "live_browser_latest.jpg",
+        store=workspace_store,
+        state_dir=workspace_store.db_path.parent,
     )
     v1_runner = AgentTurnRunner(
         store=workspace_store,
@@ -859,12 +894,9 @@ def create_app(
         live_browser=live_browser,
         coordinator=coord,
         uploads_dir=uploads_dir,
-    )
-    computer_gateway = ComputerGateway(
-        projects_root=default_projects_root(),
-        screenshot_path=live_profile_root.parent / "live_browser_latest.jpg",
-        store=workspace_store,
-        state_dir=workspace_store.db_path.parent,
+        memory_store=memory_store,
+        computer_gateway=computer_gateway,
+        facility_config=(active_runtime.facility_config if active_runtime is not None else None),
     )
 
     jinja_env = Environment(
@@ -885,6 +917,8 @@ def create_app(
         finally:
             await v1_runner.stop_scheduler()
             await live_browser.stop()
+            memory_store.close()
+            event_bus.close()
             workspace_store.close()
             if active_runtime is None and owns_session_manager and internal_sm is not None:
                 await internal_sm.close_all()
@@ -902,6 +936,7 @@ def create_app(
     app.state.session_manager = sess_mgr
     app.state.runtime = active_runtime
     app.state.workspace_store = workspace_store
+    app.state.memory_store = memory_store
     app.state.event_bus = event_bus
     app.state.v1_runner = v1_runner
     app.state.live_browser = live_browser
@@ -941,25 +976,203 @@ def create_app(
             event_bus=event_bus,
         )
     )
+    app.include_router(create_memory_router(memory_store))
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
-        del request
+        path = request.url.path
+        is_vault_route = (
+            path == "/api/v1/vault"
+            or path.startswith("/api/v1/vault/")
+            or path.startswith("/api/v1/secure-forms")
+        )
+        vault_secret_locs = frozenset({"secret_value", "value", "values", "fields"})
+        safe_vault_keys = frozenset(
+            {
+                "name",
+                "bot_id",
+                "domain",
+                "kind",
+                "form_id",
+                "thread_id",
+                "save_to_vault",
+                "allow_vault_save",
+                "action",
+                "title",
+            }
+        )
+        safe_pydantic_msg_types = frozenset(
+            {
+                "missing",
+                "string_too_long",
+                "string_too_short",
+                "string_type",
+                "dict_type",
+                "list_type",
+                "bool_type",
+                "int_type",
+                "float_type",
+                "json_invalid",
+                "extra_forbidden",
+                "literal_error",
+                "model_type",
+            }
+        )
+        static_vault_msgs = frozenset(
+            {"Value error, Vault secret requires either fields or secret_value."}
+        )
+
+        def _collect_string_leaves(val: Any, out: list[str]) -> None:
+            if isinstance(val, str):
+                if len(val) >= 4 and val != REDACTED_PLACEHOLDER:
+                    out.append(val)
+            elif isinstance(val, Mapping):
+                for sub_v in val.values():
+                    _collect_string_leaves(sub_v, out)
+            elif isinstance(val, (list, tuple, set, frozenset)):
+                for item in val:
+                    _collect_string_leaves(item, out)
+
+        def _extract_secret_candidates(
+            inp: Any,
+            *,
+            sensitive_or_vault_loc: bool,
+            loc_parts: list[str],
+        ) -> list[str]:
+            collected: list[str] = []
+            if sensitive_or_vault_loc:
+                _collect_string_leaves(inp, collected)
+            elif is_vault_route and inp is not None:
+                if isinstance(inp, Mapping):
+                    for k, v in inp.items():
+                        k_str = str(k)
+                        if (
+                            k_str in safe_vault_keys
+                            and not is_sensitive_key_strict(k_str)
+                            and k_str not in vault_secret_locs
+                            and (v is None or isinstance(v, (bool, int, float, str)))
+                        ):
+                            continue
+                        _collect_string_leaves(v, collected)
+                elif not (
+                    len(loc_parts) >= 2
+                    and loc_parts[-1] in safe_vault_keys
+                    and isinstance(inp, (bool, int, float, str))
+                ):
+                    _collect_string_leaves(inp, collected)
+            # Deduplicate, longest first
+            return sorted(set(collected), key=len, reverse=True)
+
+        def _scrub_with_candidates(
+            val: Any,
+            candidates: list[str],
+            *,
+            scrub_candidates: bool,
+        ) -> Any:
+            if isinstance(val, str):
+                text = val
+                if scrub_candidates and candidates:
+                    for cand in candidates:
+                        if cand in text:
+                            text = text.replace(cand, REDACTED_PLACEHOLDER)
+                return redact_payload_strict(text)
+            if isinstance(val, Mapping):
+                return {
+                    redact_payload_strict(k) if isinstance(k, str) else k: _scrub_with_candidates(
+                        sub_v,
+                        candidates,
+                        scrub_candidates=scrub_candidates,
+                    )
+                    for k, sub_v in val.items()
+                }
+            if isinstance(val, list):
+                return [
+                    _scrub_with_candidates(
+                        item,
+                        candidates,
+                        scrub_candidates=scrub_candidates,
+                    )
+                    for item in val
+                ]
+            return redact_payload_strict(val)
+
+        def _sanitize_vault_dict(inp: Mapping[Any, Any]) -> dict[Any, Any]:
+            cleaned_inp: dict[Any, Any] = {}
+            for k, v in inp.items():
+                k_str = str(k)
+                safe_k = redact_payload_strict(k_str) if isinstance(k, str) else k
+                if (
+                    k_str in safe_vault_keys
+                    and not is_sensitive_key_strict(k_str)
+                    and k_str not in vault_secret_locs
+                ):
+                    if v is None or isinstance(v, (bool, int, float, str)):
+                        cleaned_inp[safe_k] = redact_payload_strict(v)
+                    else:
+                        cleaned_inp[safe_k] = REDACTED_PLACEHOLDER
+                else:
+                    cleaned_inp[safe_k] = None if v is None else REDACTED_PLACEHOLDER
+            return cleaned_inp
+
+        def _scrub_validation_error(err: dict[str, Any]) -> None:
+            raw_loc = err.get("loc")
+            loc_parts = [str(part) for part in raw_loc] if isinstance(raw_loc, list) else []
+            sensitive_loc = any(is_sensitive_key_strict(part) for part in loc_parts)
+            vault_secret_loc = is_vault_route and any(
+                part in vault_secret_locs for part in loc_parts
+            )
+            sensitive_or_vault_loc = sensitive_loc or vault_secret_loc
+            candidates = _extract_secret_candidates(
+                err.get("input"),
+                sensitive_or_vault_loc=sensitive_or_vault_loc,
+                loc_parts=loc_parts,
+            )
+
+            if "input" in err and err["input"] is not None:
+                inp = err["input"]
+                if sensitive_or_vault_loc:
+                    err["input"] = REDACTED_PLACEHOLDER
+                elif is_vault_route:
+                    if isinstance(inp, Mapping):
+                        err["input"] = _sanitize_vault_dict(inp)
+                    elif (
+                        len(loc_parts) >= 2
+                        and loc_parts[-1] in safe_vault_keys
+                        and isinstance(inp, (bool, int, float, str))
+                    ):
+                        err["input"] = redact_payload_strict(inp)
+                    else:
+                        err["input"] = REDACTED_PLACEHOLDER
+                else:
+                    err["input"] = redact_payload_strict(inp)
+
+            err_type = str(err.get("type") or "")
+            raw_msg = err.get("msg")
+            if isinstance(raw_msg, str):
+                is_known_static_msg = (
+                    err_type in safe_pydantic_msg_types or raw_msg in static_vault_msgs
+                )
+                err["msg"] = _scrub_with_candidates(
+                    raw_msg,
+                    candidates,
+                    scrub_candidates=bool(candidates) and not is_known_static_msg,
+                )
+
+            if isinstance(err.get("ctx"), Mapping):
+                err["ctx"] = _scrub_with_candidates(
+                    dict(err["ctx"]),
+                    candidates,
+                    scrub_candidates=bool(candidates),
+                )
+
         encoded = jsonable_encoder(exc.errors())
         if isinstance(encoded, list):
             for err in encoded:
                 if isinstance(err, dict):
-                    loc = err.get("loc")
-                    if (
-                        isinstance(loc, list)
-                        and loc
-                        and is_sensitive_key_strict(str(loc[-1]))
-                        and err.get("input") is not None
-                    ):
-                        err["input"] = REDACTED_PLACEHOLDER
+                    _scrub_validation_error(err)
         scrubbed = _scrub_and_verify(encoded, label="validation_error")
         return JSONResponse(status_code=422, content={"detail": scrubbed})
 

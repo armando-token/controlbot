@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -19,8 +18,8 @@ from src.factory import (
     PolicyImmutabilityError,
     run_factory_demo,
 )
-from src.n3_probe import run_n3_probe
 from src.storage import StorageRepo
+from tests.acceptance.test_n3_linux import require_n3_linux_env_or_skip
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -233,10 +232,6 @@ def test_m6_deploy_package_and_rollback_subprocess_e2e(tmp_path: Path) -> None:
 
 @pytest.mark.acceptance
 @pytest.mark.n3
-@pytest.mark.skipif(
-    platform.system() != "Linux",
-    reason="PENDING_N3_LINUX_ENV: Linux host netns/iptables + local LLM required.",
-)
 def test_m6_n3_linux_offline_gate() -> None:
     cfg = load_deploy_config(
         _REPO_ROOT / "deploy" / "install_config.yaml",
@@ -244,7 +239,7 @@ def test_m6_n3_linux_offline_gate() -> None:
         repo_root=_REPO_ROOT,
     )
     assert cfg.offline_ops.egress_blocked is True
-    report = run_n3_probe()
+    report = require_n3_linux_env_or_skip()
     assert report.linux_os_ready is True
     assert report.network_isolation_ready is True
     assert report.local_llm_ready is True

@@ -41,4 +41,4 @@ echo "==> 4/5 Running strict N3 probe (Linux OS + A11 + AT-SPI + local LLM)"
 uv run python -m src.n3_probe --strict --json
 
 echo "==> 5/5 Running pytest N3 acceptance suite"
-uv run pytest tests/acceptance -m n3 -rs -v
+GROKBOT_N3_STRICT=1 uv run pytest tests/acceptance -m n3 -rs -v

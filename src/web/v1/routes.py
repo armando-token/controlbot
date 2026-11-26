@@ -362,7 +362,6 @@ def create_v1_router(
             _raise_http(status.HTTP_404_NOT_FOUND, f"Thread not found: {thread_id}")
         settings = store.get_settings()
         sender_name = str(settings.get("display_name") or "You")
-        attachments = store.get_attachments_summary(payload.attachment_ids)
         user_msg = store.create_message(
             thread_id=thread_id,
             sender_type="user",
@@ -371,7 +370,7 @@ def create_v1_router(
             content=payload.content,
             reply_to_id=payload.reply_to_id,
             mentions=payload.mentions,
-            attachments=attachments,
+            attachment_ids=payload.attachment_ids,
             status="done",
         )
         turn_id = runner.start_turn(
@@ -381,6 +380,7 @@ def create_v1_router(
             model_id=payload.model_id,
             thinking_level=payload.thinking_level,
             skill_ids=payload.skill_ids,
+            page_context_id=payload.page_context_id,
         )
         return _json_response(
             {
@@ -726,44 +726,16 @@ def create_v1_router(
         existing = store.get_artifact(artifact_id)
         if existing is None:
             _raise_http(status.HTTP_404_NOT_FOUND, f"Artifact not found: {artifact_id}")
-        deleted: Any = store.delete_artifact(artifact_id)
+        deleted = store.delete_artifact(artifact_id)
         if not deleted:
             _raise_http(status.HTTP_404_NOT_FOUND, f"Artifact not found: {artifact_id}")
 
         uploads_root = uploads_dir.resolve()
-        if isinstance(deleted, dict) and deleted.get("attachment_path"):
+        if deleted.get("attachment_path"):
             candidate = Path(str(deleted["attachment_path"])).resolve()
             if candidate.is_relative_to(uploads_root) and candidate.is_file():
                 with contextlib.suppress(OSError):
                     candidate.unlink(missing_ok=True)
-        else:
-            att_url = str(existing.get("url") or "")
-            if att_url.startswith("/api/v1/attachments/"):
-                att_id = att_url.removeprefix("/api/v1/attachments/").split("?", 1)[0].strip()
-                if att_id:
-                    att_rec = store.get_attachment_record(att_id)
-                    if att_rec is not None:
-                        bot_id_str = str(existing["bot_id"])
-                        still_in_lib = any(
-                            str(item.get("url") or "") == att_url
-                            for item in store.list_bot_library(bot_id_str).get("items", [])
-                        )
-                        still_in_thread = False
-                        thr_id = existing.get("thread_id")
-                        if thr_id:
-                            msgs, _ = store.list_thread_messages(str(thr_id), limit=200)
-                            still_in_thread = any(
-                                any(
-                                    str(a.get("id") or "") == att_id
-                                    for a in m.get("attachments", [])
-                                )
-                                for m in msgs
-                            )
-                        if not still_in_lib and not still_in_thread:
-                            candidate = Path(str(att_rec["storage_path"])).resolve()
-                            if candidate.is_relative_to(uploads_root) and candidate.is_file():
-                                with contextlib.suppress(OSError):
-                                    candidate.unlink(missing_ok=True)
 
         event_bus.publish(
             "artifact.deleted",
@@ -856,13 +828,49 @@ def create_v1_router(
         )
         return _json_response(resolved)
 
+    def _auto_vault_draft_webhook_secret(
+        fields: dict[str, Any] | None,
+        *,
+        bot_id: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if fields is None:
+            return None, None
+        next_fields = dict(fields)
+        raw_sec = str(next_fields.get("webhook_secret") or "").strip()
+        if raw_sec and raw_sec != "[REDACTED]":
+            sec = store.create_vault_secret(
+                bot_id=bot_id,
+                name=f"draft-webhook-{uuid.uuid4().hex[:8]}",
+                domain="",
+                fields={"webhook_secret": raw_sec},
+            )
+            sec_id = str(sec["id"])
+            next_fields["webhook_secret_id"] = sec_id
+            for stale_key in ("vault_secret_id", "secret_id"):
+                if stale_key in next_fields:
+                    next_fields[stale_key] = sec_id
+            return next_fields, sec_id
+        return next_fields, None
+
+    def _has_idempotency_key(scope: str, idem_key: str | None) -> bool:
+        if not idem_key or not idem_key.strip():
+            return False
+        cleaned = idem_key.strip()
+        with store._lock:
+            row = store._conn.execute(
+                "SELECT 1 FROM idempotency_keys WHERE scope = ? AND idem_key = ?",
+                (scope, cleaned),
+            ).fetchone()
+            return row is not None
+
     @router.post("/drafts", status_code=status.HTTP_201_CREATED)
     async def create_draft(payload: DraftCreateRequest) -> JSONResponse:
+        draft_fields, _ = _auto_vault_draft_webhook_secret(payload.fields, bot_id=payload.bot_id)
         draft = store.create_draft(
             bot_id=payload.bot_id,
             thread_id=payload.thread_id,
             channel_type=payload.channel_type,
-            fields=payload.fields,
+            fields=draft_fields,
         )
         event_bus.publish(
             "hitl.draft.created",
@@ -879,18 +887,37 @@ def create_v1_router(
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> JSONResponse:
         action = payload.action or "send"
+        resolve_fields = payload.fields
+        newly_vaulted_id: str | None = None
+        if resolve_fields is not None and action in {"send", "update"}:
+            existing_draft = store.get_draft(draft_id)
+            if (
+                existing_draft is not None
+                and existing_draft["status"] == "pending"
+                and not _has_idempotency_key("draft_resolve", idempotency_key)
+            ):
+                resolve_fields, newly_vaulted_id = _auto_vault_draft_webhook_secret(
+                    resolve_fields,
+                    bot_id=str(existing_draft["bot_id"]),
+                )
         try:
             updated = store.resolve_draft(
                 draft_id,
                 action,
-                fields=payload.fields,
+                fields=resolve_fields,
                 idempotency_key=idempotency_key,
             )
         except StoreNotFoundError as exc:
+            if newly_vaulted_id is not None:
+                store.delete_vault_secret(newly_vaulted_id)
             _raise_http(status.HTTP_404_NOT_FOUND, exc, exc=exc)
         except StoreConflictError as exc:
+            if newly_vaulted_id is not None:
+                store.delete_vault_secret(newly_vaulted_id)
             _raise_http(status.HTTP_409_CONFLICT, exc, exc=exc)
         except StoreValidationError as exc:
+            if newly_vaulted_id is not None:
+                store.delete_vault_secret(newly_vaulted_id)
             _raise_http(422, exc, exc=exc)
 
         event_bus.publish(
@@ -899,6 +926,7 @@ def create_v1_router(
             bot_id=str(updated["bot_id"]),
             thread_id=str(updated["thread_id"]),
         )
+        await runner.on_draft_resolved(updated, action=action)
         return _json_response(updated)
 
     @router.post("/secure-forms", status_code=status.HTTP_201_CREATED)
@@ -1128,7 +1156,18 @@ def create_v1_router(
             )
             saved_secret_id = str(meta["id"])
 
-        if form is not None and (filled or is_secret_only_form):
+        if is_secret_only_form and saved_secret_id is None:
+            if not allow_save:
+                _raise_http(
+                    status.HTTP_409_CONFLICT,
+                    "This secret form does not allow saving to Vault.",
+                )
+            _raise_http(
+                422,
+                "Secret-only form requires save_to_vault=True with non-empty values.",
+            )
+
+        if form is not None and (filled or (is_secret_only_form and saved_secret_id is not None)):
             updated_form = store.resolve_secure_form(str(form["id"]), status="submitted")
             event_bus.publish(
                 "hitl.secure_form.resolved",
@@ -1139,7 +1178,7 @@ def create_v1_router(
 
         if filled:
             msg_text = "Filled into the page. Secret values were never shown to your Bot."
-        elif is_secret_only_form:
+        elif is_secret_only_form and saved_secret_id is not None:
             msg_text = "Secret saved. Secret values were never shown to your Bot."
         elif browser_running and not required_domains:
             msg_text = (

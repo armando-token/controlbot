@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import smtplib
+import sqlite3
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -39,9 +40,11 @@ from src.engine.policy_gateway import (
     safety_floor,
 )
 from src.engine.router import LaneRouter, RouteDecision
+from src.storage.memory import MemoryAccessContext
 from src.web.live_browser import LiveBrowserController
 from src.web.protocols import CoordinatorProtocol, TaskSnapshot, maybe_await
 from src.web.v1.events import EventBus, scrub_v1_payload, utc_iso_now
+from src.web.v1.schemas import MAX_AUTO_REVIEW_RULE_LEN
 from src.web.v1.store import StoreNotFoundError, WorkspaceStore
 from src.web.workspace import (
     default_projects_root,
@@ -81,28 +84,96 @@ _RULE_DESTRUCTIVE_HINTS: frozenset[str] = frozenset(
 )
 _STOP_WORDS: frozenset[str] = frozenset(
     {
-        "before",
-        "after",
-        "always",
-        "never",
         "about",
-        "with",
-        "from",
-        "that",
-        "this",
-        "when",
-        "into",
-        "running",
-        "asking",
-        "first",
-        "allow",
         "action",
         "actions",
-        "commands",
+        "after",
+        "all",
+        "allow",
+        "always",
+        "and",
+        "any",
+        "are",
+        "ask",
+        "asking",
+        "before",
+        "both",
+        "but",
+        "can",
         "command",
+        "commands",
+        "confirm",
+        "did",
+        "each",
+        "first",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "her",
+        "here",
+        "his",
+        "how",
+        "into",
+        "its",
+        "just",
+        "let",
+        "may",
+        "more",
+        "most",
+        "never",
+        "not",
+        "now",
+        "off",
+        "our",
+        "out",
+        "own",
+        "per",
         "please",
+        "routine",
+        "routines",
+        "she",
+        "should",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "they",
+        "thing",
+        "things",
+        "this",
+        "too",
+        "two",
+        "via",
+        "was",
+        "way",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "why",
+        "will",
+        "with",
+        "would",
+        "yes",
+        "yet",
+        "you",
+        "your",
     }
 )
+_SHORT_2CHAR_TOKENS: frozenset[str] = frozenset({"go", "do", "rm", "cp", "mv"})
+_AUXILIARY_RULE_TOKENS: frozenset[str] = frozenset({"run", "running", "runs"})
+_EXACT_RULE_PREFIX = "Allow exact: "
+_EXACT_SHA_PREFIX = "Allow exact-sha256: "
 _MEMORY_PROMPT_MAX_CHARS = 6000
 _PAGE_CONTEXT_MAX_CHARS = 8000
 
@@ -232,14 +303,70 @@ def _infer_action_kind(
     return "read"
 
 
-def _rule_tokens(text: str) -> set[str]:
-    words = re.findall(r"[a-z0-9_-]{4,}", text.lower())
-    return {w for w in words if w not in _STOP_WORDS}
+def _normalize_rule_token(word: str) -> str:
+    if len(word) >= 5 and word.endswith("ing"):
+        cand = word[:-3]
+        stem = cand if any(c in "aeiouy" for c in cand) else word
+    elif len(word) > 4 and word.endswith(("ies", "ied")):
+        stem = f"{word[:-3]}y"
+    elif word.endswith("ees") and len(word) >= 4:
+        stem = word[:-1]
+    elif len(word) >= 4 and word.endswith("ed") and not word.endswith("eed"):
+        cand = word[:-2]
+        if len(word) == 4 and word[0] not in "aeiouy" and word[1] not in "aeiouy":
+            stem = word
+        elif len(word) == 4 and cand.endswith("i"):
+            stem = word[:-1]
+        else:
+            stem = cand
+    elif len(word) >= 4 and word.endswith("es"):
+        stem = word[:-2]
+    elif (
+        len(word) >= 4
+        and word.endswith("s")
+        and not word.endswith(("ss", "us", "is", "as", "os"))
+    ):
+        stem = word[:-1]
+    else:
+        stem = word
+    # Collapse CVC doubled consonants produced by -ing/-ed stripping (e.g. running -> runn -> run)
+    if (
+        stem != word
+        and len(stem) >= 4
+        and stem[-1] == stem[-2]
+        and stem[-1] in {"b", "d", "g", "m", "n", "p", "r", "t"}
+        and stem[-3] in "aeiou"
+    ):
+        stem = stem[:-1]
+    if (
+        len(stem) >= 3
+        and stem.endswith("e")
+        and not stem.endswith(("ee", "ie", "ye", "oe", "ue", "ae"))
+    ):
+        stem = stem[:-1]
+    return stem
+
+
+def _rule_tokens(text: str, *, include_aux: bool = False) -> set[str]:
+    words = [
+        w
+        for w in re.findall(r"[a-z0-9][a-z0-9_-]*", text.lower())
+        if len(w) >= 3 or w in _SHORT_2CHAR_TOKENS
+    ]
+    primary = {
+        _normalize_rule_token(w)
+        for w in words
+        if w not in _STOP_WORDS and w not in _AUXILIARY_RULE_TOKENS
+    }
+    if include_aux or len(primary) < 2:
+        return {_normalize_rule_token(w) for w in words if w not in _STOP_WORDS}
+    return primary
 
 
 def _match_ask_first_rule(prompt: str, rules: list[dict[str, Any]]) -> str | None:
     prompt_low = prompt.lower()
-    prompt_tokens = _rule_tokens(prompt_low)
+    prompt_norm = " ".join(prompt_low.split())
+    prompt_tokens = _rule_tokens(prompt_low, include_aux=True)
     has_destructive = any(pat.search(prompt) is not None for pat in _DESTRUCTIVE_PATTERNS)
 
     # Allow rules can explicitly override matching actions
@@ -247,7 +374,29 @@ def _match_ask_first_rule(prompt: str, rules: list[dict[str, Any]]) -> str | Non
         if rule.get("bucket") != "allow_auto":
             continue
         r_text = str(rule.get("rule_text", "")).strip()
-        r_tokens = _rule_tokens(r_text)
+        r_low = r_text.lower()
+        if r_low.startswith("allow exact:"):
+            exact_target = " ".join(r_low[len("allow exact:") :].strip().split())
+            if exact_target and prompt_norm == exact_target:
+                return None
+            continue
+        if r_low.startswith("allow exact-sha256:"):
+            expected_hash = r_low[len("allow exact-sha256:") :].strip()
+            if (
+                expected_hash
+                and hashlib.sha256(prompt_norm.encode("utf-8")).hexdigest() == expected_hash
+            ):
+                return None
+            continue
+        quoted = [
+            m[0] or m[1]
+            for m in re.findall(r'"([^"]{3,})"|\'([^\']{3,})\'', r_low)
+        ]
+        if quoted:
+            if any(phrase in prompt_low for phrase in quoted):
+                return None
+            continue
+        r_tokens = _rule_tokens(r_low)
         if r_tokens and len(r_tokens & prompt_tokens) >= max(2, min(3, len(r_tokens))):
             return None
 
@@ -259,7 +408,10 @@ def _match_ask_first_rule(prompt: str, rules: list[dict[str, Any]]) -> str | Non
         r_words = set(re.findall(r"[a-z0-9_-]+", r_low))
         if has_destructive and (r_words & _RULE_DESTRUCTIVE_HINTS):
             return r_text
-        quoted = re.findall(r"[\"']([^\"']{3,})[\"']", r_low)
+        quoted = [
+            m[0] or m[1]
+            for m in re.findall(r'"([^"]{3,})"|\'([^\']{3,})\'', r_low)
+        ]
         if any(phrase in prompt_low for phrase in quoted):
             return r_text
         r_tokens = _rule_tokens(r_low)
@@ -363,6 +515,7 @@ class AgentTurnRunner:
         self._routine_tasks: set[asyncio.Task[None]] = set()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._stopping = False
         self._last_cron_minute: dict[str, str] = {}
 
     def _record_policy_audit(self, event: dict[str, Any]) -> str:
@@ -419,11 +572,13 @@ class AgentTurnRunner:
         """Start the lightweight background cron & approval-expiration loop."""
         if self._scheduler_task is not None and not self._scheduler_task.done():
             return
+        self._stopping = False
         self._stop_event = asyncio.Event()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def stop_scheduler(self) -> None:
         """Stop scheduler loop and cancel any in-flight turn/routine tasks cleanly."""
+        self._stopping = True
         if self._stop_event is not None:
             self._stop_event.set()
         if self._scheduler_task is not None:
@@ -546,6 +701,25 @@ class AgentTurnRunner:
                 thread_id=str(bot["thread_id"]),
                 needs_attention=False,
             )
+
+    def _reset_routine_presence_idle(
+        self,
+        bot_id: str,
+        thread_id: str,
+        *,
+        subtext: str = "Idle",
+    ) -> None:
+        if self._store.count_pending_approvals_for_bot(bot_id) == 0:
+            self._emit_presence(
+                bot_id,
+                state="idle",
+                subtext=subtext,
+                computer_active=False,
+                thread_id=thread_id,
+                needs_attention=False,
+            )
+        else:
+            self._sync_bot_attention(bot_id)
 
     def start_turn(
         self,
@@ -686,14 +860,43 @@ class AgentTurnRunner:
         """Handle resolving an approval card (always_allow + resume agy OR runtime run)."""
         bot_id = str(approval["bot_id"])
         thread_id = str(approval["thread_id"])
+        raw_args = approval.get("arguments")
+        args_dict: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+        pending_ctx = self._store.get_approval_pending_context(str(approval["id"]))
         if decision == "always_allow":
-            label = (rule_text or f"Allow: {approval['title']}").strip()
+            explicit_rule = (rule_text or "").strip()
+            if explicit_rule:
+                label = explicit_rule
+            else:
+                matched_rule = str(args_dict.get("matched_rule") or "").strip()
+                args_prompt = str(args_dict.get("prompt") or "").strip()
+                ctx_prompt = ""
+                if isinstance(pending_ctx, dict):
+                    if isinstance(pending_ctx.get("prompt"), str):
+                        ctx_prompt = str(pending_ctx["prompt"]).strip()
+                    elif isinstance(pending_ctx.get("user_message"), dict):
+                        ctx_prompt = str(
+                            pending_ctx["user_message"].get("content") or ""
+                        ).strip()
+                prompt_arg = ctx_prompt if len(ctx_prompt) >= len(args_prompt) else args_prompt
+                if matched_rule:
+                    if prompt_arg:
+                        normalized_prompt = " ".join(prompt_arg.split())
+                        exact_limit = MAX_AUTO_REVIEW_RULE_LEN - len(_EXACT_RULE_PREFIX)
+                        if len(normalized_prompt) <= exact_limit:
+                            label = f"{_EXACT_RULE_PREFIX}{normalized_prompt}"
+                        else:
+                            digest = hashlib.sha256(
+                                normalized_prompt.lower().encode("utf-8")
+                            ).hexdigest()
+                            label = f"{_EXACT_SHA_PREFIX}{digest}"
+                    else:
+                        label = f"Allow: {matched_rule}"
+                else:
+                    label = f"Allow: {approval['title']}".strip()
             self._store.add_auto_review_rule("allow_auto", label)
 
         self._sync_bot_attention(bot_id)
-        pending_ctx = self._store.get_approval_pending_context(str(approval["id"]))
-        raw_args = approval.get("arguments")
-        args_dict: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
         run_id_raw = args_dict.get("run_id") or (
             pending_ctx.get("run_id") if isinstance(pending_ctx, dict) else None
         )
@@ -717,7 +920,104 @@ class AgentTurnRunner:
                     decision=decision,
                     pending_ctx=pending_ctx if isinstance(pending_ctx, dict) else {},
                 )
+            elif pending_ctx and isinstance(pending_ctx.get("routine_id"), str):
+                routine_id = str(pending_ctx["routine_id"])
+                routine_run_id = str(pending_ctx.get("routine_run_id") or "")
+                trigger = str(pending_ctx.get("trigger") or "manual")
+                routine = self._store.get_routine(routine_id)
+                if routine is None:
+                    if routine_run_id:
+                        with contextlib.suppress(StoreNotFoundError):
+                            failed_run = self._store.update_routine_run(
+                                routine_run_id,
+                                {
+                                    "status": "failed",
+                                    "error": f"Routine {routine_id} no longer exists.",
+                                    "finished_at": utc_iso_now(),
+                                },
+                            )
+                            self._event_bus.publish(
+                                "routine.run.status",
+                                {"routine_id": routine_id, "run": failed_run},
+                                bot_id=bot_id,
+                                thread_id=thread_id,
+                            )
+                    bot = self._store.get_bot(bot_id)
+                    bot_name = str(bot["name"]) if bot is not None else "Bot"
+                    err_msg = self._store.create_message(
+                        thread_id=thread_id,
+                        sender_type="bot",
+                        sender_bot_id=bot_id,
+                        sender_name=bot_name,
+                        content=(
+                            f"Could not resume routine `{routine_id}`: "
+                            "routine no longer exists."
+                        ),
+                        status="error",
+                    )
+                    self._event_bus.publish(
+                        "message.completed",
+                        {"message_id": err_msg["id"], "message": err_msg},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                    )
+                else:
+                    run_obj: dict[str, Any] | None = None
+                    if routine_run_id:
+                        with contextlib.suppress(StoreNotFoundError):
+                            run_obj = self._store.update_routine_run(
+                                routine_run_id,
+                                {"status": "running", "error": None},
+                            )
+                    if run_obj is None:
+                        run_obj = self._store.create_routine_run(
+                            routine_id, bot_id, trigger=trigger
+                        )
+                    self._event_bus.publish(
+                        "routine.run.status",
+                        {"routine_id": routine_id, "run": run_obj},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                    )
+                    task = asyncio.create_task(
+                        self._run_routine_bg(
+                            routine=routine,
+                            run=run_obj,
+                            skip_auto_review=True,
+                        )
+                    )
+                    self._routine_tasks.add(task)
+                    task.add_done_callback(self._routine_tasks.discard)
         else:
+            if (
+                isinstance(pending_ctx, dict)
+                and isinstance(pending_ctx.get("routine_id"), str)
+                and isinstance(pending_ctx.get("routine_run_id"), str)
+            ):
+                routine_id = str(pending_ctx["routine_id"])
+                routine_run_id = str(pending_ctx["routine_run_id"])
+                decision_past = (
+                    "denied"
+                    if decision == "deny"
+                    else "skipped"
+                    if decision == "skip"
+                    else f"{decision}ed"
+                )
+                with contextlib.suppress(StoreNotFoundError):
+                    denied_run = self._store.update_routine_run(
+                        routine_run_id,
+                        {
+                            "status": "failed",
+                            "error": f"Routine paused for approval was {decision_past}.",
+                            "finished_at": utc_iso_now(),
+                        },
+                    )
+                    self._event_bus.publish(
+                        "routine.run.status",
+                        {"routine_id": routine_id, "run": denied_run},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                    )
             if run_id_raw:
                 run_id = str(run_id_raw)
                 try:
@@ -765,6 +1065,29 @@ class AgentTurnRunner:
     ) -> None:
         bot_id = str(approval["bot_id"])
         thread_id = str(approval["thread_id"])
+        routine_id = (
+            str(pending_ctx["routine_id"])
+            if isinstance(pending_ctx.get("routine_id"), str) and pending_ctx.get("routine_id")
+            else None
+        )
+        routine_run_id = (
+            str(pending_ctx["routine_run_id"])
+            if isinstance(pending_ctx.get("routine_run_id"), str)
+            and pending_ctx.get("routine_run_id")
+            else None
+        )
+        if routine_id and routine_run_id:
+            with contextlib.suppress(StoreNotFoundError):
+                running_rtn = self._store.update_routine_run(
+                    routine_run_id,
+                    {"status": "running", "error": None},
+                )
+                self._event_bus.publish(
+                    "routine.run.status",
+                    {"routine_id": routine_id, "run": running_rtn},
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                )
         bot = self._store.get_bot(bot_id)
         bot_name = str(bot["name"]) if bot is not None else "Bot"
         model_id = str(bot.get("model_id") or "") if bot is not None else ""
@@ -809,7 +1132,16 @@ class AgentTurnRunner:
         tool_calls: list[dict[str, Any]] = []
 
         try:
-            await maybe_await(self._coordinator.resume_task(run_id, {"choice": decision}))
+            await maybe_await(
+                self._coordinator.resume_task(
+                    run_id,
+                    {
+                        "approval_decision": decision,
+                        "approved": True,
+                        "reauthenticated": True,
+                    },
+                )
+            )
             snapshot = await self._await_runtime_run(
                 run_id,
                 bot_id=bot_id,
@@ -821,6 +1153,15 @@ class AgentTurnRunner:
             )
 
             if snapshot is not None and snapshot.run.status == TaskStatus.WAITING_FOR_INPUT:
+                next_pending_ctx: dict[str, Any] = {
+                    "run_id": run_id,
+                    "bot_id": bot_id,
+                    "thread_id": thread_id,
+                    "seen_receipts": sorted(seen_receipts),
+                }
+                if routine_id and routine_run_id:
+                    next_pending_ctx["routine_id"] = routine_id
+                    next_pending_ctx["routine_run_id"] = routine_run_id
                 appr = self._store.create_approval(
                     bot_id=bot_id,
                     thread_id=thread_id,
@@ -828,12 +1169,7 @@ class AgentTurnRunner:
                     title=str(snapshot.run.required_action or "Runtime input required")[:240],
                     target=f"run:{run_id}",
                     arguments={"run_id": run_id},
-                    pending_context={
-                        "run_id": run_id,
-                        "bot_id": bot_id,
-                        "thread_id": thread_id,
-                        "seen_receipts": sorted(seen_receipts),
-                    },
+                    pending_context=next_pending_ctx,
                 )
                 self._event_bus.publish(
                     "hitl.approval.requested",
@@ -864,6 +1200,24 @@ class AgentTurnRunner:
                     status="done",
                 )
                 req_action = snapshot.run.required_action or "input required"
+                if routine_id and routine_run_id:
+                    with contextlib.suppress(StoreNotFoundError):
+                        waiting_rtn = self._store.update_routine_run(
+                            routine_run_id,
+                            {
+                                "status": "waiting_approval",
+                                "summary": (
+                                    f"Routine paused for operator input "
+                                    f"(run `{run_id}`): {req_action}."
+                                )[:1000],
+                            },
+                        )
+                        self._event_bus.publish(
+                            "routine.run.status",
+                            {"routine_id": routine_id, "run": waiting_rtn},
+                            bot_id=bot_id,
+                            thread_id=thread_id,
+                        )
                 self._emit_presence(
                     bot_id,
                     state="waiting_human",
@@ -910,6 +1264,32 @@ class AgentTurnRunner:
                 status=final_status,
                 metadata=verified_meta,
             )
+            if routine_id and routine_run_id:
+                finished_at = utc_iso_now()
+                with contextlib.suppress(StoreNotFoundError):
+                    self._store.update_routine(routine_id, {"last_run_at": finished_at})
+                    if final_status == "error" or (
+                        snapshot is not None and snapshot.run.status == TaskStatus.CANCELLED
+                    ):
+                        rtn_updates: dict[str, Any] = {
+                            "status": "failed",
+                            "error": answer[:1000],
+                            "finished_at": finished_at,
+                        }
+                    else:
+                        rtn_updates = {
+                            "status": "succeeded",
+                            "summary": answer[:1000],
+                            "message_id": msg_id,
+                            "finished_at": finished_at,
+                        }
+                    done_rtn = self._store.update_routine_run(routine_run_id, rtn_updates)
+                    self._event_bus.publish(
+                        "routine.run.status",
+                        {"routine_id": routine_id, "run": done_rtn},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                    )
             self._emit_presence(
                 bot_id,
                 state="idle" if final_status == "done" else "error",
@@ -935,6 +1315,24 @@ class AgentTurnRunner:
                 thread_id=thread_id,
                 turn_id=turn_id,
             )
+            if routine_id and routine_run_id:
+                finished_at = utc_iso_now()
+                with contextlib.suppress(StoreNotFoundError):
+                    self._store.update_routine(routine_id, {"last_run_at": finished_at})
+                    failed_rtn = self._store.update_routine_run(
+                        routine_run_id,
+                        {
+                            "status": "failed",
+                            "error": err_msg[:1000],
+                            "finished_at": finished_at,
+                        },
+                    )
+                    self._event_bus.publish(
+                        "routine.run.status",
+                        {"routine_id": routine_id, "run": failed_rtn},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                    )
             self._emit_presence(
                 bot_id,
                 state="error",
@@ -1035,22 +1433,53 @@ class AgentTurnRunner:
         bot: dict[str, Any],
         thread_id: str,
         query: str,
+        project_id: str | None = None,
     ) -> str | None:
         if self._memory_store is None:
             return None
         mem = self._memory_store
         bot_id = str(bot["id"])
-        project_id = str(bot.get("project_name") or "").strip() or None
+        resolved_project = (
+            project_id.strip()
+            if isinstance(project_id, str) and project_id.strip()
+            else (str(bot.get("project_name") or "").strip() or None)
+        )
         raw_section = ""
 
         try:
-            if hasattr(mem, "build_prompt_context"):
+            if hasattr(mem, "build_context_injection"):
+                access_ctx = MemoryAccessContext(
+                    user_id="operator",
+                    agent_role=bot_id,
+                    thread_id=thread_id,
+                    project_area=resolved_project,
+                )
+                bundle = mem.build_context_injection(access_ctx, query=query)
+                raw_section = str(getattr(bundle, "combined_text", "") or "")
+                if not raw_section.strip() and hasattr(mem, "search_memories"):
+                    hits = mem.search_memories(access_ctx, query, limit=8)
+                    lines: list[str] = ["[MEMORY CONTEXT]"]
+                    for item in list(hits or [])[:8]:
+                        if not isinstance(item, dict):
+                            continue
+                        kind = item.get("kind", "note")
+                        obs_at = item.get("observed_at", "")
+                        valid_until = item.get("valid_until", "")
+                        title = item.get("title", "")
+                        body = item.get("content", "")
+                        lines.append(
+                            f"[MEMORY kind={kind} observed_at={obs_at} valid_until={valid_until} "
+                            f"authority=advisory_only]\n{title}: {body}"
+                        )
+                    if len(lines) > 1:
+                        raw_section = "\n\n".join(lines)
+            elif hasattr(mem, "build_prompt_context"):
                 built = mem.build_prompt_context(
                     query=query,
                     user_id="operator",
                     agent_role=bot_id,
                     thread_id=thread_id,
-                    project_id=project_id,
+                    project_id=resolved_project,
                     max_chars=_MEMORY_PROMPT_MAX_CHARS,
                 )
                 raw_section = str(built or "")
@@ -1059,9 +1488,9 @@ class AgentTurnRunner:
                     query=query,
                     agent_role=bot_id,
                     thread_id=thread_id,
-                    project_id=project_id,
+                    project_id=resolved_project,
                 )
-                lines: list[str] = ["[MEMORY CONTEXT]"]
+                lines = ["[MEMORY CONTEXT]"]
                 for item in list(hits or [])[:8]:
                     if not isinstance(item, dict):
                         continue
@@ -1099,6 +1528,7 @@ class AgentTurnRunner:
         page_context_id: str | None = None,
         airlock_context: str | None = None,
         airlock_sanitize: Callable[[str], str] | None = None,
+        project_id: str | None = None,
     ) -> str:
         sections: list[str] = []
         role_prompt = str(bot.get("role_prompt", "")).strip()
@@ -1204,7 +1634,12 @@ class AgentTurnRunner:
         )
 
         # Memory placed right before [USER MESSAGE] so persona/skills prefix remains KV-cacheable
-        mem_section = self._build_memory_section(bot=bot, thread_id=thread_id, query=content)
+        mem_section = self._build_memory_section(
+            bot=bot,
+            thread_id=thread_id,
+            query=content,
+            project_id=project_id,
+        )
         if mem_section:
             if airlock_sanitize is not None:
                 mem_section = airlock_sanitize(mem_section)
@@ -1809,11 +2244,17 @@ class AgentTurnRunner:
                 content=f"Action blocked by safety floor: `{floor_violation}`.",
                 status="error",
             )
+            updated_blocked = (
+                self._store.update_message(str(blocked_msg["id"]), {"metadata": meta})
+                or {**blocked_msg, "metadata": meta}
+            )
+            if "metadata" not in updated_blocked:
+                updated_blocked = {**updated_blocked, "metadata": meta}
             self._event_bus.publish(
                 "message.completed",
                 {
-                    "message_id": blocked_msg["id"],
-                    "message": {**blocked_msg, "metadata": meta},
+                    "message_id": updated_blocked["id"],
+                    "message": updated_blocked,
                 },
                 bot_id=lead_id,
                 thread_id=thread_id,
@@ -3244,6 +3685,27 @@ class AgentTurnRunner:
         *,
         routine: dict[str, Any],
         run: dict[str, Any],
+        skip_auto_review: bool = False,
+    ) -> None:
+        if self._stopping:
+            return
+        try:
+            await self._execute_routine_bg(
+                routine=routine,
+                run=run,
+                skip_auto_review=skip_auto_review,
+            )
+        except sqlite3.ProgrammingError as exc:
+            if self._stopping and "closed database" in str(exc).lower():
+                return
+            raise
+
+    async def _execute_routine_bg(
+        self,
+        *,
+        routine: dict[str, Any],
+        run: dict[str, Any],
+        skip_auto_review: bool = False,
     ) -> None:
         routine_id = str(routine["id"])
         run_id = str(run["id"])
@@ -3267,6 +3729,98 @@ class AgentTurnRunner:
 
         thread_id = str(bot["thread_id"])
         instruction = str(routine["instruction"]).strip()
+
+        # Hard safety_floor check before anything executes
+        floor_violation = safety_floor("routine.prompt", {"prompt": instruction})
+        if floor_violation is not None:
+            self._policy_gateway.evaluate_and_record(
+                PolicyRequest(
+                    actor_id=bot_id,
+                    actor_role="bot",
+                    lane=Lane.GENERAL,
+                    tool_id="routine.prompt",
+                    action_kind="write",
+                    arguments={"prompt": instruction},
+                    task_id=run_id,
+                )
+            )
+            finished_at = utc_iso_now()
+            self._store.update_routine(routine_id, {"last_run_at": finished_at})
+            failed = self._store.update_routine_run(
+                run_id,
+                {
+                    "status": "failed",
+                    "error": f"Action blocked by safety floor: `{floor_violation}`.",
+                    "finished_at": finished_at,
+                },
+            )
+            self._event_bus.publish(
+                "routine.run.status",
+                {"routine_id": routine_id, "run": failed},
+                bot_id=bot_id,
+                thread_id=thread_id,
+            )
+            self._reset_routine_presence_idle(bot_id, thread_id, subtext="Blocked by safety floor")
+            return
+
+        # Auto-review ask_first check before invoking engines
+        if not skip_auto_review:
+            rules = self._store.list_auto_review_rules()
+            matched_rule = _match_ask_first_rule(instruction, rules)
+            if matched_rule is not None:
+                appr = self._store.create_approval(
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                    kind="ask_first",
+                    title=f"Confirm routine: {matched_rule[:120]}",
+                    target=f"routine:{routine_id}",
+                    risk_banner="This can't be undone",
+                    arguments={
+                        "routine_id": routine_id,
+                        "routine_run_id": run_id,
+                        "prompt": instruction[:500],
+                        "matched_rule": matched_rule,
+                    },
+                    allow_always_allowed=True,
+                    expires_in_minutes=30,
+                    pending_context={
+                        "routine_id": routine_id,
+                        "routine_run_id": run_id,
+                        "bot_id": bot_id,
+                        "thread_id": thread_id,
+                        "trigger": str(run.get("trigger") or "manual"),
+                        "skip_auto_review": True,
+                        "prompt": instruction,
+                    },
+                )
+                waiting_run = self._store.update_routine_run(
+                    run_id,
+                    {
+                        "status": "waiting_approval",
+                        "summary": f"Waiting for approval: {matched_rule[:120]}",
+                    },
+                )
+                self._event_bus.publish(
+                    "routine.run.status",
+                    {"routine_id": routine_id, "run": waiting_run},
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                )
+                self._emit_presence(
+                    bot_id,
+                    state="waiting_human",
+                    subtext="Waiting for approval (Ask First)",
+                    thread_id=thread_id,
+                    needs_attention=True,
+                )
+                self._event_bus.publish(
+                    "hitl.approval.requested",
+                    {"approval": appr},
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                )
+                return
+
         summary = ""
         error_msg: str | None = None
 
@@ -3337,6 +3891,8 @@ class AgentTurnRunner:
                                 "run_id": coord_run.run_id,
                                 "bot_id": bot_id,
                                 "thread_id": thread_id,
+                                "routine_id": routine_id,
+                                "routine_run_id": run_id,
                             },
                         )
                         self._event_bus.publish(
@@ -3346,6 +3902,22 @@ class AgentTurnRunner:
                             thread_id=thread_id,
                         )
                         req_act = snap.run.required_action or "input required"
+                        waiting_run = self._store.update_routine_run(
+                            run_id,
+                            {
+                                "status": "waiting_approval",
+                                "summary": (
+                                    f"Routine **{routine['name']}** paused for operator input "
+                                    f"(run `{coord_run.run_id}`): {req_act}."
+                                )[:1000],
+                            },
+                        )
+                        self._event_bus.publish(
+                            "routine.run.status",
+                            {"routine_id": routine_id, "run": waiting_run},
+                            bot_id=bot_id,
+                            thread_id=thread_id,
+                        )
                         self._emit_presence(
                             bot_id,
                             state="waiting_human",
@@ -3353,10 +3925,7 @@ class AgentTurnRunner:
                             thread_id=thread_id,
                             needs_attention=True,
                         )
-                        summary = (
-                            f"Routine **{routine['name']}** paused for operator input "
-                            f"(run `{coord_run.run_id}`): {req_act}."
-                        )
+                        return
                     elif snap is not None and snap.run.status == TaskStatus.FAILED:
                         error_msg = (
                             snap.result.answer
@@ -3377,7 +3946,12 @@ class AgentTurnRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            if self._stopping:
+                return
             error_msg = str(scrub_v1_payload(str(exc)))[:300]
+
+        if self._stopping:
+            return
 
         finished_at = utc_iso_now()
         self._store.update_routine(routine_id, {"last_run_at": finished_at})
@@ -3393,6 +3967,7 @@ class AgentTurnRunner:
                 bot_id=bot_id,
                 thread_id=thread_id,
             )
+            self._reset_routine_presence_idle(bot_id, thread_id, subtext="Routine failed")
             return
 
         message_id: str | None = None
@@ -3430,3 +4005,4 @@ class AgentTurnRunner:
             bot_id=bot_id,
             thread_id=thread_id,
         )
+        self._reset_routine_presence_idle(bot_id, thread_id, subtext="Idle")

@@ -7251,13 +7251,18 @@ def _format_printf_args(
             if stopped:
                 break
         if total_len > _SINGLE_PRINTF_MAX_CHARS:
+            if idx < n_fmt or arg_idx < len(rest):
+                unsupported = True
             if _char_budget is not None:
                 _char_budget[0] += total_len
                 if _char_budget[0] > _MAX_SHELL_EXPANDED_CHARS:
                     raise _ShellComplexityBudgetExceeded()
             break
         passes += 1
-        if fmt_stopped or stopped or not consumed_any or arg_idx >= len(rest) or passes >= 64:
+        if fmt_stopped or stopped or not consumed_any or arg_idx >= len(rest):
+            break
+        if passes >= 64:
+            unsupported = True
             break
     if _char_budget is not None:
         _char_budget[0] += total_len
@@ -7302,9 +7307,10 @@ def _expand_echo_or_printf_output(
     lines: list[str] = []
     for ln in re.split(r"[\n\r\x00]+", rendered):
         if ln:
-            lines.append(ln)
             if len(lines) >= 64:
+                unsupported = True
                 break
+            lines.append(ln)
     return lines, unsupported
 
 
@@ -8505,6 +8511,7 @@ def _extract_xargs_echo_samples(
     )
     samples: list[tuple[str | None, list[str]]] = []
     seen_lines: set[str] = set()
+    batch_count = 0
     has_unsupported = False
     for toks in expanded_prevs:
         if not toks:
@@ -8521,21 +8528,35 @@ def _extract_xargs_echo_samples(
             continue
         all_words: list[str] = []
         for ln in lines:
-            ln_words = [
+            raw_words = [
                 w.strip("\"'")
                 for w in ln.split()
                 if w.strip("\"'")
-            ][:64]
+            ]
+            if len(raw_words) > 64:
+                has_unsupported = True
+                ln_words = raw_words[:64]
+            else:
+                ln_words = raw_words
             if not ln_words:
                 ln_words = [ln]
             for w in ln_words:
-                if len(all_words) < 64:
-                    all_words.append(w)
-            if ln not in seen_lines and len(samples) < 64:
-                seen_lines.add(ln)
-                samples.append((ln, ln_words))
-        if len(lines) > 1 and all_words and len(samples) < 64:
-            samples.append((None, all_words))
+                if len(all_words) >= 64:
+                    has_unsupported = True
+                    break
+                all_words.append(w)
+            if ln not in seen_lines:
+                if len(seen_lines) < 64:
+                    seen_lines.add(ln)
+                    samples.append((ln, ln_words))
+                else:
+                    has_unsupported = True
+        if len(lines) > 1 and all_words:
+            if batch_count < 64:
+                samples.append((None, all_words))
+                batch_count += 1
+            else:
+                has_unsupported = True
     return samples, has_unsupported
 
 
@@ -8560,13 +8581,18 @@ def _find_group_upstream_echo_samples(
     visited = 0
     samples: list[tuple[str | None, list[str]]] = []
     seen_lines: set[str] = set()
+    batch_count = 0
     has_unsupported = False
-    while work and len(samples) < 64:
+    while work:
+        if len(seen_lines) >= 64:
+            has_unsupported = True
+            break
         visited += 1
         _step_budget[0] += 1
         if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
             raise _ShellComplexityBudgetExceeded()
         if visited > 64:
+            has_unsupported = True
             break
         s_pos, e_pos, cur_lvars = work.pop()
         u_s, u_e, _ = _unwrap_span_groups(text, s_pos, e_pos, pairs)
@@ -8663,11 +8689,17 @@ def _find_group_upstream_echo_samples(
                                     has_unsupported = True
                                 for line_s, w_list in sub_samples:
                                     if line_s is None:
-                                        if len(samples) < 64:
+                                        if batch_count < 64:
                                             samples.append((None, w_list))
-                                    elif line_s not in seen_lines and len(samples) < 64:
-                                        seen_lines.add(line_s)
-                                        samples.append((line_s, w_list))
+                                            batch_count += 1
+                                        else:
+                                            has_unsupported = True
+                                    elif line_s not in seen_lines:
+                                        if len(seen_lines) < 64:
+                                            seen_lines.add(line_s)
+                                            samples.append((line_s, w_list))
+                                        else:
+                                            has_unsupported = True
                                 break
                             if up_cmd in _STDIN_PASSTHROUGH_CMDS:
                                 continue
@@ -9163,7 +9195,12 @@ def _check_deobfuscated_commands_impl(
                         if running_upstream_critical_path is not None
                         else inherited_active_crit
                     )
-                    if "xargs" in segment_source[sg_s:sg_e].lower():
+                    sub_slice_low = segment_source[sg_s:sg_e].lower()
+                    if "xargs" in sub_slice_low or (
+                        "x" in sub_slice_low
+                        and "rgs" in sub_slice_low
+                        and any(q in sub_slice_low for q in ("'", '"', "\\", "$"))
+                    ):
                         sg_echo, sg_unsup = _collect_upstream_xargs_echo_samples(
                             segment_source,
                             sg_stage_idx,
@@ -9501,8 +9538,10 @@ def _check_deobfuscated_commands_impl(
                                     return explicit_violation
                                 if (has_rec or has_frc) and upstream_critical_path is not None:
                                     return "safety_floor:destructive_rm_root_or_glob"
-                                if not (has_rec or has_frc) and (
-                                    stage_idx > 0 or inherited_echo_samples is not None
+                                if (
+                                    stage_idx > 0
+                                    or inherited_echo_samples is not None
+                                    or inherited_echo_unsupported
                                 ):
                                     echo_samples, echo_unsupported = (
                                         _collect_upstream_xargs_echo_samples(
@@ -9524,16 +9563,43 @@ def _check_deobfuscated_commands_impl(
                                     )
                                     if echo_unsupported:
                                         return "safety_floor:shell_complexity_budget_exceeded"
-                                    for _, w_list in echo_samples:
-                                        if w_list:
-                                            comb_rec, comb_frc, comb_tgts = _parse_rm_tokens(
-                                                [*xargs_inner[1:], *w_list]
-                                            )
-                                            comb_viol = _check_rm_targets(
-                                                comb_rec, comb_frc, comb_tgts
-                                            )
-                                            if comb_viol is not None:
-                                                return comb_viol
+                                    has_placeholder = xargs_replace_str is not None or any(
+                                        "{}" in tok for tok in xargs_inner
+                                    )
+                                    for line_s, w_list in echo_samples:
+                                        if has_placeholder:
+                                            if line_s is None:
+                                                continue
+                                            rm_args = [
+                                                (
+                                                    _bounded_str_replace(
+                                                        _bounded_str_replace(
+                                                            tok, "{}", line_s, _char_budget
+                                                        ),
+                                                        xargs_replace_str,
+                                                        line_s,
+                                                        _char_budget,
+                                                    )
+                                                    if (
+                                                        xargs_replace_str
+                                                        and xargs_replace_str != "{}"
+                                                    )
+                                                    else _bounded_str_replace(
+                                                        tok, "{}", line_s, _char_budget
+                                                    )
+                                                )
+                                                for tok in xargs_inner[1:]
+                                            ]
+                                        elif w_list:
+                                            rm_args = [*xargs_inner[1:], *w_list]
+                                        else:
+                                            continue
+                                        comb_rec, comb_frc, comb_tgts = _parse_rm_tokens(rm_args)
+                                        comb_viol = _check_rm_targets(
+                                            comb_rec, comb_frc, comb_tgts
+                                        )
+                                        if comb_viol is not None:
+                                            return comb_viol
                             elif (
                                 is_xargs_shell
                                 and (script_idx := _find_sh_c_script_index(xargs_inner))
@@ -9543,7 +9609,11 @@ def _check_deobfuscated_commands_impl(
                                     if _truncated_out is not None:
                                         _truncated_out[0] = True
                                     return "safety_floor:shell_complexity_budget_exceeded"
-                                if stage_idx > 0 or inherited_echo_samples is not None:
+                                if (
+                                    stage_idx > 0
+                                    or inherited_echo_samples is not None
+                                    or inherited_echo_unsupported
+                                ):
                                     echo_samples, echo_unsupported = (
                                         _collect_upstream_xargs_echo_samples(
                                             segment_source,
@@ -9696,7 +9766,9 @@ def _check_deobfuscated_commands_impl(
                                         return sub_violation
                             else:
                                 if needs_upstream and (
-                                    stage_idx > 0 or inherited_echo_samples is not None
+                                    stage_idx > 0
+                                    or inherited_echo_samples is not None
+                                    or inherited_echo_unsupported
                                 ):
                                     echo_samples, echo_unsupported = (
                                         _collect_upstream_xargs_echo_samples(

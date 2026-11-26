@@ -331,7 +331,13 @@ class LaneRouter:
         has_excel_kw = any(kw in q_low for kw in _EXCEL_KEYWORDS)
         has_ambiguous_bare_num = _BARE_ASSET_NUMBER_RE.search(clean_query) is not None
 
-        has_industrial = has_tag or has_ind_kw or bool(candidates)
+        has_strong_candidate = any(c.score > 0.75 for c in candidates)
+        has_industrial = (
+            has_tag
+            or has_ind_kw
+            or has_strong_candidate
+            or (effective_area is not None and bool(candidates))
+        )
         has_external_general = has_web_kw or has_excel_kw
 
         # Stage 1: Mixed (Industrial + Web/Replacement/Excel)
@@ -379,7 +385,7 @@ class LaneRouter:
             )
 
         # Ambiguous bare numeric plant fragment (e.g. "revisa el 34") without clear context
-        if has_ambiguous_bare_num and not candidates:
+        if has_ambiguous_bare_num and not has_industrial and not has_external_general:
             return RouteDecision(
                 lane=Lane.INDUSTRIAL,
                 domain_profile="industrial_ot",
@@ -387,6 +393,7 @@ class LaneRouter:
                 required_verifiers=("industrial_reconciler",),
                 verdict_override=VerdictState.NEEDS_CLARIFICATION,
                 needs_clarification=True,
+                clarification_candidates=tuple(candidates),
                 general_fallback_available=True,
                 stage_used="stage1_lexical",
                 rationale="Ambiguous numeric reference without asset or area context.",

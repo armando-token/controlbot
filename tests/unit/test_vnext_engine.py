@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import ValidationError
-from src.adapters.config import AreaConfig, AssetMapping, FacilityConfig
+from src.adapters.config import AreaConfig, AssetMapping, FacilityConfig, load_facility_config
 from src.adapters.office_excel import (
     ExcelCellSpec,
     ExcelSheetSpec,
@@ -4374,5 +4374,220 @@ def test_safety_floor_depth_fail_closed_printf_passthrough_and_chmod_modes() -> 
         signal.signal(signal.SIGALRM, prev_handler)
 
 
+@pytest.mark.n1
+def test_safety_floor_xargs_rm_rf_unsupported_and_64_truncation_fail_closed() -> None:
+    """Regression coverage for r25 xargs rm -rf echo_unsupported & 64-item truncation fixes."""
+    gw = PolicyGateway(
+        PolicySet(
+            policy_version="2.0",
+            rules=(
+                PolicyRule(
+                    rule_id="allow-general-write",
+                    effect="allow",
+                    action_pattern=r"bash\.exec",
+                    lanes=(Lane.GENERAL,),
+                    max_risk="write",
+                ),
+            ),
+        )
+    )
 
+    a65 = " ".join(f"a{i}" for i in range(65))
+    a64 = " ".join(f"a{i}" for i in range(64))
+    a63 = " ".join(f"a{i}" for i in range(63))
+    a128 = " ".join(f"a{i}" for i in range(128))
+    nl65 = "\\n".join(f"a{i}" for i in range(65))
+
+    def _alarm_handler(_signum: int, _frame: Any) -> None:
+        raise TimeoutError("SIGALRM 2s")
+
+    prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    try:
+        blocked_cases = (
+            (
+                "XARGS_RM_RF_PRINTF_TIME",
+                r"printf '%(%Y)T\n' | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_RM_RF_PRINTF_TRAIL_PCT",
+                r"printf '%\n' | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_RM_RF_PRINTF_STAR_SAFE",
+                r"printf '%*s\n' 1 safe | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_RM_RF_SUBSHELL_PRINTF_TIME",
+                r"(printf '%(%Y)T\n') | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_RM_RF_CAT_PRINTF_TIME",
+                r"printf '%(%Y)T\n' | cat | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_I_RM_RF_PRINTF_TIME",
+                r"printf '%(%Y)T\n' | xargs -I% rm -rf %",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_PRINTF_65_ARGS_GIT_FORCE",
+                f"printf '%s\\n' {a65} --force | xargs -I% git push % origin main",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_ECHO_65_LINES_GIT_FORCE",
+                f"echo -e '{nl65}\\n--force' | xargs -I% git push % origin main",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_PRINTF_65_ARGS_RM_RF",
+                f"printf '%s\\n' {a65} / | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_ECHO_65_LINES_RM_RF",
+                f"echo -e '{nl65}\\n/' | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_ECHO_65_WORDS_GIT_FORCE",
+                f"echo {a65} --force | xargs git push",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_RM_RF_SUBSHELL_CAT_PRINTF_TIME",
+                r"(printf '%(%Y)T\n') | (cat | xargs rm -rf)",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_RM_RF_OBFUS_SUBSHELL_PRINTF_TIME",
+                r"(printf '%(%Y)T\n') | (x'a'rgs rm -rf)",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_SUBSHELL_PRINTF_65_GIT_FORCE",
+                f"(printf '%s\\n' {a65} --force) | xargs -I% git push % origin main",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_BRACE_CAT_PRINTF_65_RM_RF",
+                f"{{ printf '%s\\n' {a65} /; }} | cat | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_GROUP_SIBLING_OVER_64_GIT_FORCE",
+                f"((printf '%s\\n' {a64}); (echo --force)) | xargs -I% git push % origin main",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_PRINTF_128_WORDS_RM_RF",
+                f"printf '%s %s\\n' {a128} | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_PRINTF_B_65_LINES_RM_RF",
+                f"printf '%b\\n' '{nl65}\\n/' | xargs rm -rf",
+                "safety_floor:shell_complexity_budget_exceeded",
+            ),
+            (
+                "XARGS_I_RM_RF_PREFIX_ETC",
+                "echo etc | xargs -I% rm -rf /%",
+                "safety_floor:destructive_rm_root_or_glob",
+            ),
+        )
+        for label, cmd, expected_violation in blocked_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert not dec.allowed, (label, call_mode)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 1.0, (label, call_mode)
+                assert res == expected_violation, (label, call_mode, res)
+
+        benign_cases = (
+            ("BENIGN_PRINTF_65_LS", f"printf '%s\\n' {a65} | xargs ls"),
+            ("BENIGN_PRINTF_STAR_LS", r"printf '%*s\n' 1 ok | xargs ls"),
+            ("BENIGN_ECHO_TMP_RM_RF", "echo /tmp/work | xargs rm -rf"),
+            ("BENIGN_PRINTF_64_TMP_RM_RF", f"printf '%s\\n' {a63} /tmp/work | xargs rm -rf"),
+            (
+                "BENIGN_BRACE_PRINTF_64_TMP_RM_RF",
+                f"{{ printf '%s\\n' {a63} /tmp/work; }} | xargs rm -rf",
+            ),
+            ("BENIGN_ECHO_65_WC", f"echo {a65} | xargs wc -l"),
+            (
+                "BENIGN_SUBSHELL_OVERRIDE_RM_RF",
+                "(echo /) | (echo /tmp/work | cat | xargs rm -rf)",
+            ),
+            ("BENIGN_PRINTF_128_WORDS_LS", f"printf '%s %s\\n' {a128} | xargs ls"),
+        )
+        for label, cmd in benign_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert dec.allowed, (label, call_mode, dec)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 1.0, (label, call_mode)
+                assert res is None, (label, call_mode, res)
+    finally:
+        signal.signal(signal.SIGALRM, prev_handler)
+
+
+@pytest.mark.n1
+async def test_lane_router_bare_number_revisa_el_34_needs_clarification() -> None:
+    cfg = load_facility_config(Path("lab/configs/facility_a.json"))
+    router = LaneRouter()
+
+    d_bare = await router.route("revisa el 34", facility_config=cfg)
+    assert d_bare.needs_clarification is True
+    assert d_bare.verdict_override == VerdictState.NEEDS_CLARIFICATION
+    assert [c.asset_id for c in d_bare.clarification_candidates] == ["bomba-34-a1"]
+
+    d_area = await router.route("revisa el 34 en area-1", facility_config=cfg)
+    assert d_area.lane == Lane.INDUSTRIAL
+    assert d_area.needs_clarification is False
+
+    d_noun = await router.route("bomba 34", facility_config=cfg)
+    assert d_noun.lane == Lane.INDUSTRIAL
+    assert d_noun.needs_clarification is False
 

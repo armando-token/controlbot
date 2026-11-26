@@ -15,6 +15,17 @@ import subprocess
 import termios
 from pathlib import Path
 
+_JOB_CONTROL_SIGS: frozenset[int] = frozenset(
+    {int(signal.SIGINT), int(signal.SIGTSTP), int(signal.SIGQUIT)}
+)
+
+
+def _setup_controlling_tty() -> None:
+    os.setsid()
+    tiocsctty = getattr(termios, "TIOCSCTTY", None)
+    if isinstance(tiocsctty, int):
+        fcntl.ioctl(0, tiocsctty, 0)
+
 
 def _default_shell() -> str:
     zsh_path = Path("/bin/zsh")
@@ -58,7 +69,7 @@ class LiveTerminalSession:
                     stderr=slave_fd,
                     cwd=str(cwd),
                     env=env,
-                    start_new_session=True,
+                    preexec_fn=_setup_controlling_tty,
                     close_fds=True,
                 )
             finally:
@@ -190,6 +201,16 @@ class LiveTerminalSession:
                 if candidate > 0:
                     fg_pgrp = candidate
 
+        if sig in _JOB_CONTROL_SIGS:
+            if fg_pgrp is not None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(fg_pgrp, sig)
+                    delivered = True
+            if not delivered and sig == int(signal.SIGINT):
+                self.write("\x03")
+                delivered = True
+            return delivered
+
         if proc is not None and proc.poll() is None:
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.killpg(proc.pid, sig)
@@ -203,9 +224,6 @@ class LiveTerminalSession:
                 os.killpg(fg_pgrp, sig)
                 delivered = True
 
-        if not delivered and sig == int(signal.SIGINT):
-            self.write("\x03")
-            delivered = True
         return delivered
 
     def resize(self, *, cols: int, rows: int) -> None:

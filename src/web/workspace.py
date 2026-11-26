@@ -96,7 +96,7 @@ def list_local_projects(projects_root: Path) -> list[dict[str, Any]]:
             if not resolved.is_dir() or not resolved.is_relative_to(resolved_root):
                 continue
             mtime = resolved.stat().st_mtime
-        except OSError:
+        except (OSError, RuntimeError):
             continue
 
         updated_iso = datetime.fromtimestamp(mtime, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -127,8 +127,11 @@ def resolve_project_dir(projects_root: Path, project_name: str) -> Path:
         raise ValueError(f"Invalid project_name: {project_name!r}")
     if not projects_root.is_dir():
         raise ValueError(f"Projects root directory does not exist: {projects_root}")
-    resolved_root = projects_root.resolve()
-    candidate = (projects_root / cleaned).resolve()
+    try:
+        resolved_root = projects_root.resolve()
+        candidate = (projects_root / cleaned).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping project path: {project_name!r}") from exc
     if not candidate.is_relative_to(resolved_root) or candidate == resolved_root:
         raise ValueError(f"Project path escapes projects root: {project_name!r}")
     if not candidate.is_dir():
@@ -201,7 +204,7 @@ def list_agy_conversations(brain_root: Path, *, limit: int = 25) -> list[dict[st
             if not transcript.is_file():
                 continue
             stat = transcript.stat()
-        except OSError:
+        except (OSError, RuntimeError):
             continue
 
         preview, is_user = _extract_transcript_preview(transcript)
@@ -614,6 +617,10 @@ async def stream_agy_prompt(
             proc.kill()
             with contextlib.suppress(Exception):
                 await proc.wait()
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.close()
         if not stderr_task.done():
             stderr_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -679,6 +686,10 @@ async def list_agy_models(*, force_refresh: bool = False) -> list[dict[str, Any]
     return [dict(item) for item in parsed]
 
 
+def _has_git_segment(path: Path) -> bool:
+    return any(part.lower() == ".git" for part in path.parts)
+
+
 def _resolve_relative_project_path(
     project_dir: Path,
     rel_path: str,
@@ -690,20 +701,44 @@ def _resolve_relative_project_path(
         return project_dir
     if "\x00" in cleaned or "\\" in cleaned:
         raise ValueError(f"Invalid relative path: {rel_path!r}")
-    parts = Path(cleaned).parts
+    rel_obj = Path(cleaned)
+    parts = rel_obj.parts
     if any(part in {".", ".."} for part in parts):
         raise ValueError(f"Relative path traversal forbidden: {rel_path!r}")
-    resolved_root = project_dir.resolve()
+    if _has_git_segment(rel_obj):
+        raise ValueError("Access to .git metadata is restricted.")
+    try:
+        resolved_root = project_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
     if follow_symlinks:
-        candidate = (resolved_root / cleaned).resolve()
+        try:
+            candidate = (resolved_root / cleaned).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
         if not candidate.is_relative_to(resolved_root):
             raise ValueError(f"Path escapes project root: {rel_path!r}")
+        if _has_git_segment(candidate.relative_to(resolved_root)):
+            raise ValueError("Access to .git metadata is restricted.")
         return candidate
-    rel_obj = Path(cleaned)
-    resolved_parent = (resolved_root / rel_obj.parent).resolve()
+    try:
+        resolved_parent = (resolved_root / rel_obj.parent).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
     if not resolved_parent.is_relative_to(resolved_root):
         raise ValueError(f"Path escapes project root: {rel_path!r}")
-    return resolved_parent / rel_obj.name
+    if _has_git_segment(resolved_parent.relative_to(resolved_root)):
+        raise ValueError("Access to .git metadata is restricted.")
+    candidate = resolved_parent / rel_obj.name
+    try:
+        resolved_target = candidate.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
+    if not resolved_target.is_relative_to(resolved_root):
+        raise ValueError(f"Path escapes project root: {rel_path!r}")
+    if _has_git_segment(resolved_target.relative_to(resolved_root)):
+        raise ValueError("Access to .git metadata is restricted.")
+    return candidate
 
 
 def _is_sensitive_filename(path: Path) -> bool:
@@ -746,11 +781,15 @@ def list_project_files(
     if not target_dir.is_dir():
         raise ValueError(f"Directory not found inside {project_name}: {rel_path!r}")
 
-    resolved_root = project_dir.resolve()
+    try:
+        resolved_root = project_dir.resolve()
+        resolved_target_dir = target_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
     rel_clean = (
         ""
-        if target_dir.resolve() == resolved_root
-        else target_dir.resolve().relative_to(resolved_root).as_posix()
+        if resolved_target_dir == resolved_root
+        else resolved_target_dir.relative_to(resolved_root).as_posix()
     )
     parent_path = ""
     if rel_clean:
@@ -770,8 +809,11 @@ def list_project_files(
             resolved_child = child.resolve()
             if not resolved_child.is_relative_to(resolved_root):
                 continue
+            rel_parts = resolved_child.relative_to(resolved_root).parts
+            if any(part in _SKIP_DIR_NAMES or part.lower() == ".git" for part in rel_parts):
+                continue
             stat = resolved_child.stat()
-        except OSError:
+        except (OSError, RuntimeError):
             continue
         is_dir = resolved_child.is_dir()
         child_rel = resolved_child.relative_to(resolved_root).as_posix()
@@ -807,8 +849,22 @@ def read_project_file(
     if not rel_path.strip():
         raise ValueError("rel_path must not be empty.")
     project_dir = resolve_project_dir(projects_root, project_name)
+    rel_clean_obj = Path(rel_path.strip().lstrip("/"))
     target = _resolve_relative_project_path(project_dir, rel_path)
-    if _is_sensitive_filename(target) or _is_sensitive_filename(Path(rel_path.strip().lstrip("/"))):
+    try:
+        resolved_root = project_dir.resolve()
+        resolved_target = target.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid or escaping path: {rel_path!r}") from exc
+    if _has_git_segment(rel_clean_obj) or _has_git_segment(
+        resolved_target.relative_to(resolved_root)
+    ):
+        raise ValueError("Access to .git metadata is restricted.")
+    if (
+        _is_sensitive_filename(target)
+        or _is_sensitive_filename(rel_clean_obj)
+        or _is_sensitive_filename(resolved_target)
+    ):
         raise ValueError(f"Access to sensitive file {target.name!r} is restricted.")
     if not target.is_file():
         raise ValueError(f"File not found inside {project_name}: {rel_path!r}")
@@ -826,7 +882,7 @@ def read_project_file(
         scrubbed = "[REDACTED]"
     return {
         "project": project_name,
-        "rel_path": target.resolve().relative_to(project_dir.resolve()).as_posix(),
+        "rel_path": resolved_target.relative_to(resolved_root).as_posix(),
         "size_bytes": total_size,
         "truncated": truncated,
         "content": scrubbed,

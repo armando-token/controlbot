@@ -176,9 +176,17 @@ def create_memory_router(memory_store: MemoryStore) -> APIRouter:
         effective_role = (
             _clean_identity(x_actor_role)
             or _clean_identity(actor_role)
-            or _clean_identity(payload.actor_role)
             or "Operator"
         )
+        if (
+            "actor_role" in payload.model_fields_set
+            and (payload.actor_role or "").strip().lower() == "manager"
+            and effective_role.strip().lower() != "manager"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot elevate actor_role to Manager via request body.",
+            )
         try:
             norm_scope = normalize_scope(payload.scope)
         except MemoryValidationError as exc:
@@ -258,9 +266,17 @@ def create_memory_router(memory_store: MemoryStore) -> APIRouter:
         effective_role = (
             _clean_identity(x_actor_role)
             or _clean_identity(actor_role)
-            or _clean_identity(payload.actor_role)
             or "Operator"
         )
+        if (
+            "actor_role" in payload.model_fields_set
+            and (payload.actor_role or "").strip().lower() == "manager"
+            and effective_role.strip().lower() != "manager"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot elevate actor_role to Manager via request body.",
+            )
         ctx = _build_access_ctx(
             user_id=_clean_identity(x_user_id) or _clean_identity(user_id),
             agent_role=_clean_identity(x_agent_role) or _clean_identity(agent_role),

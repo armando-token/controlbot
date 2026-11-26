@@ -392,6 +392,7 @@ class WorkspaceStore:
                 artifacts_json TEXT NOT NULL DEFAULT '[]',
                 reactions_json TEXT NOT NULL DEFAULT '{}',
                 memory_diffs_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 conversation_id TEXT,
                 model_id TEXT,
                 status TEXT NOT NULL DEFAULT 'done',
@@ -642,6 +643,13 @@ class WorkspaceStore:
                 """,
                 (now,),
             )
+            msg_cols = {
+                str(r[1]) for r in conn.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            if "metadata_json" not in msg_cols:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';"
+                )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
     def _seed_defaults(self) -> None:
@@ -1004,6 +1012,13 @@ class WorkspaceStore:
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            raw_meta = row["metadata_json"]
+        except (IndexError, KeyError):
+            raw_meta = "{}"
+        parsed_meta = _loads_json(raw_meta, {})
+        if not isinstance(parsed_meta, dict):
+            parsed_meta = {}
         return {
             "id": str(row["id"]),
             "thread_id": str(row["thread_id"]),
@@ -1019,6 +1034,7 @@ class WorkspaceStore:
             "artifacts": _loads_json(row["artifacts_json"], []),
             "reactions": _loads_json(row["reactions_json"], {}),
             "memory_diffs": _loads_json(row["memory_diffs_json"], []),
+            "metadata": parsed_meta,
             "conversation_id": row["conversation_id"],
             "model_id": row["model_id"],
             "status": str(row["status"]),
@@ -1992,9 +2008,11 @@ class WorkspaceStore:
         reply_to_id: str | None = None,
         mentions: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        attachment_ids: list[str] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
         memory_diffs: list[dict[str, Any]] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         conversation_id: str | None = None,
         model_id: str | None = None,
         status: str = "done",
@@ -2006,17 +2024,61 @@ class WorkspaceStore:
         safe_tools = scrub_v1_payload(tool_calls or [])
         safe_artifacts = scrub_v1_payload(artifacts or [])
         safe_diffs = scrub_v1_payload(memory_diffs or [])
+        safe_metadata = scrub_v1_payload(dict(metadata) if isinstance(metadata, Mapping) else {})
         with self.write_tx() as conn:
+            resolved_attachments: list[dict[str, Any]] = []
+            seen_att_ids: set[str] = set()
+            for att in attachments or []:
+                if not isinstance(att, Mapping):
+                    continue
+                raw_id = att.get("id")
+                att_id_str = str(raw_id).strip() if raw_id is not None else ""
+                if att_id_str:
+                    att_row = conn.execute(
+                        "SELECT id, filename, mime_type, size_bytes FROM attachments WHERE id = ?",
+                        (att_id_str,),
+                    ).fetchone()
+                    if att_row is None or att_id_str in seen_att_ids:
+                        continue
+                    seen_att_ids.add(att_id_str)
+                    resolved_attachments.append(
+                        {
+                            "id": str(att_row["id"]),
+                            "filename": str(att_row["filename"]),
+                            "mime_type": str(att_row["mime_type"]),
+                            "size_bytes": int(att_row["size_bytes"]),
+                        }
+                    )
+                else:
+                    resolved_attachments.append(dict(att))
+            for req_att_id in attachment_ids or []:
+                clean_att_id = str(req_att_id).strip()
+                if not clean_att_id or clean_att_id in seen_att_ids:
+                    continue
+                att_row = conn.execute(
+                    "SELECT id, filename, mime_type, size_bytes FROM attachments WHERE id = ?",
+                    (clean_att_id,),
+                ).fetchone()
+                if att_row is not None:
+                    seen_att_ids.add(clean_att_id)
+                    resolved_attachments.append(
+                        {
+                            "id": str(att_row["id"]),
+                            "filename": str(att_row["filename"]),
+                            "mime_type": str(att_row["mime_type"]),
+                            "size_bytes": int(att_row["size_bytes"]),
+                        }
+                    )
             conn.execute(
                 """
                 INSERT INTO messages (
                     id, thread_id, sender_type, sender_bot_id, sender_name,
                     content, thinking_text, reply_to_id, mentions_json,
                     attachments_json, tool_calls_json, artifacts_json,
-                    reactions_json, memory_diffs_json, conversation_id,
-                    model_id, status, created_at
+                    reactions_json, memory_diffs_json, metadata_json,
+                    conversation_id, model_id, status, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -2029,10 +2091,11 @@ class WorkspaceStore:
                     safe_thinking,
                     reply_to_id,
                     json.dumps(mentions or []),
-                    json.dumps(attachments or []),
+                    json.dumps(resolved_attachments),
                     json.dumps(safe_tools),
                     json.dumps(safe_artifacts),
                     json.dumps(safe_diffs),
+                    json.dumps(safe_metadata),
                     conversation_id,
                     model_id,
                     status,
@@ -2059,6 +2122,7 @@ class WorkspaceStore:
                 "artifacts": "artifacts_json",
                 "reactions": "reactions_json",
                 "memory_diffs": "memory_diffs_json",
+                "metadata": "metadata_json",
             }
             plain_cols = {"content", "thinking_text", "conversation_id", "model_id", "status"}
             for key, value in updates.items():
@@ -2071,7 +2135,19 @@ class WorkspaceStore:
                     )
                 elif key in json_map:
                     cols.append(f"{json_map[key]} = ?")
-                    vals.append(json.dumps(scrub_v1_payload(value)))
+                    if key == "metadata":
+                        if isinstance(value, str):
+                            parsed_val = _loads_json(value, {})
+                            norm_val: dict[str, Any] = (
+                                dict(parsed_val) if isinstance(parsed_val, Mapping) else {}
+                            )
+                        elif isinstance(value, Mapping):
+                            norm_val = dict(value)
+                        else:
+                            norm_val = {}
+                        vals.append(json.dumps(scrub_v1_payload(norm_val)))
+                    else:
+                        vals.append(json.dumps(scrub_v1_payload(value)))
             if cols:
                 vals.append(message_id)
                 conn.execute(f"UPDATE messages SET {', '.join(cols)} WHERE id = ?", vals)
@@ -2373,28 +2449,62 @@ class WorkspaceStore:
 
             unreferenced_path: str | None = None
             url = str(art.get("url") or "")
-            if url.startswith("/api/v1/attachments/"):
-                att_id = url.rsplit("/", 1)[-1]
-                other_refs = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM artifacts WHERE url = ?", (url,)
-                    ).fetchone()[0]
-                )
-                if other_refs == 0:
-                    att_row = conn.execute(
-                        "SELECT storage_path FROM attachments WHERE id = ?", (att_id,)
-                    ).fetchone()
-                    if att_row is not None:
-                        storage_path = str(att_row["storage_path"])
-                        conn.execute("DELETE FROM attachments WHERE id = ?", (att_id,))
-                        path_refs = int(
-                            conn.execute(
-                                "SELECT COUNT(*) FROM attachments WHERE storage_path = ?",
-                                (storage_path,),
-                            ).fetchone()[0]
-                        )
-                        if path_refs == 0:
-                            unreferenced_path = storage_path
+            base_url = url.split("?", 1)[0].split("#", 1)[0].strip().rstrip("/")
+            if base_url.startswith("/api/v1/attachments/"):
+                att_id = base_url.rsplit("/", 1)[-1].strip()
+                if att_id:
+                    escaped_base = _escape_like(base_url)
+                    other_refs = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM artifacts WHERE "
+                            "url = ? OR url LIKE ? ESCAPE '\\' "
+                            "OR url = ? OR url LIKE ? ESCAPE '\\' "
+                            "OR url LIKE ? ESCAPE '\\'",
+                            (
+                                base_url,
+                                f"{escaped_base}?%",
+                                f"{base_url}/",
+                                f"{escaped_base}/?%",
+                                f"{escaped_base}#%",
+                            ),
+                        ).fetchone()[0]
+                    )
+                    bound_in_messages = False
+                    if other_refs == 0:
+                        like_pat = f"%{_escape_like(att_id)}%"
+                        msg_rows = conn.execute(
+                            "SELECT attachments_json FROM messages "
+                            "WHERE attachments_json LIKE ? ESCAPE '\\'",
+                            (like_pat,),
+                        ).fetchall()
+                        for mrow in msg_rows:
+                            parsed_atts = _loads_json(mrow["attachments_json"], [])
+                            if not isinstance(parsed_atts, list):
+                                continue
+                            for att_item in parsed_atts:
+                                if (
+                                    isinstance(att_item, Mapping)
+                                    and str(att_item.get("id") or "") == att_id
+                                ) or (isinstance(att_item, str) and att_item == att_id):
+                                    bound_in_messages = True
+                                    break
+                            if bound_in_messages:
+                                break
+                    if other_refs == 0 and not bound_in_messages:
+                        att_row = conn.execute(
+                            "SELECT storage_path FROM attachments WHERE id = ?", (att_id,)
+                        ).fetchone()
+                        if att_row is not None:
+                            storage_path = str(att_row["storage_path"])
+                            conn.execute("DELETE FROM attachments WHERE id = ?", (att_id,))
+                            path_refs = int(
+                                conn.execute(
+                                    "SELECT COUNT(*) FROM attachments WHERE storage_path = ?",
+                                    (storage_path,),
+                                ).fetchone()[0]
+                            )
+                            if path_refs == 0:
+                                unreferenced_path = storage_path
 
             self.append_audit_event(
                 actor="operator",

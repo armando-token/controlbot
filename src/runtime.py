@@ -523,16 +523,45 @@ def _resolve_single_query_area(
     return None
 
 
+_NON_AREA_APPROVAL_TOKENS: frozenset[str] = frozenset(
+    {
+        "allow_once",
+        "always_allow",
+        "allow_always",
+        "deny",
+        "skip",
+        "approve",
+        "approved",
+        "reject",
+        "rejected",
+        "ok",
+        "yes",
+        "no",
+        "continue",
+        "proceed",
+        "reauthenticated",
+    }
+)
+
+
 def _resolve_area_from_human_input(
     human_input: Mapping[str, Any] | None,
     config: FacilityConfig,
 ) -> str | None:
     if not human_input:
         return None
+    known_areas: set[str] = set(config.areas.keys()) | {
+        a.area for a in config.assets if a.area
+    }
     for key in ("area", "choice"):
         raw_val = human_input.get(key)
-        if isinstance(raw_val, str) and raw_val.strip():
-            return raw_val.strip()
+        if isinstance(raw_val, str):
+            cand = raw_val.strip()
+            if not cand or cand.lower() in _NON_AREA_APPROVAL_TOKENS:
+                continue
+            if key == "choice" and known_areas and cand not in known_areas:
+                continue
+            return cand
     raw_asset_id = human_input.get("asset_id")
     if isinstance(raw_asset_id, str) and raw_asset_id.strip():
         target_id = raw_asset_id.strip()

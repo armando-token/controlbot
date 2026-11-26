@@ -39,6 +39,22 @@ _QUERY_SECRET_RE = re.compile(
 )
 
 
+_EXTRA_SENSITIVE_KEYS: frozenset[str] = frozenset(
+    {
+        "secret_value",
+        "vault_value",
+        "passphrase",
+        "private_pem",
+    }
+)
+_EXTRA_SENSITIVE_SUFFIXES: tuple[str, ...] = (
+    "_secret_value",
+    "_vault_value",
+    "_passphrase",
+    "_private_pem",
+)
+
+
 def _camel_to_snake(key: str) -> str:
     step1 = _CAMEL_BOUNDARY_2.sub(r"\1_\2", key.strip())
     step2 = _CAMEL_BOUNDARY_1.sub(r"\1_\2", step1)
@@ -50,7 +66,9 @@ def is_sensitive_key_strict(key: str) -> bool:
     if is_sensitive_key(key):
         return True
     snake = _camel_to_snake(key)
-    return is_sensitive_key(snake)
+    if is_sensitive_key(snake):
+        return True
+    return snake in _EXTRA_SENSITIVE_KEYS or snake.endswith(_EXTRA_SENSITIVE_SUFFIXES)
 
 
 def redact_string_strict(value: str) -> str:

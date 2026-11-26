@@ -6,7 +6,7 @@ doctor:
 	$(UV) run python -m src.doctor
 
 test-n1:
-	$(UV) run pytest tests/unit -m "not n2 and not n3"
+	$(UV) run pytest tests/unit tests/integration -m "not n2 and not n3"
 
 test:
 	$(MAKE) test-n1 && $(MAKE) test-n2 && $(MAKE) test-acceptance
