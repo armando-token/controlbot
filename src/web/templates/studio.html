@@ -520,6 +520,10 @@
               <input id="show-hydrogen-check" type="checkbox">
               <span>Mostrar Hydrogen</span>
             </label>
+            <label title="Envía automáticamente la URL y contenido visible del Navegador en Vivo a Antigravity">
+              <input id="share-browser-check" type="checkbox" checked>
+              <span id="share-browser-label">Ver navegador vivo (apagado)</span>
+            </label>
             <span id="agy-context-label" style="margin-left:auto;color:var(--text-muted);"></span>
           </div>
           <div id="plant-composer-controls" class="composer-controls" style="display:none;">
@@ -694,6 +698,8 @@
         agyModelSelect: document.getElementById("agy-model-select"),
         refreshModelsBtn: document.getElementById("refresh-models-btn"),
         showHydrogenCheck: document.getElementById("show-hydrogen-check"),
+        shareBrowserCheck: document.getElementById("share-browser-check"),
+        shareBrowserLabel: document.getElementById("share-browser-label"),
         agyContextLabel: document.getElementById("agy-context-label"),
         plantComposerControls: document.getElementById("plant-composer-controls"),
         areaSelect: document.getElementById("area-select"),
@@ -1015,11 +1021,21 @@
             blocks.push('<div class="card"><div class="banner banner-err" style="margin-top:0;">' + esc(t.text) + '</div></div>');
           } else {
             const usage = t.usage || {};
+            const brPill = t.browserUsed
+              ? (
+                '<span class="pill pill-ok" title="' + esc(t.browserUrl || "") + '">' +
+                  'Vio: ' + esc(shortBrowserLabel(t.browserUrl, "")) +
+                '</span>'
+              )
+              : "";
             blocks.push(
               '<div class="card">' +
-                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">' +
                   '<strong>Respuesta Antigravity</strong>' +
-                  '<span class="pill pill-ok">' + esc(t.model) + (usage.total_tokens ? (' · ' + usage.total_tokens + ' tokens') : '') + '</span>' +
+                  '<div style="display:flex;gap:6px;align-items:center;">' +
+                    brPill +
+                    '<span class="pill pill-ok">' + esc(t.model) + (usage.total_tokens ? (' · ' + usage.total_tokens + ' tokens') : '') + '</span>' +
+                  '</div>' +
                 '</div>' +
                 '<div class="answer-box">' + esc(t.text) + '</div>' +
               '</div>'
@@ -1072,6 +1088,15 @@
         });
       }
 
+      function shortBrowserLabel(rawUrl, rawTitle) {
+        const cleaned = String(rawUrl || "").replace(/^https?:\/\//, "");
+        if (cleaned && cleaned !== "about:blank") {
+          return cleaned.length > 28 ? (cleaned.slice(0, 27) + "…") : cleaned;
+        }
+        const t = String(rawTitle || "").trim();
+        return t ? (t.length > 24 ? (t.slice(0, 23) + "…") : t) : "activo";
+      }
+
       function applyBrowserStatus(st) {
         browserRunning = Boolean(st.running);
         els.brStartBtn.style.display = browserRunning ? "none" : "inline-flex";
@@ -1080,6 +1105,11 @@
         els.brViewport.style.display = browserRunning ? "block" : "none";
         if (st.url && document.activeElement !== els.brUrlInput) {
           els.brUrlInput.value = st.url === "about:blank" ? "" : st.url;
+        }
+        if (els.shareBrowserLabel) {
+          els.shareBrowserLabel.textContent = browserRunning
+            ? ("Ver navegador vivo (" + shortBrowserLabel(st.url, st.title) + ")")
+            : "Ver navegador vivo (apagado)";
         }
         updateRamPill();
       }
@@ -1113,6 +1143,15 @@
           sendBrowserCmd({ type: "key", key: ev.key });
         }
       });
+      els.brViewport.addEventListener("paste", function (ev) {
+        if (!browserRunning) return;
+        const clip = ev.clipboardData || window.clipboardData;
+        const txt = clip ? clip.getData("text") : "";
+        if (txt) {
+          ev.preventDefault();
+          sendBrowserCmd({ type: "type", text: txt });
+        }
+      });
 
       els.brStartBtn.addEventListener("click", function () {
         sendBrowserCmd({ type: "start", url: els.brUrlInput.value.trim() || null });
@@ -1136,6 +1175,7 @@
       });
       els.brUrlInput.addEventListener("keydown", function (ev) {
         if (ev.key === "Enter") {
+          ev.preventDefault();
           const u = els.brUrlInput.value.trim();
           if (u) sendBrowserCmd({ type: "navigate", url: u });
         }
@@ -1424,7 +1464,8 @@
               conversation_id: activeAgyId || null,
               project_name: project,
               model: model,
-              allow_hydrogen: showHydrogen
+              allow_hydrogen: showHydrogen,
+              include_browser_context: Boolean(els.shareBrowserCheck && els.shareBrowserCheck.checked)
             })
           });
           agyTurns = agyTurns.filter(function (t) { return t.role !== "pending"; });
@@ -1436,7 +1477,9 @@
             role: "assistant",
             text: res.response || "",
             model: res.model || model,
-            usage: res.usage || {}
+            usage: res.usage || {},
+            browserUsed: Boolean(res.browser_context_used),
+            browserUrl: res.browser_url || ""
           });
           loadAgyConversations();
         } catch (err) {
@@ -1492,7 +1535,11 @@
 
       async function loadBrowserInitialStatus() {
         try {
-          applyBrowserStatus(await apiJson("/api/browser/status"));
+          const st = await apiJson("/api/browser/status");
+          applyBrowserStatus(st);
+          if (st && st.running) {
+            ensureBrowserSocket();
+          }
         } catch (_) {}
       }
 

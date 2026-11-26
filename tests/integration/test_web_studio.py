@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+import src.web.app as web_app_mod
 from src.contracts.redaction import REDACTED_PLACEHOLDER
 from src.local_server import running_local_stack
 from src.storage.redaction import contains_unredacted_secret_strict
 from src.web import create_app
-from src.web.workspace import parse_agy_models_output
+from src.web.workspace import build_agy_prompt_with_browser_context, parse_agy_models_output
 from starlette.testclient import TestClient
 
 
@@ -57,6 +61,7 @@ async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Pat
         assert "controlbot.showplantmodule" in body_low
         assert "computador en vivo" in body_low
         assert "mostrar hydrogen" in body_low
+        assert "share-browser-check" in body_low
         assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
         assert "https://" not in body_low
 
@@ -267,3 +272,157 @@ async def test_unified_local_server_stack_boots_and_completes_pump34_task(tmp_pa
             answer = snap["result"]["answer"]
             assert "ALM-3401" in answer
             assert "WO-3408" in answer
+
+
+@pytest.mark.n1
+def test_build_agy_prompt_with_browser_context() -> None:
+    assert build_agy_prompt_with_browser_context("hola", None) == "hola"
+    assert build_agy_prompt_with_browser_context("hola", {"running": False}) == "hola"
+
+    enriched = build_agy_prompt_with_browser_context(
+        "¿Cuál es el precio del N1200?",
+        {
+            "running": True,
+            "url": "http://127.0.0.1:9000/catalogo",
+            "title": "Catálogo N1200",
+            "visible_text": "Controlador N1200 — Precio: $245.00 USD",
+            "screenshot_path": "/tmp/live_browser_latest.jpg",
+            "elements": [
+                {
+                    "tag": "button",
+                    "text": "Ver stock",
+                    "placeholder": "",
+                    "href": "",
+                    "x": 120,
+                    "y": 80,
+                }
+            ],
+        },
+    )
+    assert "http://127.0.0.1:9000/catalogo" in enriched
+    assert "Catálogo N1200" in enriched
+    assert "Controlador N1200 — Precio: $245.00 USD" in enriched
+    assert 'source="untrusted_webpage"' in enriched
+    assert "/api/browser/action" in enriched
+    assert "/tmp/live_browser_latest.jpg" in enriched
+    assert "[SOLICITUD DEL USUARIO]" in enriched
+    assert "¿Cuál es el precio del N1200?" in enriched
+
+
+@pytest.mark.n2
+def test_live_browser_context_action_and_agy_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html_doc = (
+        b"<!DOCTYPE html><html><head><title>Tienda N1200</title></head><body>"
+        b"<h1>Controlador N1200</h1>"
+        b"<p>Precio: $245.00 USD</p>"
+        b"<button id='stock-btn' onclick=\"document.getElementById('stock').textContent="
+        b"'Stock disponible: 14 unidades'\">Ver stock</button>"
+        b"<div id='stock'></div>"
+        b"<input type='password' value='SuperSecretPass123!'>"
+        b"</body></html>"
+    )
+
+    class _CatalogHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html_doc)))
+            self.end_headers()
+            self.wfile.write(html_doc)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CatalogHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    page_url = f"http://127.0.0.1:{server.server_port}/producto/n1200"
+
+    captured_contexts: list[dict[str, Any] | None] = []
+
+    async def _fake_send_agy_prompt(**kwargs: Any) -> dict[str, Any]:
+        ctx_arg = kwargs.get("browser_context")
+        captured_contexts.append(ctx_arg if isinstance(ctx_arg, dict) else None)
+        return {
+            "conversation_id": "22222222-3333-4444-5555-666666666666",
+            "status": "SUCCESS",
+            "response": "El precio del N1200 es $245.00 USD.",
+            "model": str(kwargs.get("model", "gemini-4-carbon-low")),
+            "usage": {"total_tokens": 42},
+            "resume_command": "agy --resume 22222222-3333-4444-5555-666666666666",
+        }
+
+    monkeypatch.setattr(web_app_mod, "send_agy_prompt", _fake_send_agy_prompt)
+    monkeypatch.setenv("GROKBOT_PROFILE_ROOT", str(tmp_path / "profiles"))
+
+    try:
+        app = create_app(db_path=tmp_path / "bridge.sqlite3")
+        with TestClient(app) as client:
+            idle_ctx = client.get("/api/browser/context")
+            assert idle_ctx.status_code == 200
+            assert idle_ctx.json()["running"] is False
+
+            nav_resp = client.post(
+                "/api/browser/action",
+                json={"type": "navigate", "url": page_url},
+            )
+            assert nav_resp.status_code == 200
+            nav_body = nav_resp.json()
+            assert nav_body["status"]["running"] is True
+            ctx = nav_body["context"]
+            assert ctx["title"] == "Tienda N1200"
+            assert "N1200" in ctx["visible_text"]
+            assert "$245.00 USD" in ctx["visible_text"]
+            assert "SuperSecretPass123!" not in json.dumps(nav_body)
+
+            stock_btn = next(e for e in ctx["elements"] if e["tag"] == "button")
+            click_resp = client.post(
+                "/api/browser/action",
+                json={"type": "click", "x": stock_btn["x"], "y": stock_btn["y"]},
+            )
+            assert click_resp.status_code == 200
+            assert "Stock disponible: 14 unidades" in click_resp.json()["context"]["visible_text"]
+
+            ctx_get = client.get("/api/browser/context")
+            assert ctx_get.status_code == 200
+            assert "SuperSecretPass123!" not in json.dumps(ctx_get.json())
+
+            agy_with_browser = client.post(
+                "/api/agy/send",
+                json={
+                    "prompt": "Dame el precio del N1200 en mi web abierta",
+                    "model": "gemini-4-carbon-low",
+                    "include_browser_context": True,
+                },
+            )
+            assert agy_with_browser.status_code == 200
+            agy_json = agy_with_browser.json()
+            assert agy_json["browser_context_used"] is True
+            assert agy_json["browser_url"] == page_url
+            assert len(captured_contexts) == 1
+            assert captured_contexts[0] is not None
+            assert "$245.00 USD" in captured_contexts[0]["visible_text"]
+            assert "SuperSecretPass123!" not in json.dumps(captured_contexts[0])
+
+            agy_without_browser = client.post(
+                "/api/agy/send",
+                json={
+                    "prompt": "Ignora el navegador",
+                    "model": "gemini-4-carbon-low",
+                    "include_browser_context": False,
+                },
+            )
+            assert agy_without_browser.status_code == 200
+            assert agy_without_browser.json()["browser_context_used"] is False
+            assert captured_contexts[1] is None
+
+            stopped = client.post("/api/browser/stop")
+            assert stopped.status_code == 200
+            assert stopped.json()["running"] is False
+            assert client.get("/api/browser/context").json()["running"] is False
+    finally:
+        server.shutdown()
+        server.server_close()

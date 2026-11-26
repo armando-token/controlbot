@@ -807,6 +807,12 @@ def create_app(
                     detail=str(_scrub_and_verify(str(exc), label="error")),
                 ) from exc
 
+        browser_ctx: dict[str, Any] | None = None
+        if payload.include_browser_context and live_browser.running:
+            browser_ctx = await live_browser.extract_page_context(
+                screenshot_path=live_profile_root.parent / "live_browser_latest.jpg"
+            )
+
         try:
             result = await send_agy_prompt(
                 prompt=payload.prompt,
@@ -814,6 +820,7 @@ def create_app(
                 project_dir=project_dir,
                 model=payload.model,
                 allow_hydrogen=payload.allow_hydrogen,
+                browser_context=browser_ctx,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -831,6 +838,10 @@ def create_app(
                 detail=str(_scrub_and_verify(str(exc), label="error")),
             ) from exc
 
+        result["browser_context_used"] = browser_ctx is not None
+        result["browser_url"] = (
+            str(browser_ctx.get("url", "")) if browser_ctx is not None else None
+        )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(result, label="AgySendResult"),
@@ -841,6 +852,59 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(await live_browser.status(), label="BrowserStatus"),
+        )
+
+    @app.get("/api/browser/context")
+    async def api_browser_context() -> JSONResponse:
+        if not live_browser.running:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "running": False,
+                    "url": "",
+                    "title": "",
+                    "visible_text": "",
+                    "elements": [],
+                    "screenshot_path": None,
+                },
+            )
+        ctx = await live_browser.extract_page_context(
+            screenshot_path=live_profile_root.parent / "live_browser_latest.jpg"
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(ctx or {"running": False}, label="BrowserContext"),
+        )
+
+    @app.post("/api/browser/action")
+    async def api_browser_action(request: Request) -> JSONResponse:
+        raw_body = await request.body()
+        if not raw_body.strip():
+            raise HTTPException(status_code=400, detail="Action JSON object is required.")
+        try:
+            parsed = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON body.") from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(status_code=400, detail="Action payload must be a JSON object.")
+        try:
+            action_result = await live_browser.perform_action(
+                parsed,
+                screenshot_path=live_profile_root.parent / "live_browser_latest.jpg",
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(action_result, label="BrowserAction"),
         )
 
     @app.post("/api/browser/start")

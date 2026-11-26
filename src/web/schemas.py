@@ -96,3 +96,4 @@ class AgySendRequest(FrozenModel):
     project_name: str | None = None
     model: NonEmptyStr = "gemini-4-carbon-low"
     allow_hydrogen: bool = False
+    include_browser_context: bool = True
