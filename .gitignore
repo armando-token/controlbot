@@ -42,3 +42,7 @@ macos/build/
 macos/**/DerivedData/
 macos/**/*.xcodeproj/xcuserdata/
 macos/**/*.xcworkspace/xcuserdata/
+
+# Frontend dependencies & vault keys
+frontend/node_modules/
+*.vault.key

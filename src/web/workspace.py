@@ -40,6 +40,20 @@ _FALLBACK_MODELS: tuple[dict[str, Any], ...] = (
 )
 _MODELS_CACHE_TTL_S = 120.0
 _models_cache: tuple[float, list[dict[str, Any]]] | None = None
+_MAX_STDERR_BYTES = 64 * 1024
+
+
+def _default_local_base_url() -> str:
+    """Resolve local ControlBot HTTP base URL from environment or default :8000."""
+    for key in ("CONTROLBOT_BASE_URL", "GROKBOT_BASE_URL"):
+        raw = os.environ.get(key, "").strip().rstrip("/")
+        if raw:
+            return raw
+    for key in ("CONTROLBOT_PORT", "PORT"):
+        raw_port = os.environ.get(key, "").strip()
+        if raw_port.isdigit():
+            return f"http://127.0.0.1:{raw_port}"
+    return "http://127.0.0.1:8000"
 
 
 def _scrub_text(value: str) -> str:
@@ -224,12 +238,13 @@ def build_agy_prompt_with_browser_context(
     prompt: str,
     browser_context: dict[str, Any] | None,
     *,
-    base_url: str = "http://127.0.0.1:8000",
+    base_url: str | None = None,
 ) -> str:
     """Attach live Chromium URL, visible DOM text, and action hints to an agy prompt."""
     cleaned = prompt.strip()
     if not browser_context or not browser_context.get("running"):
         return cleaned
+    resolved_base = (base_url or "").strip().rstrip("/") or _default_local_base_url()
 
     url = _scrub_text(str(browser_context.get("url", "")).strip())
     title = _scrub_text(str(browser_context.get("title", "")).strip())
@@ -274,11 +289,11 @@ def build_agy_prompt_with_browser_context(
     lines.extend(
         [
             "</LIVE_BROWSER_PAGE_CONTENT>",
-            f"Control directo del Navegador en Vivo (API local en {base_url}):",
+            f"Control directo del Navegador en Vivo (API local en {resolved_base}):",
             "- NO busques ni leas el código fuente de ControlBot para usar el navegador.",
             "- Si el dato pedido ya está arriba, respóndelo directo sin usar herramientas.",
-            f"- Ver estado/DOM actualizado: GET {base_url}/api/browser/context",
-            f"- Mover el navegador en vivo: POST {base_url}/api/browser/action con JSON:",
+            f"- Ver estado/DOM actualizado: GET {resolved_base}/api/browser/context",
+            f"- Mover el navegador en vivo: POST {resolved_base}/api/browser/action con JSON:",
             '  · Navegar: {"type":"navigate","url":"https://..."}',
             '  · Clic en (x, y): {"type":"click","x":123,"y":456}',
             '  · Escribir: {"type":"type","text":"..."} · Tecla: {"type":"key","key":"Enter"}',
@@ -383,11 +398,16 @@ def _prepare_agy_command(
     browser_context: dict[str, Any] | None,
     timeout_s: float,
     output_format: str,
+    base_url: str | None = None,
 ) -> tuple[list[str], str, str | None, int]:
     cleaned_prompt = prompt.strip()
     if not cleaned_prompt:
         raise ValueError("prompt must not be empty.")
-    effective_prompt = build_agy_prompt_with_browser_context(cleaned_prompt, browser_context)
+    effective_prompt = build_agy_prompt_with_browser_context(
+        cleaned_prompt,
+        browser_context,
+        base_url=base_url,
+    )
 
     cleaned_model = model.strip()
     if not cleaned_model:
@@ -434,6 +454,7 @@ async def send_agy_prompt(
     allow_hydrogen: bool = False,
     browser_context: dict[str, Any] | None = None,
     timeout_s: float = 120.0,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     """Execute one Antigravity CLI turn, optionally resuming conversation_id."""
     args, cleaned_model, cleaned_cid, bounded_timeout = _prepare_agy_command(
@@ -444,6 +465,7 @@ async def send_agy_prompt(
         browser_context=browser_context,
         timeout_s=timeout_s,
         output_format="json",
+        base_url=base_url,
     )
 
     proc = await asyncio.create_subprocess_exec(
@@ -512,6 +534,7 @@ async def stream_agy_prompt(
     allow_hydrogen: bool = False,
     browser_context: dict[str, Any] | None = None,
     timeout_s: float = 180.0,
+    base_url: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Stream normalized NDJSON progress & response events from agy CLI."""
     args, cleaned_model, cleaned_cid, bounded_timeout = _prepare_agy_command(
@@ -522,6 +545,7 @@ async def stream_agy_prompt(
         browser_context=browser_context,
         timeout_s=timeout_s,
         output_format="stream-json",
+        base_url=base_url,
     )
 
     proc = await asyncio.create_subprocess_exec(
@@ -537,6 +561,20 @@ async def stream_agy_prompt(
     saw_error = False
     assert proc.stdout is not None
     assert proc.stderr is not None
+
+    async def _drain_stderr() -> bytes:
+        buf = bytearray()
+        assert proc.stderr is not None
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            remaining_cap = _MAX_STDERR_BYTES - len(buf)
+            if remaining_cap > 0:
+                buf.extend(chunk[:remaining_cap])
+        return bytes(buf)
+
+    stderr_task: asyncio.Task[bytes] = asyncio.create_task(_drain_stderr())
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -560,7 +598,7 @@ async def stream_agy_prompt(
                 raise RuntimeError("agy stream event failed strict secret redaction check.")
             yield parsed
 
-        stderr_b = await asyncio.wait_for(proc.stderr.read(), timeout=5.0)
+        stderr_b = await asyncio.wait_for(stderr_task, timeout=5.0)
         rc = await asyncio.wait_for(proc.wait(), timeout=5.0)
         if not saw_done and not saw_error:
             stderr_txt = _scrub_text(stderr_b.decode("utf-8", errors="replace").strip())
@@ -576,6 +614,10 @@ async def stream_agy_prompt(
             proc.kill()
             with contextlib.suppress(Exception):
                 await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await stderr_task
 
 
 def parse_agy_models_output(raw_text: str) -> list[dict[str, Any]]:
@@ -637,7 +679,12 @@ async def list_agy_models(*, force_refresh: bool = False) -> list[dict[str, Any]
     return [dict(item) for item in parsed]
 
 
-def _resolve_relative_project_path(project_dir: Path, rel_path: str) -> Path:
+def _resolve_relative_project_path(
+    project_dir: Path,
+    rel_path: str,
+    *,
+    follow_symlinks: bool = True,
+) -> Path:
     cleaned = rel_path.strip().lstrip("/")
     if not cleaned:
         return project_dir
@@ -647,19 +694,43 @@ def _resolve_relative_project_path(project_dir: Path, rel_path: str) -> Path:
     if any(part in {".", ".."} for part in parts):
         raise ValueError(f"Relative path traversal forbidden: {rel_path!r}")
     resolved_root = project_dir.resolve()
-    candidate = (resolved_root / cleaned).resolve()
-    if not candidate.is_relative_to(resolved_root):
+    if follow_symlinks:
+        candidate = (resolved_root / cleaned).resolve()
+        if not candidate.is_relative_to(resolved_root):
+            raise ValueError(f"Path escapes project root: {rel_path!r}")
+        return candidate
+    rel_obj = Path(cleaned)
+    resolved_parent = (resolved_root / rel_obj.parent).resolve()
+    if not resolved_parent.is_relative_to(resolved_root):
         raise ValueError(f"Path escapes project root: {rel_path!r}")
-    return candidate
+    return resolved_parent / rel_obj.name
 
 
 def _is_sensitive_filename(path: Path) -> bool:
     name_low = path.name.lower()
     if name_low == ".env" or name_low.startswith(".env."):
         return True
-    if name_low.endswith((".pem", ".key", ".p12", ".pfx", ".kdbx")):
+    if name_low.endswith(
+        (".pem", ".key", ".p12", ".pfx", ".kdbx", ".sqlite3", ".db", ".p8", ".jks", ".ovpn")
+    ):
         return True
-    if name_low in {"id_rsa", "id_ed25519", "secrets.json", "credentials.json", ".npmrc", ".netrc"}:
+    if name_low in {
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "authorized_keys",
+        "secrets.json",
+        "credentials.json",
+        ".npmrc",
+        ".netrc",
+        ".pypirc",
+    }:
+        return True
+    parts_low = tuple(part.lower() for part in path.parts)
+    if any(
+        parts_low[i : i + 2] in {(".ssh", "config"), (".aws", "config")}
+        for i in range(len(parts_low) - 1)
+    ):
         return True
     return "secret" in name_low or "credential" in name_low
 
@@ -737,10 +808,10 @@ def read_project_file(
         raise ValueError("rel_path must not be empty.")
     project_dir = resolve_project_dir(projects_root, project_name)
     target = _resolve_relative_project_path(project_dir, rel_path)
+    if _is_sensitive_filename(target) or _is_sensitive_filename(Path(rel_path.strip().lstrip("/"))):
+        raise ValueError(f"Access to sensitive file {target.name!r} is restricted.")
     if not target.is_file():
         raise ValueError(f"File not found inside {project_name}: {rel_path!r}")
-    if _is_sensitive_filename(target):
-        raise ValueError(f"Access to sensitive file {target.name!r} is restricted.")
 
     raw_bytes = target.read_bytes()
     total_size = len(raw_bytes)

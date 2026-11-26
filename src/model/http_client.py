@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
@@ -48,21 +48,26 @@ def validate_local_model_origin(
     if not host:
         raise OriginNotAllowedError(f"Invalid local model origin host: {origin!r}")
 
+    allowed_set = {validate_http_origin(o) for o in allowed_origins} if allowed_origins else set()
+
     is_ip = False
     try:
         ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         is_ip = True
     except ValueError:
         ip = None
 
     if is_ip and ip is not None:
+        explicit_link_local = bool(allowed_set and normalized in allowed_set and ip.is_link_local)
         if not (
             ip.is_loopback
             or (
                 allow_private_lan
                 and not ip.is_unspecified
                 and not ip.is_multicast
-                and (ip.is_private or ip.is_link_local)
+                and ((ip.is_private and not ip.is_link_local) or explicit_link_local)
             )
         ):
             raise OriginNotAllowedError(
@@ -79,12 +84,10 @@ def validate_local_model_origin(
             f"Model origin {normalized!r} is an external/public host and is blocked."
         )
 
-    if allowed_origins:
-        allowed_set = {validate_http_origin(o) for o in allowed_origins}
-        if normalized not in allowed_set:
-            raise OriginNotAllowedError(
-                f"Model origin {normalized!r} not in allowed_origins {sorted(allowed_set)}."
-            )
+    if allowed_set and normalized not in allowed_set:
+        raise OriginNotAllowedError(
+            f"Model origin {normalized!r} not in allowed_origins {sorted(allowed_set)}."
+        )
 
     return normalized
 
@@ -106,6 +109,7 @@ class LocalModelConfig(FrozenModel):
     max_transport_retries: int = Field(default=0, ge=0, le=2)
     retry_backoff_s: float = Field(default=0.1, ge=0.0)
     strict_model_id_check: bool = False
+    send_response_format_with_tools: bool = False
     api_key: str | None = Field(default=None, repr=False, exclude=True)
 
     @field_validator("endpoint_path")
@@ -178,25 +182,30 @@ class LocalHttpModelClient:
         self._config = config
         self.call_history: list[PromptContext] = []
         self.last_response_metadata: dict[str, Any] = {}
+        self._last_tool_calls: tuple[ModelToolCall, ...] = ()
 
     @property
     def config(self) -> LocalModelConfig:
         return self._config
 
-    async def decide(
+    @property
+    def last_tool_calls(self) -> tuple[ModelToolCall, ...]:
+        """All parsed ModelToolCall objects from the most recent decide/stream_decide call."""
+        return self._last_tool_calls
+
+    def _build_request_payload(
         self,
         prompt_ctx: PromptContext,
         tools: Sequence[ToolSpec],
         budget_remaining: BudgetRemaining,
-    ) -> ModelDecision:
-        """Send redacted PromptContext to local HTTP LLM server and parse ModelDecision."""
+        *,
+        stream: bool = False,
+    ) -> tuple[str, dict[str, Any], dict[str, str], str]:
         normalized_origin = validate_local_model_origin(
             self._config.origin,
             allowed_origins=self._config.allowed_origins,
             allow_private_lan=self._config.allow_private_lan,
         )
-        self.call_history.append(prompt_ctx)
-
         system_prompt = (
             f"Template={self._config.prompt_template}; "
             "Respond with either a tool call or a JSON object matching ModelDecision "
@@ -219,17 +228,45 @@ class LocalHttpModelClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload},
             ],
-            "response_format": {"type": "json_object"},
         }
+        if not tools or self._config.send_response_format_with_tools:
+            req_body["response_format"] = {"type": "json_object"}
         if tools:
             req_body["tools"] = _serialize_tools(tools)
             req_body["tool_choice"] = "auto"
+        if stream:
+            req_body["stream"] = True
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
 
         url = f"{normalized_origin}{self._config.endpoint_path}"
+        return url, req_body, headers, normalized_origin
+
+    async def decide(
+        self,
+        prompt_ctx: PromptContext,
+        tools: Sequence[ToolSpec],
+        budget_remaining: BudgetRemaining,
+    ) -> ModelDecision:
+        """Send redacted PromptContext to local HTTP LLM server and parse ModelDecision."""
+        decision, _ = await self.decide_all_tool_calls(prompt_ctx, tools, budget_remaining)
+        return decision
+
+    async def decide_all_tool_calls(
+        self,
+        prompt_ctx: PromptContext,
+        tools: Sequence[ToolSpec],
+        budget_remaining: BudgetRemaining,
+    ) -> tuple[ModelDecision, tuple[ModelToolCall, ...]]:
+        """Send PromptContext and return (ModelDecision, all parsed ModelToolCall items)."""
+        url, req_body, headers, normalized_origin = self._build_request_payload(
+            prompt_ctx, tools, budget_remaining, stream=False
+        )
+        user_payload = str(req_body["messages"][1]["content"])
+        self.call_history.append(prompt_ctx)
+
         response = await self._post_with_retries(url, req_body, headers)
 
         try:
@@ -262,7 +299,10 @@ class LocalHttpModelClient:
             prompt_text=user_payload,
             completion_text=raw_completion_text,
         )
-        decision = self._parse_decision(message, tools=tools, usage=usage)
+        decision, parsed_calls = self._parse_decision_with_all_calls(
+            message, tools=tools, usage=usage
+        )
+        self._last_tool_calls = parsed_calls
 
         self.last_response_metadata = {
             "model_id": self._config.model_id,
@@ -272,6 +312,166 @@ class LocalHttpModelClient:
             "observed_model": observed_model,
             "usage_mode": usage.usage_mode,
             "endpoint_origin": normalized_origin,
+            "tool_calls_count": len(parsed_calls),
+        }
+        return decision, parsed_calls
+
+    async def stream_decide(
+        self,
+        prompt_ctx: PromptContext,
+        tools: Sequence[ToolSpec],
+        budget_remaining: BudgetRemaining,
+        *,
+        on_delta: Callable[[str], Awaitable[None] | None] | None = None,
+    ) -> ModelDecision:
+        """Stream OpenAI SSE chat-completion deltas and assemble final ModelDecision."""
+        url, req_body, headers, normalized_origin = self._build_request_payload(
+            prompt_ctx, tools, budget_remaining, stream=True
+        )
+        user_payload = str(req_body["messages"][1]["content"])
+        self.call_history.append(prompt_ctx)
+
+        content_chunks: list[str] = []
+        tool_accum: dict[int, dict[str, Any]] = {}
+        observed_model: Any = None
+        raw_usage: Any = None
+
+        async with httpx.AsyncClient(
+            timeout=self._config.timeout_s,
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            try:
+                async with client.stream("POST", url, json=req_body, headers=headers) as resp:
+                    if 300 <= resp.status_code < 400:
+                        location = resp.headers.get("location", "")
+                        raise OriginNotAllowedError(
+                            f"Redirect blocked by local-only model policy "
+                            f"(HTTP {resp.status_code} -> {location!r})."
+                        )
+                    if resp.status_code in _TRANSIENT_HTTP_STATUSES:
+                        raise TransientModelError(
+                            f"Local model HTTP transient status {resp.status_code}."
+                        )
+                    if resp.status_code != 200:
+                        raise ModelProtocolError(
+                            f"Local model HTTP error status {resp.status_code}."
+                        )
+
+                    async for line in resp.aiter_lines():
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith(":"):
+                            continue
+                        if not stripped.startswith("data:"):
+                            continue
+                        data_part = stripped[5:].strip()
+                        if data_part == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_part)
+                        except ValueError as exc:
+                            raise ModelProtocolError(
+                                f"Invalid JSON in SSE stream chunk: {exc}"
+                            ) from exc
+                        if not isinstance(chunk, dict):
+                            raise ModelProtocolError("SSE stream chunk must be a JSON object.")
+                        if chunk.get("model") is not None:
+                            observed_model = chunk.get("model")
+                        if chunk.get("usage") is not None:
+                            raw_usage = chunk.get("usage")
+
+                        choices = chunk.get("choices")
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        first = choices[0]
+                        if not isinstance(first, dict):
+                            continue
+                        delta = first.get("delta")
+                        if not isinstance(delta, dict):
+                            continue
+
+                        text_piece = delta.get("content")
+                        if isinstance(text_piece, str) and text_piece:
+                            content_chunks.append(text_piece)
+                            if on_delta is not None:
+                                maybe_res = on_delta(text_piece)
+                                if maybe_res is not None:
+                                    await maybe_res
+
+                        delta_tcs = delta.get("tool_calls")
+                        if isinstance(delta_tcs, list):
+                            for tc_frag in delta_tcs:
+                                if not isinstance(tc_frag, dict):
+                                    continue
+                                raw_idx = tc_frag.get("index", 0)
+                                if isinstance(raw_idx, (bool, float)):
+                                    raise ModelProtocolError(
+                                        f"Invalid SSE tool_call index: {raw_idx!r}."
+                                    )
+                                try:
+                                    idx = int(raw_idx)
+                                except (TypeError, ValueError) as exc:
+                                    raise ModelProtocolError(
+                                        f"Invalid SSE tool_call index: {raw_idx!r}."
+                                    ) from exc
+                                if idx < 0:
+                                    raise ModelProtocolError(
+                                        f"Invalid SSE tool_call index: {raw_idx!r}."
+                                    )
+                                slot = tool_accum.setdefault(
+                                    idx,
+                                    {
+                                        "id": tc_frag.get("id") or f"call_{idx}",
+                                        "type": tc_frag.get("type") or "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    },
+                                )
+                                if tc_frag.get("id"):
+                                    slot["id"] = tc_frag["id"]
+                                fn_frag = tc_frag.get("function")
+                                if isinstance(fn_frag, dict):
+                                    if isinstance(fn_frag.get("name"), str):
+                                        slot["function"]["name"] += fn_frag["name"]
+                                    if isinstance(fn_frag.get("arguments"), str):
+                                        slot["function"]["arguments"] += fn_frag["arguments"]
+                                    elif isinstance(fn_frag.get("arguments"), dict):
+                                        slot["function"]["arguments"] = fn_frag["arguments"]
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.TransportError) as exc:
+                raise TransientModelError(f"Local model HTTP stream failed: {exc}") from exc
+
+        if self._config.strict_model_id_check and observed_model != self._config.model_id:
+            raise ModelProtocolError(
+                f"Model ID mismatch: expected {self._config.model_id!r}, got {observed_model!r}."
+            )
+
+        assembled_msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_chunks) if content_chunks else None,
+        }
+        if tool_accum:
+            assembled_msg["tool_calls"] = [tool_accum[k] for k in sorted(tool_accum.keys())]
+
+        raw_completion_text = self._extract_completion_text(assembled_msg)
+        usage = self._parse_usage(
+            raw_usage,
+            prompt_text=user_payload,
+            completion_text=raw_completion_text,
+        )
+        decision, parsed_calls = self._parse_decision_with_all_calls(
+            assembled_msg, tools=tools, usage=usage
+        )
+        self._last_tool_calls = parsed_calls
+
+        self.last_response_metadata = {
+            "model_id": self._config.model_id,
+            "quantization": self._config.quantization,
+            "prompt_template": self._config.prompt_template,
+            "weights_sha256": self._config.weights_sha256,
+            "observed_model": observed_model,
+            "usage_mode": usage.usage_mode,
+            "endpoint_origin": normalized_origin,
+            "tool_calls_count": len(parsed_calls),
+            "streamed": True,
         }
         return decision
 
@@ -315,9 +515,7 @@ class LocalHttpModelClient:
                         f"Local model HTTP transient status {resp.status_code}."
                     )
                 if resp.status_code != 200:
-                    raise ModelProtocolError(
-                        f"Local model HTTP error status {resp.status_code}."
-                    )
+                    raise ModelProtocolError(f"Local model HTTP error status {resp.status_code}.")
                 return resp
 
         raise TransientModelError(f"Local model HTTP transport failed: {last_exc}")
@@ -325,11 +523,13 @@ class LocalHttpModelClient:
     @staticmethod
     def _extract_completion_text(message: dict[str, Any]) -> str:
         content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
         tool_calls = message.get("tool_calls")
+        if isinstance(content, str) and content.strip():
+            if isinstance(tool_calls, list) and tool_calls:
+                return f"{content}\n{json.dumps(tool_calls, sort_keys=True)}"
+            return content
         if isinstance(tool_calls, list) and tool_calls:
-            return json.dumps(tool_calls[0], sort_keys=True)
+            return json.dumps(tool_calls, sort_keys=True)
         return ""
 
     @staticmethod
@@ -366,12 +566,99 @@ class LocalHttpModelClient:
             raise ModelProtocolError(f"Invalid model usage payload: {exc}") from exc
 
     @staticmethod
+    def _parse_single_tool_call(
+        tc: Any,
+        *,
+        idx: int,
+        tool_map: dict[str, ToolSpec],
+        rationale: Any,
+    ) -> ModelToolCall:
+        if not isinstance(tc, dict):
+            raise ModelProtocolError(f"message.tool_calls[{idx}] must be an object.")
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            raise ModelProtocolError(f"tool_calls[{idx}].function must be an object.")
+        tool_id = fn.get("name")
+        if not isinstance(tool_id, str) or not tool_id.strip():
+            raise ModelProtocolError(f"tool_calls[{idx}].function.name must be non-empty.")
+        tool_id = tool_id.strip()
+        if tool_id not in tool_map:
+            raise ModelPermissionError(
+                f"Permission denied: tool_id {tool_id!r} is not allowed "
+                "(outside allowed tool list)."
+            )
+        raw_args = fn.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                parsed_args = json.loads(raw_args) if raw_args.strip() else {}
+            except ValueError as exc:
+                raise ModelProtocolError(
+                    f"Invalid JSON in tool_calls[{idx}].function.arguments: {exc}"
+                ) from exc
+        elif isinstance(raw_args, dict):
+            parsed_args = dict(raw_args)
+        else:
+            raise ModelProtocolError(f"tool_calls[{idx}].function.arguments must be JSON/dict.")
+        if not isinstance(parsed_args, dict):
+            raise ModelProtocolError(f"tool_calls[{idx}].function.arguments must decode to dict.")
+
+        explicit_origin: Any = parsed_args.pop("__target_origin__", None)
+        if explicit_origin is None:
+            explicit_origin = parsed_args.get("target_origin")
+        if explicit_origin is None:
+            explicit_origin = parsed_args.get("origin")
+        if explicit_origin is None:
+            explicit_origin = tc.get("target_origin") or fn.get("target_origin")
+        if explicit_origin is None:
+            for url_key in ("url", "target_url"):
+                candidate_url = parsed_args.get(url_key)
+                if isinstance(candidate_url, str) and candidate_url.startswith(
+                    ("http://", "https://")
+                ):
+                    parsed_url = urlparse(candidate_url)
+                    if parsed_url.scheme and parsed_url.netloc:
+                        explicit_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                        break
+        spec = tool_map.get(tool_id)
+        resolved_origin: str | None = None
+        if explicit_origin is not None:
+            try:
+                resolved_origin = validate_http_origin(str(explicit_origin))
+            except ValueError as exc:
+                raise ModelProtocolError(f"Invalid target_origin: {exc}") from exc
+        elif spec is not None and spec.allowed_origins:
+            resolved_origin = spec.allowed_origins[0]
+
+        try:
+            return ModelToolCall(
+                tool_id=tool_id,
+                args=parsed_args,
+                target_origin=resolved_origin,
+                completion_verifier=spec.verifier_name if spec is not None else None,
+                rationale=rationale if isinstance(rationale, str) else "",
+            )
+        except ValidationError as exc:
+            raise ModelProtocolError(f"Invalid ModelDecision tool_call[{idx}]: {exc}") from exc
+
+    @classmethod
     def _parse_decision(
+        cls,
         message: dict[str, Any],
         *,
         tools: Sequence[ToolSpec],
         usage: ModelUsage,
     ) -> ModelDecision:
+        decision, _ = cls._parse_decision_with_all_calls(message, tools=tools, usage=usage)
+        return decision
+
+    @classmethod
+    def _parse_decision_with_all_calls(
+        cls,
+        message: dict[str, Any],
+        *,
+        tools: Sequence[ToolSpec],
+        usage: ModelUsage,
+    ) -> tuple[ModelDecision, tuple[ModelToolCall, ...]]:
         tool_map = {t.tool_id: t for t in tools}
 
         tool_calls = message.get("tool_calls")
@@ -379,77 +666,24 @@ class LocalHttpModelClient:
             if not isinstance(tool_calls, list):
                 raise ModelProtocolError("message.tool_calls must be a list when present.")
             if tool_calls:
-                tc = tool_calls[0]
-                if not isinstance(tc, dict):
-                    raise ModelProtocolError("message.tool_calls[0] must be an object.")
-                fn = tc.get("function")
-                if not isinstance(fn, dict):
-                    raise ModelProtocolError("tool_calls[0].function must be an object.")
-                tool_id = fn.get("name")
-                if not isinstance(tool_id, str) or not tool_id.strip():
-                    raise ModelProtocolError("tool_calls[0].function.name must be non-empty.")
-                tool_id = tool_id.strip()
-                if tool_id not in tool_map:
-                    raise ModelPermissionError(
-                        f"Permission denied: tool_id {tool_id!r} is not allowed "
-                        "(outside allowed tool list)."
-                    )
-                raw_args = fn.get("arguments", "{}")
-                if isinstance(raw_args, str):
-                    try:
-                        parsed_args = json.loads(raw_args) if raw_args.strip() else {}
-                    except ValueError as exc:
-                        raise ModelProtocolError(
-                            f"Invalid JSON in tool_calls[0].function.arguments: {exc}"
-                        ) from exc
-                elif isinstance(raw_args, dict):
-                    parsed_args = dict(raw_args)
-                else:
-                    raise ModelProtocolError("tool_calls[0].function.arguments must be JSON/dict.")
-                if not isinstance(parsed_args, dict):
-                    raise ModelProtocolError(
-                        "tool_calls[0].function.arguments must decode to dict."
-                    )
-
-                explicit_origin: Any = parsed_args.pop("__target_origin__", None)
-                if explicit_origin is None:
-                    explicit_origin = parsed_args.get("target_origin")
-                if explicit_origin is None:
-                    explicit_origin = parsed_args.get("origin")
-                if explicit_origin is None:
-                    explicit_origin = tc.get("target_origin") or fn.get("target_origin")
-                if explicit_origin is None:
-                    for url_key in ("url", "target_url"):
-                        candidate_url = parsed_args.get(url_key)
-                        if isinstance(candidate_url, str) and candidate_url.startswith(
-                            ("http://", "https://")
-                        ):
-                            parsed_url = urlparse(candidate_url)
-                            if parsed_url.scheme and parsed_url.netloc:
-                                explicit_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                                break
-                spec = tool_map.get(tool_id)
-                resolved_origin: str | None = None
-                if explicit_origin is not None:
-                    try:
-                        resolved_origin = validate_http_origin(str(explicit_origin))
-                    except ValueError as exc:
-                        raise ModelProtocolError(f"Invalid target_origin: {exc}") from exc
-                elif spec is not None and spec.allowed_origins:
-                    resolved_origin = spec.allowed_origins[0]
-
                 rationale = message.get("content")
+                parsed_calls = tuple(
+                    cls._parse_single_tool_call(
+                        tc,
+                        idx=idx,
+                        tool_map=tool_map,
+                        rationale=rationale,
+                    )
+                    for idx, tc in enumerate(tool_calls)
+                )
                 try:
-                    return ModelDecision(
-                        decision_type="tool_call",
-                        tool_call=ModelToolCall(
-                            tool_id=tool_id,
-                            args=parsed_args,
-                            target_origin=resolved_origin,
-                            completion_verifier=spec.verifier_name if spec is not None else None,
-                            rationale=rationale if isinstance(rationale, str) else "",
+                    return (
+                        ModelDecision(
+                            decision_type="tool_call",
+                            tool_call=parsed_calls[0],
+                            usage=usage,
                         ),
-                        usage=usage,
+                        parsed_calls,
                     )
                 except ValidationError as exc:
                     raise ModelProtocolError(f"Invalid ModelDecision tool_call: {exc}") from exc
@@ -518,10 +752,7 @@ class LocalHttpModelClient:
                 elif spec is not None and spec.allowed_origins:
                     raw_tc = {**raw_tc, "target_origin": spec.allowed_origins[0]}
                     parsed_obj = {**parsed_obj, "tool_call": raw_tc}
-            if (
-                raw_tc.get("completion_verifier") is None
-                and spec is not None
-            ):
+            if raw_tc.get("completion_verifier") is None and spec is not None:
                 raw_tc = {**raw_tc, "completion_verifier": spec.verifier_name}
                 parsed_obj = {**parsed_obj, "tool_call": raw_tc}
 
@@ -529,7 +760,9 @@ class LocalHttpModelClient:
             parsed_obj = {**parsed_obj, "partial_info": None}
 
         try:
-            return ModelDecision.model_validate({**parsed_obj, "usage": usage.model_dump()})
+            decision = ModelDecision.model_validate({**parsed_obj, "usage": usage.model_dump()})
+            calls = (decision.tool_call,) if decision.tool_call is not None else ()
+            return decision, calls
         except (ValidationError, ValueError) as exc:
             raise ModelProtocolError(f"Invalid structured ModelDecision: {exc}") from exc
 

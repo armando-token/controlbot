@@ -59,17 +59,23 @@ async def test_studio_html_light_mode_hidden_plant_and_system_info(tmp_path: Pat
         assert studio_resp.status_code == 200
         assert "text/html" in studio_resp.headers["content-type"].lower()
         body_low = studio_resp.text.lower()
-        assert "controlbot studio" in body_low
-        assert "color-scheme: light" in body_low
-        assert "#f8fafc" in body_low
-        assert "controlbot.showplantmodule" in body_low
-        assert "computador en vivo" in body_low
-        assert "mostrar hydrogen" in body_low
-        assert "share-browser-check" in body_low
-        assert "/api/agy/stream" in body_low
-        assert "withauthtoken" in body_low
         assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', body_low)
-        assert "https://" not in body_low
+        assert ('id="root"' in body_low) or ("controlbot studio" in body_low)
+
+        legacy_resp = await client.get("/studio-legacy")
+        assert legacy_resp.status_code == 200
+        legacy_low = legacy_resp.text.lower()
+        assert "controlbot studio" in legacy_low
+        assert "color-scheme: light" in legacy_low
+        assert "#f8fafc" in legacy_low
+        assert "controlbot.showplantmodule" in legacy_low
+        assert "computador en vivo" in legacy_low
+        assert "mostrar hydrogen" in legacy_low
+        assert "share-browser-check" in legacy_low
+        assert "/api/agy/stream" in legacy_low
+        assert "withauthtoken" in legacy_low
+        assert not re.search(r'(?:src|href)\s*=\s*["\']https?://', legacy_low)
+        assert "https://" not in legacy_low
 
         root_resp = await client.get("/")
         assert root_resp.status_code == 200
@@ -255,7 +261,7 @@ async def test_unified_local_server_stack_boots_and_completes_pump34_task(tmp_pa
 
             studio_resp = await client.get("/app")
             assert studio_resp.status_code == 200
-            assert "ControlBot Studio" in studio_resp.text
+            assert ('id="root"' in studio_resp.text) or ("ControlBot Studio" in studio_resp.text)
 
             submit = await client.post(
                 "/api/tasks",

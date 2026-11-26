@@ -8,8 +8,9 @@ import json
 import os
 import re
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, quote_plus, urlparse
@@ -17,7 +18,9 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -49,6 +52,15 @@ from src.storage.redaction import (
     is_sensitive_key_strict,
     redact_payload_strict,
 )
+from src.web.auth import (
+    DEFAULT_RATE_LIMITS,
+    RateLimitMiddleware,
+    SlidingWindowRateLimiter,
+    TokenAuthMiddleware,
+    resolve_cors_config,
+    resolve_web_token,
+    verify_websocket_token,
+)
 from src.web.live_browser import LiveBrowserController
 from src.web.live_terminal import LiveTerminalSession
 from src.web.protocols import CoordinatorProtocol, SessionManagerProtocol, TaskSnapshot, maybe_await
@@ -61,6 +73,14 @@ from src.web.schemas import (
     TaskSubmitRequest,
 )
 from src.web.stub import InMemoryCoordinatorStub
+from src.web.v1 import (
+    AgentTurnRunner,
+    ComputerGateway,
+    EventBus,
+    WorkspaceStore,
+    create_computer_router,
+    create_v1_router,
+)
 from src.web.workspace import (
     default_agy_brain_root,
     default_projects_root,
@@ -80,6 +100,7 @@ if TYPE_CHECKING:
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_FRONTEND_DIST_DIR = _REPO_ROOT / "frontend" / "dist"
 _RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "GROKBOT_DB_PATH",
     "GROKBOT_ALLOWED_ORIGINS",
@@ -95,6 +116,156 @@ _RUNTIME_ENV_KEYS: tuple[str, ...] = (
 
 def _has_runtime_env() -> bool:
     return any(bool(os.environ.get(key, "").strip()) for key in _RUNTIME_ENV_KEYS)
+
+
+class _ViteIndexParser(HTMLParser):
+    """Parse Vite's dist/index.html without fragile attribute-order regexes."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.css_paths: list[str] = []
+        self.preload_paths: list[str] = []
+        self.js_paths: list[str] = []
+        self._parts: list[str] = []
+        self._skip_script_depth = 0
+
+    def _attrs_dict(self, attrs: list[tuple[str, str | None]]) -> dict[str, str]:
+        return {k.lower(): (v or "") for k, v in attrs}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_low = tag.lower()
+        attr_map = self._attrs_dict(attrs)
+        if tag_low == "link":
+            rel_tokens = set(attr_map.get("rel", "").lower().split())
+            href = attr_map.get("href", "")
+            if href.startswith("/assets/"):
+                if "stylesheet" in rel_tokens:
+                    self.css_paths.append(href)
+                    return
+                if "modulepreload" in rel_tokens:
+                    self.preload_paths.append(href)
+                    return
+        elif tag_low == "script":
+            src = attr_map.get("src", "")
+            script_type = attr_map.get("type", "").strip().lower()
+            if script_type == "module" and src.startswith("/assets/"):
+                self.js_paths.append(src)
+                self._skip_script_depth += 1
+                return
+        raw = self.get_starttag_text()
+        if raw is not None:
+            self._parts.append(raw)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_low = tag.lower()
+        attr_map = self._attrs_dict(attrs)
+        if tag_low == "link":
+            rel_tokens = set(attr_map.get("rel", "").lower().split())
+            href = attr_map.get("href", "")
+            if href.startswith("/assets/"):
+                if "stylesheet" in rel_tokens:
+                    self.css_paths.append(href)
+                    return
+                if "modulepreload" in rel_tokens:
+                    self.preload_paths.append(href)
+                    return
+        raw = self.get_starttag_text()
+        if raw is not None:
+            self._parts.append(raw)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._skip_script_depth > 0:
+            self._skip_script_depth -= 1
+            return
+        self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_script_depth > 0:
+            return
+        self._parts.append(data)
+
+    def handle_comment(self, data: str) -> None:
+        if self._skip_script_depth > 0:
+            return
+        self._parts.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        self._parts.append(f"<!{decl}>")
+
+    def handle_entityref(self, name: str) -> None:
+        if self._skip_script_depth > 0:
+            return
+        self._parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._skip_script_depth > 0:
+            return
+        self._parts.append(f"&#{name};")
+
+    def handle_pi(self, data: str) -> None:
+        self._parts.append(f"<?{data}>")
+
+    def stripped_html(self) -> str:
+        return "".join(self._parts)
+
+
+def _render_studio_app_html(html_text: str, assets_dir: Path) -> str:
+    parser = _ViteIndexParser()
+    parser.feed(html_text)
+    parser.close()
+
+    if not (parser.css_paths or parser.preload_paths or parser.js_paths):
+        return html_text
+
+    disk_js_assets: list[str] = []
+    if assets_dir.is_dir():
+        disk_js_assets = [f"/assets/{p.name}" for p in sorted(assets_dir.glob("*.js"))]
+    all_js_chunks = sorted(set(parser.js_paths) | set(disk_js_assets))
+
+    loader = (
+        "<script>(function(){"
+        "var t=new URLSearchParams(window.location.search).get('token');"
+        "window.__GB_TOKEN=t||null;"
+        "var q=t?('?token='+encodeURIComponent(t)):'';"
+        "if(t){"
+        f"var chunks={json.dumps(all_js_chunks)};"
+        "var imports={};"
+        "chunks.forEach(function(p){imports[p]=p+q;});"
+        "var im=document.createElement('script');"
+        "im.type='importmap';"
+        "im.textContent=JSON.stringify({imports:imports});"
+        "document.head.appendChild(im);"
+        "var origFetch=window.fetch;"
+        "if(typeof origFetch==='function'){"
+        "window.fetch=function(input,init){"
+        "var url=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:'');"
+        "var originPrefix=window.location.origin+'/assets/';"
+        "if(url&&(url.indexOf('/assets/')===0||url.indexOf(originPrefix)===0)"
+        "&&url.indexOf('token=')===-1){"
+        "var sep=url.indexOf('?')===-1?'?':'&';"
+        "var nextUrl=url+sep+'token='+encodeURIComponent(t);"
+        "input=typeof input==='string'?nextUrl:new Request(nextUrl,input);"
+        "}"
+        "return origFetch.call(this,input,init);"
+        "};"
+        "}"
+        "}"
+        f"var css={json.dumps(parser.css_paths)};"
+        f"var preloads={json.dumps(parser.preload_paths)};"
+        f"var js={json.dumps(parser.js_paths)};"
+        "css.forEach(function(p){var l=document.createElement('link');"
+        "l.rel='stylesheet';l.href=p+q;document.head.appendChild(l);});"
+        "preloads.forEach(function(p){var l=document.createElement('link');"
+        "l.rel='modulepreload';l.href=p+q;document.head.appendChild(l);});"
+        "js.forEach(function(p){var s=document.createElement('script');"
+        "s.type='module';s.src=p+q;document.head.appendChild(s);});"
+        "})();</script>"
+    )
+    cleaned = parser.stripped_html()
+    head_idx = cleaned.lower().find("</head>")
+    if head_idx != -1:
+        return cleaned[:head_idx] + f"  {loader}\n  " + cleaned[head_idx:]
+    return loader + cleaned
 
 
 def _env_origin_overrides() -> dict[str, str]:
@@ -527,6 +698,10 @@ def create_app(
     db_path: Path | str | None = None,
     coordinator: CoordinatorProtocol | None = None,
     session_manager: SessionManagerProtocol | None = None,
+    *,
+    web_token: str | None = None,
+    allowed_cors_origins: Sequence[str] | None = None,
+    rate_limits: Mapping[str, tuple[int, float]] | None = None,
 ) -> FastAPI:
     """Create the FastAPI local operator API & HTML observability UI."""
     resolved_db = Path(db_path) if db_path is not None else None
@@ -671,6 +846,26 @@ def create_app(
         )
     )
     live_browser = LiveBrowserController(profile_root=live_profile_root)
+    workspace_store = WorkspaceStore(db_path=resolved_db)
+    event_bus = EventBus()
+    uploads_dir = (
+        resolved_db.parent / "uploads"
+        if resolved_db is not None
+        else Path("var") / "uploads"
+    )
+    v1_runner = AgentTurnRunner(
+        store=workspace_store,
+        event_bus=event_bus,
+        live_browser=live_browser,
+        coordinator=coord,
+        uploads_dir=uploads_dir,
+    )
+    computer_gateway = ComputerGateway(
+        projects_root=default_projects_root(),
+        screenshot_path=live_profile_root.parent / "live_browser_latest.jpg",
+        store=workspace_store,
+        state_dir=workspace_store.db_path.parent,
+    )
 
     jinja_env = Environment(
         loader=FileSystemLoader(str(_TEMPLATES_DIR)),
@@ -680,6 +875,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await v1_runner.start_scheduler()
         try:
             if active_runtime is not None:
                 async with active_runtime:
@@ -687,15 +883,64 @@ def create_app(
             else:
                 yield
         finally:
+            await v1_runner.stop_scheduler()
             await live_browser.stop()
+            workspace_store.close()
             if active_runtime is None and owns_session_manager and internal_sm is not None:
                 await internal_sm.close_all()
+
+    configured_token = resolve_web_token(web_token)
+    rate_limiter = SlidingWindowRateLimiter()
+    effective_limits = dict(DEFAULT_RATE_LIMITS)
+    if rate_limits:
+        effective_limits.update(rate_limits)
+    cors_cfg = resolve_cors_config(allowed_cors_origins)
 
     app = FastAPI(title="Grokbotclon Local Operator Console", version="1.0.0", lifespan=lifespan)
     app.state.db_path = str(resolved_db) if resolved_db is not None else None
     app.state.coordinator = coord
     app.state.session_manager = sess_mgr
     app.state.runtime = active_runtime
+    app.state.workspace_store = workspace_store
+    app.state.event_bus = event_bus
+    app.state.v1_runner = v1_runner
+    app.state.live_browser = live_browser
+    app.state.computer_gateway = computer_gateway
+    app.state.web_token_configured = bool(configured_token)
+    app.state.web_token = configured_token
+    app.state.rate_limiter = rate_limiter
+
+    # Register inner-to-outer (Starlette wraps middlewares LIFO).
+    app.add_middleware(RateLimitMiddleware, limiter=rate_limiter, limits=effective_limits)
+    app.add_middleware(TokenAuthMiddleware, expected_token=configured_token)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_cfg.allow_origins,
+        allow_origin_regex=cors_cfg.allow_origin_regex,
+        allow_credentials=cors_cfg.allow_credentials,
+        allow_methods=cors_cfg.allow_methods,
+        allow_headers=cors_cfg.allow_headers,
+        expose_headers=cors_cfg.expose_headers,
+    )
+
+    app.include_router(
+        create_v1_router(
+            store=workspace_store,
+            event_bus=event_bus,
+            runner=v1_runner,
+            live_browser=live_browser,
+            uploads_dir=uploads_dir,
+            coordinator=coord,
+        )
+    )
+    app.include_router(
+        create_computer_router(
+            gateway=computer_gateway,
+            live_browser=live_browser,
+            store=workspace_store,
+            event_bus=event_bus,
+        )
+    )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -836,8 +1081,13 @@ def create_app(
             )
         return project_dir, browser_ctx
 
+    def _request_base_url(request: Request) -> str | None:
+        if request.url.port:
+            return f"http://127.0.0.1:{request.url.port}"
+        return None
+
     @app.post("/api/agy/send")
-    async def api_agy_send(payload: AgySendRequest) -> JSONResponse:
+    async def api_agy_send(request: Request, payload: AgySendRequest) -> JSONResponse:
         project_dir, browser_ctx = await _prepare_agy_turn(payload)
 
         try:
@@ -848,6 +1098,7 @@ def create_app(
                 model=payload.model,
                 allow_hydrogen=payload.allow_hydrogen,
                 browser_context=browser_ctx,
+                base_url=_request_base_url(request),
             )
         except ValueError as exc:
             raise HTTPException(
@@ -875,9 +1126,10 @@ def create_app(
         )
 
     @app.post("/api/agy/stream")
-    async def api_agy_stream(payload: AgySendRequest) -> StreamingResponse:
+    async def api_agy_stream(request: Request, payload: AgySendRequest) -> StreamingResponse:
         project_dir, browser_ctx = await _prepare_agy_turn(payload)
         browser_url = str(browser_ctx.get("url", "")) if browser_ctx is not None else None
+        local_base = _request_base_url(request)
 
         def _sse_line(ev: dict[str, Any]) -> str:
             scrubbed = _scrub_and_verify(ev, label="AgyStreamEvent")
@@ -899,6 +1151,7 @@ def create_app(
                 model=payload.model,
                 allow_hydrogen=payload.allow_hydrogen,
                 browser_context=browser_ctx,
+                base_url=local_base,
             )
             try:
                 async for ev in gen:
@@ -950,6 +1203,11 @@ def create_app(
 
     @app.post("/api/browser/action")
     async def api_browser_action(request: Request) -> JSONResponse:
+        if computer_gateway.is_human_takeover("default"):
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail="Browser is locked: human takeover is active.",
+            )
         raw_body = await request.body()
         if not raw_body.strip():
             raise HTTPException(status_code=400, detail="Action JSON object is required.")
@@ -1009,6 +1267,12 @@ def create_app(
 
     @app.websocket("/ws/browser")
     async def ws_live_browser(websocket: WebSocket) -> None:
+        if not verify_websocket_token(websocket, configured_token):
+            await websocket.close(code=4401)
+            return
+        if computer_gateway.is_human_takeover("default"):
+            await websocket.close(code=4423, reason="Human takeover active")
+            return
         await websocket.accept()
         await websocket.send_json({"type": "status", **(await live_browser.status())})
         initial_frame = await live_browser.capture_frame()
@@ -1023,12 +1287,37 @@ def create_app(
                 if frame is not None:
                     await websocket.send_json(frame)
 
+        mutating_browser_ops = frozenset(
+            {
+                "start",
+                "stop",
+                "navigate",
+                "back",
+                "forward",
+                "reload",
+                "click",
+                "dblclick",
+                "wheel",
+                "type",
+                "key",
+            }
+        )
+
         async def _reader() -> None:
             while True:
                 msg = await websocket.receive_json()
                 if not isinstance(msg, dict):
                     continue
                 ev_type = str(msg.get("type", "")).strip().lower()
+                if ev_type in mutating_browser_ops and computer_gateway.is_human_takeover(
+                    "default"
+                ):
+                    with contextlib.suppress(Exception):
+                        await websocket.send_json(
+                            {"type": "error", "message": "Human takeover active"}
+                        )
+                        await websocket.close(code=4423)
+                    return
                 try:
                     if ev_type == "start":
                         url_arg = msg.get("url")
@@ -1088,6 +1377,9 @@ def create_app(
 
     @app.websocket("/ws/terminal")
     async def ws_live_terminal(websocket: WebSocket) -> None:
+        if not verify_websocket_token(websocket, configured_token):
+            await websocket.close(code=4401)
+            return
         await websocket.accept()
         project_name = websocket.query_params.get("project", "").strip()
         if project_name:
@@ -1278,9 +1570,42 @@ def create_app(
             ) from exc
         return JSONResponse(status_code=status.HTTP_200_OK, content=_serialize_session(state))
 
-    @app.get("/app", response_class=HTMLResponse)
-    async def ui_studio(request: Request) -> Response:
+    @app.get("/assets/{file_path:path}")
+    async def ui_frontend_asset(file_path: str) -> Response:
+        assets_root = (_FRONTEND_DIST_DIR / "assets").resolve()
+        if not assets_root.is_dir():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found.")
+        candidate = (assets_root / file_path).resolve()
+        if not candidate.is_relative_to(assets_root) or not candidate.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found.")
+        return FileResponse(
+            candidate,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
+    @app.get("/studio-legacy", response_class=HTMLResponse)
+    async def ui_studio_legacy(request: Request) -> Response:
         return templates.TemplateResponse(request, "studio.html", {})
+
+    @app.get("/app", response_class=HTMLResponse)
+    @app.get("/app/{subpath:path}", response_class=HTMLResponse)
+    async def ui_studio(request: Request, subpath: str = "") -> Response:
+        del subpath
+        dist_index = _FRONTEND_DIST_DIR / "index.html"
+        if dist_index.is_file():
+            raw_html = dist_index.read_text(encoding="utf-8")
+            rendered = _render_studio_app_html(raw_html, _FRONTEND_DIST_DIR / "assets")
+            return HTMLResponse(
+                content=rendered,
+                status_code=status.HTTP_200_OK,
+                headers={"Cache-Control": "no-store"},
+            )
+        return templates.TemplateResponse(
+            request,
+            "studio.html",
+            {},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/", response_class=HTMLResponse)
     async def ui_index(request: Request, error: str | None = None) -> Response:

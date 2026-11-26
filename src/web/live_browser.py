@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ipaddress
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -18,6 +20,7 @@ _VIEWPORT_WIDTH = 1280
 _VIEWPORT_HEIGHT = 800
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]", "10.", "192.168.")
 _INLINE_TOKEN_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pou]_[A-Za-z0-9_]{8,})\b")
+_SELECTOR_SAFE_RE = re.compile(r'["\\\x00-\x1f\x7f]')
 _EXTRACT_JS = r"""(maxElements) => {
   const collectText = (doc) => {
     if (!doc || !doc.body) return "";
@@ -95,6 +98,171 @@ def normalize_browser_url(raw_url: str) -> str:
     return cleaned
 
 
+def _has_unsafe_authority_chars(value: str) -> bool:
+    return any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def _extract_raw_authority(url_clean: str) -> str:
+    if "://" not in url_clean:
+        return ""
+    after_scheme = url_clean.split("://", 1)[1]
+    end = len(after_scheme)
+    for sep in ("/", "?", "#"):
+        idx = after_scheme.find(sep)
+        if idx != -1 and idx < end:
+            end = idx
+    return after_scheme[:end]
+
+
+def _parse_domain_spec(raw_spec: str) -> tuple[str | None, str, int | None] | None:
+    """Parse a domain or URL spec into (explicit_scheme, host, explicit_port)."""
+    exp = raw_spec.strip()
+    if not exp or _has_unsafe_authority_chars(exp) or "@" in exp or "\\" in exp:
+        return None
+    has_scheme = "://" in exp
+    if not has_scheme and ("/" in exp or "?" in exp or "#" in exp):
+        return None
+    candidate = exp if has_scheme else f"https://{exp}"
+    try:
+        parsed = urlparse(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+        or "\\" in parsed.netloc
+        or _has_unsafe_authority_chars(parsed.netloc)
+    ):
+        return None
+    scheme_low = parsed.scheme.lower()
+    if has_scheme and scheme_low not in {"http", "https"}:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return None
+    return (scheme_low if has_scheme else None), host, port
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def domain_matches_url(expected_domain: str, active_url: str) -> bool:
+    """Return True iff `active_url` is an http(s) URL matching `expected_domain`."""
+    exp_spec = _parse_domain_spec(expected_domain)
+    if exp_spec is None:
+        return False
+    exp_scheme, exp_host, exp_port = exp_spec
+
+    url_clean = active_url.strip()
+    if not url_clean:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url_clean):
+        return False
+    raw_authority = _extract_raw_authority(url_clean)
+    if (
+        not raw_authority
+        or "@" in raw_authority
+        or "\\" in raw_authority
+        or _has_unsafe_authority_chars(raw_authority)
+    ):
+        return False
+    try:
+        parsed_url = urlparse(url_clean)
+        actual_port = parsed_url.port
+    except ValueError:
+        return False
+    if (
+        parsed_url.username is not None
+        or parsed_url.password is not None
+        or "@" in parsed_url.netloc
+        or "\\" in parsed_url.netloc
+        or _has_unsafe_authority_chars(parsed_url.netloc)
+    ):
+        return False
+
+    actual_scheme = parsed_url.scheme.lower()
+    if actual_scheme not in {"http", "https"}:
+        return False
+    actual_host = (parsed_url.hostname or "").lower().rstrip(".")
+    if not actual_host:
+        return False
+
+    if exp_scheme is not None and actual_scheme != exp_scheme:
+        return False
+
+    if exp_port is not None:
+        effective_actual_port = (
+            actual_port if actual_port is not None else (443 if actual_scheme == "https" else 80)
+        )
+        if effective_actual_port != exp_port:
+            return False
+
+    if _is_ip_literal(exp_host) or _is_ip_literal(actual_host):
+        return actual_host == exp_host
+    return actual_host == exp_host or actual_host.endswith(f".{exp_host}")
+
+
+def domains_compatible(domain_a: str, domain_b: str) -> bool:
+    """Return True iff two domain/URL specs denote the same or parent/subdomain origin."""
+    spec_a = _parse_domain_spec(domain_a)
+    spec_b = _parse_domain_spec(domain_b)
+    if spec_a is None or spec_b is None:
+        return False
+    scheme_a, host_a, port_a = spec_a
+    scheme_b, host_b, port_b = spec_b
+    if scheme_a is not None and scheme_b is not None and scheme_a != scheme_b:
+        return False
+    if port_a is not None and port_b is not None and port_a != port_b:
+        return False
+    if _is_ip_literal(host_a) or _is_ip_literal(host_b):
+        return host_a == host_b
+    return (
+        host_a == host_b
+        or host_a.endswith(f".{host_b}")
+        or host_b.endswith(f".{host_a}")
+    )
+
+
+def _candidate_selectors(field_name: str) -> list[str]:
+    esc = _SELECTOR_SAFE_RE.sub("", field_name).strip()
+    low = esc.lower()
+    selectors: list[str] = []
+    if esc:
+        selectors.append(f'input[name="{esc}"]')
+    if "pass" in low or low in {"pwd", "secret", "pin", "passcode"}:
+        selectors.append('input[type="password"]')
+        if esc:
+            selectors.append(f'input[id*="{esc}"]')
+    elif "email" in low or "user" in low or "login" in low:
+        selectors.extend(
+            [
+                'input[type="email"]',
+                'input[name*="user"]',
+                'input[name*="email"]',
+                'input[name*="login"]',
+            ]
+        )
+        if esc:
+            selectors.append(f'input[id*="{esc}"]')
+        selectors.append('input[type="text"]')
+    elif esc:
+        selectors.extend(
+            [
+                f'textarea[name="{esc}"]',
+                f'input[id="{esc}"]',
+                f'[name*="{esc}"]',
+            ]
+        )
+    return selectors
+
+
 class LiveBrowserController:
     """Lazy persistent Playwright Chromium session controlled over HTTP/WebSocket."""
 
@@ -121,6 +289,64 @@ class LiveBrowserController:
     @property
     def running(self) -> bool:
         return self._active_page() is not None
+
+    def current_url(self) -> str | None:
+        """Return the active page URL if the browser is running, else None."""
+        page = self._active_page()
+        return page.url if page is not None else None
+
+    async def fill_credentials(
+        self,
+        fields: dict[str, str],
+        *,
+        expected_domain: str | Sequence[str] | None = None,
+        submit_selector: str | None = None,
+    ) -> dict[str, Any]:
+        """Fill credential fields on the active page after fail-closed origin verification."""
+        async with self._lock:
+            page = self._active_page()
+            if page is None:
+                return {"filled": False, "reason": "browser_not_running", "url": None}
+            active_url = page.url
+            required_domains: list[str]
+            if expected_domain is None:
+                required_domains = []
+            elif isinstance(expected_domain, str):
+                cleaned_dom = expected_domain.strip()
+                required_domains = [cleaned_dom] if cleaned_dom else []
+            else:
+                required_domains = [
+                    str(dom).strip() for dom in expected_domain if str(dom).strip()
+                ]
+            if not required_domains:
+                return {"filled": False, "reason": "domain_required", "url": active_url}
+            for dom in required_domains:
+                if not domain_matches_url(dom, active_url):
+                    return {"filled": False, "reason": "origin_mismatch", "url": active_url}
+            if not fields:
+                return {"filled": False, "reason": "no_fields", "url": active_url}
+
+            filled_fields: list[str] = []
+            for field_name, field_value in fields.items():
+                for selector in _candidate_selectors(field_name):
+                    with contextlib.suppress(Exception):
+                        loc = page.locator(selector)
+                        if await loc.count() > 0:
+                            await loc.first.fill(field_value, timeout=2000)
+                            filled_fields.append(field_name)
+                            break
+
+            if filled_fields and submit_selector:
+                with contextlib.suppress(Exception):
+                    btn = page.locator(submit_selector)
+                    if await btn.count() > 0:
+                        await btn.first.click(timeout=2000)
+
+            return {
+                "filled": bool(filled_fields),
+                "reason": "ok" if filled_fields else "no_matching_inputs",
+                "url": active_url,
+            }
 
     async def status(self) -> dict[str, Any]:
         """Return current browser running status, URL, and page title."""
