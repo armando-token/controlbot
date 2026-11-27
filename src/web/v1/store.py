@@ -1696,6 +1696,28 @@ class WorkspaceStore:
                 "drafts_enabled",
                 "conversation_id",
             }
+            non_nullable_cols = {
+                "name",
+                "role_prompt",
+                "about",
+                "avatar_shape",
+                "avatar_color",
+                "avatar_eyes_large",
+                "engine_id",
+                "model_id",
+                "thinking_level",
+                "pinned",
+                "hidden",
+                "is_primary",
+                "is_team_bot",
+                "unread_count",
+                "needs_attention",
+                "status_state",
+                "status_subtext",
+                "computer_active",
+                "timezone",
+                "drafts_enabled",
+            }
             if updates.get("is_primary") is True:
                 conn.execute("UPDATE bots SET is_primary = 0 WHERE id != ?", (bot_id,))
 
@@ -1704,6 +1726,8 @@ class WorkspaceStore:
             for key, value in updates.items():
                 if key not in allowed_cols:
                     continue
+                if value is None and key in non_nullable_cols:
+                    raise StoreValidationError(f"Field '{key}' must not be null.")
                 cols.append(f"{key} = ?")
                 vals.append(int(bool(value)) if key in bool_cols else value)
 
@@ -1749,6 +1773,19 @@ class WorkspaceStore:
             conn.execute("DELETE FROM routine_runs WHERE bot_id = ?", (bot_id,))
             conn.execute("DELETE FROM routines WHERE bot_id = ?", (bot_id,))
             conn.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
+            now = utc_iso_now()
+            channel_rows = conn.execute("SELECT id, bot_ids_json FROM channels").fetchall()
+            for ch_row in channel_rows:
+                raw_ids = _loads_json(ch_row["bot_ids_json"], [])
+                if not isinstance(raw_ids, list):
+                    continue
+                old_ids = [str(item) for item in raw_ids]
+                new_ids = [item for item in old_ids if item != bot_id]
+                if len(new_ids) != len(old_ids):
+                    conn.execute(
+                        "UPDATE channels SET bot_ids_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(new_ids), now, str(ch_row["id"])),
+                    )
             self.append_audit_event(
                 actor="operator",
                 action="bot.delete",
@@ -2447,6 +2484,32 @@ class WorkspaceStore:
             )
             conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
 
+            like_art = f"%{_escape_like(artifact_id)}%"
+            art_msg_rows = conn.execute(
+                "SELECT id, artifacts_json FROM messages "
+                "WHERE artifacts_json LIKE ? ESCAPE '\\'",
+                (like_art,),
+            ).fetchall()
+            updated_message_ids: list[str] = []
+            for mrow in art_msg_rows:
+                parsed_arts = _loads_json(str(mrow["artifacts_json"]), [])
+                if not isinstance(parsed_arts, list):
+                    continue
+                filtered_arts = [
+                    item
+                    for item in parsed_arts
+                    if not (
+                        (isinstance(item, Mapping) and str(item.get("id") or "") == artifact_id)
+                        or (isinstance(item, str) and item == artifact_id)
+                    )
+                ]
+                if len(filtered_arts) != len(parsed_arts):
+                    conn.execute(
+                        "UPDATE messages SET artifacts_json = ? WHERE id = ?",
+                        (json.dumps(filtered_arts), str(mrow["id"])),
+                    )
+                    updated_message_ids.append(str(mrow["id"]))
+
             unreferenced_path: str | None = None
             url = str(art.get("url") or "")
             base_url = url.split("?", 1)[0].split("#", 1)[0].strip().rstrip("/")
@@ -2519,6 +2582,7 @@ class WorkspaceStore:
                 "deleted": True,
                 "artifact": art,
                 "attachment_path": unreferenced_path,
+                "updated_message_ids": updated_message_ids,
             }
 
     def list_bot_library(
@@ -2984,6 +3048,7 @@ class WorkspaceStore:
         normalized_rules: list[tuple[str, str, str, int]] = []
         allow_count = 0
         ask_count = 0
+        seen_ids: set[str] = set()
         for idx, item in enumerate(rules):
             if not isinstance(item, Mapping):
                 raise StoreValidationError("Each auto-review rule must be a mapping.")
@@ -3002,7 +3067,15 @@ class WorkspaceStore:
                 allow_count += 1
             else:
                 ask_count += 1
-            rule_id = str(item.get("id") or f"arr_{uuid.uuid4().hex[:10]}")
+            raw_id = item.get("id")
+            cleaned_id = str(raw_id).strip() if raw_id is not None else ""
+            if cleaned_id:
+                if cleaned_id in seen_ids:
+                    raise StoreValidationError(f"Duplicate auto-review rule id: {cleaned_id}")
+                seen_ids.add(cleaned_id)
+                rule_id = cleaned_id
+            else:
+                rule_id = f"arr_{uuid.uuid4().hex[:10]}"
             normalized_rules.append((rule_id, bucket, rule_text, idx))
 
         if allow_count > MAX_AUTO_REVIEW_RULES_PER_BUCKET:
@@ -3263,6 +3336,13 @@ class WorkspaceStore:
                 raise StoreNotFoundError(f"Routine not found: {routine_id}")
             cols: list[str] = []
             vals: list[Any] = []
+            non_nullable_routine_fields = {
+                "name",
+                "instruction",
+                "schedule_type",
+                "timezone",
+                "visibility",
+            }
             routine_fields = (
                 "name",
                 "instruction",
@@ -3273,9 +3353,14 @@ class WorkspaceStore:
             )
             for key in routine_fields:
                 if key in updates:
+                    val = updates[key]
+                    if val is None and key in non_nullable_routine_fields:
+                        raise StoreValidationError(f"Field '{key}' must not be null.")
                     cols.append(f"{key} = ?")
-                    vals.append(updates[key])
-            if "enabled" in updates and updates["enabled"] is not None:
+                    vals.append(val)
+            if "enabled" in updates:
+                if updates["enabled"] is None:
+                    raise StoreValidationError("Field 'enabled' must not be null.")
                 cols.append("enabled = ?")
                 vals.append(int(bool(updates["enabled"])))
             if updates.get("regenerate_webhook_key") is True:
@@ -3335,6 +3420,13 @@ class WorkspaceStore:
             ).fetchone()
             assert row is not None
             return self._row_to_routine_run(row)
+
+    def get_routine_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM routine_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            return self._row_to_routine_run(row) if row is not None else None
 
     def update_routine_run(self, run_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         with self.write_tx() as conn:

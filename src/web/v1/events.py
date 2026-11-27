@@ -17,8 +17,8 @@ from typing import Any
 
 from src.storage.redaction import redact_payload_strict
 
-_EVT_EPOCH_RE = re.compile(r"^evt_(\d+)_([A-Za-z0-9-]+)$")
-_COLON_EPOCH_RE = re.compile(r"^([A-Za-z0-9-]+):(\d+)$")
+_EVT_EPOCH_RE = re.compile(r"^evt_(\d+)_([A-Za-z0-9_-]+)$")
+_COLON_EPOCH_RE = re.compile(r"^([A-Za-z0-9_-]+):(\d+)$")
 _EVT_LEGACY_RE = re.compile(r"^evt_(\d+)$")
 _DIGITS_RE = re.compile(r"^(\d+)$")
 

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   CheckCircle2,
   ClipboardPaste,
@@ -33,10 +33,24 @@ export const FullScreenTakeoverModal: React.FC = () => {
   const pushToast = useUiStore((s) => s.pushToast);
 
   const status = useComputerStore((s) => (vmId ? s.byVmId[vmId] : undefined));
+  const statusLoaded = useComputerStore((s) => (vmId ? Boolean(s.loadedByVmId[vmId]) : false));
   const setStatus = useComputerStore((s) => s.setStatus);
   const preferredSource = useComputerStore((s) => s.preferredSource);
+  const hasExplicitSourceChoice = useComputerStore((s) => s.hasExplicitSourceChoice);
   const setPreferredSource = useComputerStore((s) => s.setPreferredSource);
   const addTeachStep = useComputerStore((s) => s.addTeachStep);
+
+  const statusQuery = useQuery({
+    queryKey: ['computer-status', vmId],
+    queryFn: () => computerApi.status(vmId!),
+    enabled: Boolean(vmId) && !statusLoaded,
+  });
+
+  useEffect(() => {
+    if (statusQuery.data) {
+      setStatus(statusQuery.data);
+    }
+  }, [statusQuery.data, setStatus]);
 
   const canvasRef = useRef<LiveVncHandle | null>(null);
   const controlWsRef = useRef<WebSocket | null>(null);
@@ -46,7 +60,13 @@ export const FullScreenTakeoverModal: React.FC = () => {
   const [clipboardText, setClipboardText] = useState('');
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
 
-  const isTakeover = status?.control_owner === 'human_takeover';
+  const currentStatus = status ?? statusQuery.data;
+  const isTakeover = currentStatus?.control_owner === 'human_takeover';
+  const effectiveSource: 'vnc' | 'screencast' =
+    currentStatus && !currentStatus.vnc_available && !hasExplicitSourceChoice
+      ? 'screencast'
+      : preferredSource;
+  const canMountCanvas = statusLoaded || statusQuery.isError;
 
   const sendViewportResize = useCallback((force = false) => {
     const ws = controlWsRef.current;
@@ -247,22 +267,23 @@ export const FullScreenTakeoverModal: React.FC = () => {
       if (debounceTimer !== null) window.clearTimeout(debounceTimer);
       ro.disconnect();
     };
-  }, [vmId, preferredSource, isTakeover, sendViewportResize]);
+  }, [vmId, effectiveSource, isTakeover, sendViewportResize]);
 
   // Countdown display for lease TTL
   useEffect(() => {
-    if (!status?.lease_expires_at || !isTakeover) {
+    const expiresAt = currentStatus?.lease_expires_at;
+    if (!expiresAt || !isTakeover) {
       setSecondsLeft(null);
       return;
     }
     const tick = () => {
-      const ms = new Date(status.lease_expires_at!).getTime() - Date.now();
+      const ms = new Date(expiresAt).getTime() - Date.now();
       setSecondsLeft(Math.max(0, Math.floor(ms / 1000)));
     };
     tick();
     const id = window.setInterval(tick, 1000);
     return () => window.clearInterval(id);
-  }, [status?.lease_expires_at, isTakeover]);
+  }, [currentStatus?.lease_expires_at, isTakeover]);
 
   const takeoverMutation = useMutation({
     mutationFn: () => computerApi.takeover(vmId || 'default'),
@@ -380,7 +401,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
                 onClick={() => setPreferredSource('vnc')}
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[12px] font-medium"
                 style={{
-                  backgroundColor: preferredSource === 'vnc' ? 'var(--bg-active)' : 'transparent',
+                  backgroundColor: effectiveSource === 'vnc' ? 'var(--bg-active)' : 'transparent',
                 }}
               >
                 <Monitor size={12.5} />
@@ -392,7 +413,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[12px] font-medium"
                 style={{
                   backgroundColor:
-                    preferredSource === 'screencast' ? 'var(--bg-active)' : 'transparent',
+                    effectiveSource === 'screencast' ? 'var(--bg-active)' : 'transparent',
                 }}
               >
                 <Globe size={12.5} />
@@ -522,12 +543,22 @@ export const FullScreenTakeoverModal: React.FC = () => {
 
         {/* Live Canvas */}
         <div ref={viewportContainerRef} className="flex-1 min-h-0">
-          <LiveVncCanvas
-            ref={canvasRef}
-            vmId={vmId}
-            source={preferredSource}
-            interactive={isTakeover}
-          />
+          {!canMountCanvas ? (
+            <div
+              className="h-full min-h-[220px] flex flex-col items-center justify-center gap-2 p-4 text-center"
+              style={{ backgroundColor: '#18191C', color: '#A1A7B5' }}
+            >
+              <Monitor size={22} className="text-[#A78BFA]" />
+              <div className="text-[12.5px]">Checking display availability…</div>
+            </div>
+          ) : (
+            <LiveVncCanvas
+              ref={canvasRef}
+              vmId={vmId}
+              source={effectiveSource}
+              interactive={isTakeover}
+            />
+          )}
         </div>
 
         {/* Agent Lock Notice */}

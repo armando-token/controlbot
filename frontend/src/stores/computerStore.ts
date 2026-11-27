@@ -11,7 +11,9 @@ export interface TeachStepItem {
 
 interface ComputerState {
   byVmId: Record<string, ComputerStatus>;
+  loadedByVmId: Record<string, boolean>;
   preferredSource: 'vnc' | 'screencast';
+  hasExplicitSourceChoice: boolean;
   teachSteps: TeachStepItem[];
 
   setStatus: (status: ComputerStatus) => void;
@@ -44,18 +46,40 @@ const defaultStatus: ComputerStatus = {
 
 export const useComputerStore = create<ComputerState>((set) => ({
   byVmId: { default: defaultStatus },
+  loadedByVmId: {},
   preferredSource: 'vnc',
+  hasExplicitSourceChoice: false,
   teachSteps: [],
 
   setStatus: (status) =>
-    set((s) => ({
-      byVmId: {
-        ...s.byVmId,
-        [status.vm_id || 'default']: status,
-      },
-    })),
+    set((s) => {
+      const vmKey = status.vm_id || 'default';
+      const vncUnavailable = !status.vnc_available;
+      let nextPreferred = s.preferredSource;
+      if (vncUnavailable && s.preferredSource === 'vnc' && !s.hasExplicitSourceChoice) {
+        nextPreferred = 'screencast';
+      } else if (
+        !vncUnavailable &&
+        status.display_mode === 'vnc' &&
+        s.preferredSource === 'screencast' &&
+        !s.hasExplicitSourceChoice
+      ) {
+        nextPreferred = 'vnc';
+      }
+      return {
+        byVmId: {
+          ...s.byVmId,
+          [vmKey]: status,
+        },
+        loadedByVmId: {
+          ...s.loadedByVmId,
+          [vmKey]: true,
+        },
+        preferredSource: nextPreferred,
+      };
+    }),
 
-  setPreferredSource: (preferredSource) => set({ preferredSource }),
+  setPreferredSource: (preferredSource) => set({ preferredSource, hasExplicitSourceChoice: true }),
 
   addTeachStep: (step) =>
     set((s) => ({

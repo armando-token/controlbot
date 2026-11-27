@@ -88,9 +88,23 @@ def _split_top_level_args(arg_str: str) -> list[str]:
 
 def _strip_sheet_prefix(ref: str, default_sheet: str) -> tuple[str, str]:
     if "!" in ref:
-        sheet_part, coord_part = ref.split("!", 1)
-        return sheet_part.strip().strip("'"), coord_part.strip()
+        sheet_part, coord_part = ref.rsplit("!", 1)
+        cleaned_sheet = sheet_part.strip()
+        if (
+            len(cleaned_sheet) >= 2
+            and cleaned_sheet.startswith("'")
+            and cleaned_sheet.endswith("'")
+        ):
+            cleaned_sheet = cleaned_sheet[1:-1].replace("''", "'")
+        return cleaned_sheet, coord_part.strip()
     return default_sheet, ref.strip()
+
+
+_SHEET_PREFIX_RE = r"(?:(?:'(?:[^']|'')+'|[A-Za-z0-9_]+)!)"
+_CELL_COORD_RE = r"\$?[A-Za-z]{1,3}\$?\d+"
+_RANGE_SPLIT_RE = re.compile(
+    rf"^({_SHEET_PREFIX_RE}?{_CELL_COORD_RE}):({_SHEET_PREFIX_RE}?{_CELL_COORD_RE})$"
+)
 
 
 def _expand_range_coords(
@@ -99,9 +113,13 @@ def _expand_range_coords(
     default_sheet: str,
     sheet_map: Mapping[str, ParsedExcelSheet],
 ) -> tuple[str, list[str]]:
-    if ":" not in range_expr:
-        raise ExcelFormulaEvalError("#REF!")
-    left, right = range_expr.split(":", 1)
+    match = _RANGE_SPLIT_RE.fullmatch(range_expr.strip())
+    if match is None:
+        if ":" not in range_expr:
+            raise ExcelFormulaEvalError("#REF!")
+        left, right = range_expr.rsplit(":", 1)
+    else:
+        left, right = match.group(1), match.group(2)
     sheet_l, coord_l = _strip_sheet_prefix(left, default_sheet)
     sheet_r, coord_r = _strip_sheet_prefix(right, default_sheet)
     target_sheet = sheet_l
@@ -253,8 +271,13 @@ class _FormulaEvaluator:
             ):
                 op = _consume()[1]
                 right = _parse_add_sub()
-                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                    lf, rf = float(left), float(right)
+                left_is_num = isinstance(left, (int, float)) and not isinstance(left, bool)
+                right_is_num = isinstance(right, (int, float)) and not isinstance(right, bool)
+                if (left_is_num and (right_is_num or right is None)) or (
+                    left is None and right_is_num
+                ):
+                    lf = 0.0 if left is None else float(left)
+                    rf = 0.0 if right is None else float(right)
                     if op == "=":
                         left = lf == rf
                     elif op == "<>":
@@ -267,6 +290,22 @@ class _FormulaEvaluator:
                         left = lf > rf
                     elif op == ">=":
                         left = lf >= rf
+                elif (isinstance(left, bool) and (isinstance(right, bool) or right is None)) or (
+                    left is None and isinstance(right, bool)
+                ):
+                    lb = False if left is None else bool(left)
+                    rb = False if right is None else bool(right)
+                    if op == "=":
+                        left = lb == rb
+                    elif op == "<>":
+                        left = lb != rb
+                    else:
+                        li, ri = (1 if lb else 0), (1 if rb else 0)
+                        left = (
+                            li < ri
+                            if op == "<"
+                            else (li <= ri if op == "<=" else (li > ri if op == ">" else li >= ri))
+                        )
                 else:
                     ls = "" if left is None else str(left)
                     rs = "" if right is None else str(right)
@@ -314,7 +353,14 @@ class _FormulaEvaluator:
                 val = _parse_unary()
                 fval = _to_float(val)
                 return -fval if op == "-" else fval
-            return _parse_primary()
+            return _parse_postfix()
+
+        def _parse_postfix() -> Any:
+            val = _parse_primary()
+            while (nxt := _peek()) is not None and nxt[0] == "PCT":
+                _consume()
+                val = _to_float(val) / 100.0
+            return val
 
         def _parse_primary() -> Any:
             tok = _peek()
@@ -700,9 +746,14 @@ class _FormulaEvaluator:
                 i += len(m_num.group(0))
                 continue
 
+            if ch == "%":
+                tokens.append(("PCT", "%"))
+                i += 1
+                continue
+
             # Range or cell reference (with optional Sheet! prefix) or function/ident
             m_range = re.match(
-                r"(?:[A-Za-z0-9_']+!)?\$?[A-Za-z]{1,3}\$?\d+:(?:[A-Za-z0-9_']+!)?\$?[A-Za-z]{1,3}\$?\d+",
+                rf"{_SHEET_PREFIX_RE}?{_CELL_COORD_RE}:{_SHEET_PREFIX_RE}?{_CELL_COORD_RE}",
                 expr[i:],
             )
             if m_range:
@@ -710,7 +761,7 @@ class _FormulaEvaluator:
                 i += len(m_range.group(0))
                 continue
 
-            m_ref = re.match(r"(?:[A-Za-z0-9_']+!)?\$?[A-Za-z]{1,3}\$?\d+", expr[i:])
+            m_ref = re.match(rf"{_SHEET_PREFIX_RE}?{_CELL_COORD_RE}", expr[i:])
             if m_ref:
                 # Ensure it isn't immediately followed by '(' (which would be invalid)
                 end_pos = i + len(m_ref.group(0))
@@ -839,7 +890,11 @@ class SpreadsheetVerifier:
         # 2. Check expected totals if provided
         if expected_totals:
             for ref_key, expected_val in expected_totals.items():
-                lookup_key = ref_key if "!" in ref_key else f"{sheets[0].name}!{ref_key.upper()}"
+                if "!" in ref_key:
+                    sh_part, coord_part = _strip_sheet_prefix(ref_key, sheets[0].name)
+                    lookup_key = f"{sh_part}!{coord_part.upper()}"
+                else:
+                    lookup_key = f"{sheets[0].name}!{ref_key.upper()}"
                 actual_val = evaluated_values.get(lookup_key)
                 if actual_val is None and "!" not in ref_key:
                     # Fallback lookup across sheets

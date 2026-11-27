@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import mimetypes
 import os
 import secrets
@@ -106,6 +107,36 @@ def _scrub_str(value: str) -> str:
     return scrubbed
 
 
+def coerce_finite_int(raw: Any) -> int:
+    """Coerce a JSON scalar to a finite integer, rejecting bools and non-finite floats."""
+    if isinstance(raw, bool):
+        raise ValueError("Boolean is not a valid integer.")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        if not math.isfinite(raw):
+            raise ValueError("Non-finite float cannot be converted to integer.")
+        return int(raw)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            raise ValueError("Empty string is not a valid integer.")
+        return int(stripped)
+    raise TypeError(f"Unsupported integer type: {type(raw).__name__}")
+
+
+def _safe_coord_int(raw: Any, default: int = 0) -> int:
+    if isinstance(raw, bool):
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(val):
+        return default
+    return int(round(val))
+
+
 def _to_json_dict(obj: Any) -> dict[str, Any]:
     if isinstance(obj, dict):
         return dict(obj)
@@ -123,7 +154,7 @@ async def _read_optional_json_object(request: Request) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(raw_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid JSON request body.",
@@ -458,17 +489,17 @@ def _describe_browser_action(event: dict[str, Any], *, url: str = "") -> str:
     if ev_type == "reload":
         return "Reload current page"
     if ev_type == "click":
-        x = int(round(float(event.get("x", 0))))
-        y = int(round(float(event.get("y", 0))))
+        x = _safe_coord_int(event.get("x", 0))
+        y = _safe_coord_int(event.get("y", 0))
         btn = str(event.get("button", "left")).lower()
         return f"Click ({btn}) at ({x}, {y})"
     if ev_type == "dblclick":
-        x = int(round(float(event.get("x", 0))))
-        y = int(round(float(event.get("y", 0))))
+        x = _safe_coord_int(event.get("x", 0))
+        y = _safe_coord_int(event.get("y", 0))
         return f"Double-click at ({x}, {y})"
     if ev_type == "wheel":
-        dx = int(round(float(event.get("dx", 0))))
-        dy = int(round(float(event.get("dy", 0))))
+        dx = _safe_coord_int(event.get("dx", 0))
+        dy = _safe_coord_int(event.get("dy", 0))
         return f"Scroll by ({dx}, {dy})"
     if ev_type == "type":
         raw_text = str(event.get("text", ""))
@@ -1423,11 +1454,11 @@ def create_computer_router(
         ttl_arg: int | None = None
         if raw_ttl is not None:
             try:
-                ttl_arg = int(raw_ttl)
-            except (TypeError, ValueError) as exc:
+                ttl_arg = coerce_finite_int(raw_ttl)
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="ttl_seconds must be an integer.",
+                    status_code=422,
+                    detail="ttl_seconds must be a finite integer.",
                 ) from exc
         session_id = str(body.get("session_id") or "default").strip() or "default"
         token_payload = gateway.mint_token_response(
@@ -1445,11 +1476,11 @@ def create_computer_router(
         ttl_arg: int | None = None
         if raw_ttl is not None:
             try:
-                ttl_arg = int(raw_ttl)
-            except (TypeError, ValueError) as exc:
+                ttl_arg = coerce_finite_int(raw_ttl)
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="ttl_seconds must be an integer.",
+                    status_code=422,
+                    detail="ttl_seconds must be a finite integer.",
                 ) from exc
         idem_key = request.headers.get("idempotency-key")
         try:
@@ -1510,7 +1541,7 @@ def create_computer_router(
             )
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail=_scrub_str(str(exc)),
             ) from exc
         except Exception as exc:
@@ -1661,7 +1692,23 @@ def create_computer_router(
             code = _file_access_error_code(msg)
             raise HTTPException(status_code=code, detail=_scrub_str(msg)) from exc
 
-        parent_dir.mkdir(parents=True, exist_ok=True)
+        if parent_dir.exists() and not parent_dir.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Target upload path is not a directory.",
+            )
+        try:
+            parent_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot prepare upload directory: {exc}",
+            ) from exc
+        if target.exists() and target.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Target upload file path is a directory.",
+            )
         total_bytes = 0
         try:
             with target.open("wb") as handle:
@@ -1935,9 +1982,12 @@ def create_computer_router(
             # Relay 1-byte ClientInit before enabling the post-ClientInit RFB Input Gate
             init_buf = bytearray(leftover)
             while len(init_buf) < 1:
-                first_chunk = await websocket.receive_bytes()
-                if not first_chunk:
+                raw = await websocket.receive()
+                if raw.get("type") == "websocket.disconnect":
                     return
+                first_chunk = raw.get("bytes")
+                if not isinstance(first_chunk, (bytes, bytearray)) or not first_chunk:
+                    continue
                 init_buf.extend(first_chunk)
             tcp_writer.write(bytes(init_buf[:1]))
             await tcp_writer.drain()
@@ -1955,11 +2005,14 @@ def create_computer_router(
 
             async def _ws_to_vnc() -> None:
                 while True:
-                    chunk = await websocket.receive_bytes()
-                    if not chunk:
+                    raw = await websocket.receive()
+                    if raw.get("type") == "websocket.disconnect":
                         break
+                    chunk = raw.get("bytes")
+                    if not isinstance(chunk, (bytes, bytearray)) or not chunk:
+                        continue
                     allow_input = gateway.get_control_owner(vm_id) == "human_takeover"
-                    filtered = gate.feed(chunk, allow_input=allow_input)
+                    filtered = gate.feed(bytes(chunk), allow_input=allow_input)
                     if filtered:
                         tcp_writer.write(filtered)
                         await tcp_writer.drain()
@@ -2028,11 +2081,26 @@ def create_computer_router(
 
         async def _reader() -> None:
             while True:
-                msg = await websocket.receive_json()
+                raw = await websocket.receive()
+                if raw.get("type") == "websocket.disconnect":
+                    break
+                raw_text = raw.get("text")
+                if not isinstance(raw_text, str):
+                    continue
+                try:
+                    msg = json.loads(raw_text)
+                except (json.JSONDecodeError, ValueError):
+                    continue
                 if not isinstance(msg, dict):
                     continue
                 ev_type = str(msg.get("type") or msg.get("action") or "").strip().lower()
                 if not ev_type:
+                    continue
+                if ev_type == "ping":
+                    await websocket.send_json({"type": "pong", "ts": _utc_now_iso()})
+                    continue
+                if ev_type == "status":
+                    await _send_state_and_frame()
                     continue
 
                 is_raw_input = ev_type in _RAW_BROWSER_INPUT_TYPES
@@ -2146,7 +2214,16 @@ def create_computer_router(
             initial_st = await gateway.get_status(vm_id, live_browser=live_browser)
             await websocket.send_json({"op": "computer.state", "status": initial_st})
             while True:
-                msg = await websocket.receive_json()
+                raw = await websocket.receive()
+                if raw.get("type") == "websocket.disconnect":
+                    break
+                raw_text = raw.get("text")
+                if not isinstance(raw_text, str):
+                    continue
+                try:
+                    msg = json.loads(raw_text)
+                except (json.JSONDecodeError, ValueError):
+                    continue
                 if not isinstance(msg, dict):
                     continue
                 op = str(msg.get("op") or "").strip().lower()
@@ -2176,9 +2253,9 @@ def create_computer_router(
                         )
                 elif op == "viewport.resize":
                     try:
-                        w = int(msg.get("width", 1280))
-                        h = int(msg.get("height", 800))
-                    except (TypeError, ValueError):
+                        w = coerce_finite_int(msg.get("width", 1280))
+                        h = coerce_finite_int(msg.get("height", 800))
+                    except (TypeError, ValueError, OverflowError):
                         w, h = 1280, 800
                     bw, bh = gateway.set_viewport(vm_id, width=w, height=h)
                     await websocket.send_json(
@@ -2261,15 +2338,15 @@ def create_computer_router(
                     continue
                 if raw_text.startswith("{"):
                     parsed: Any = None
-                    with contextlib.suppress(json.JSONDecodeError):
+                    with contextlib.suppress(json.JSONDecodeError, ValueError):
                         parsed = json.loads(raw_text)
                     if isinstance(parsed, dict):
                         op = str(parsed.get("op") or parsed.get("type") or "").strip().lower()
                         if op == "resize":
-                            with contextlib.suppress(TypeError, ValueError):
+                            with contextlib.suppress(TypeError, ValueError, OverflowError):
                                 term.resize(
-                                    cols=int(parsed.get("cols", 100)),
-                                    rows=int(parsed.get("rows", 28)),
+                                    cols=coerce_finite_int(parsed.get("cols", 100)),
+                                    rows=coerce_finite_int(parsed.get("rows", 28)),
                                 )
                             continue
                         if op == "signal":

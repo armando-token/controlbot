@@ -197,6 +197,7 @@ async def test_resume_and_stream_runtime_run_passes_approval_payload(tmp_path: P
         )
         resolved = store.resolve_approval(str(appr["id"]), "allow_once")
         await runner.on_approval_resolved(resolved, decision="allow_once")
+        await runner.wait_for_active_turn(thread_id)
 
         assert captured_resumes == [
             (
@@ -313,6 +314,7 @@ async def test_routine_ask_first_pause_and_allow_once_always_allow_resume(
         # Resolve with allow_once -> re-activates existing run with skip_auto_review=True
         resolved = store.resolve_approval(str(appr["id"]), "allow_once")
         await runner.on_approval_resolved(resolved, decision="allow_once")
+        await runner.wait_for_active_turn(thread_id)
         for _ in range(50):
             cur = store.list_routine_runs(str(routine["id"]))
             if cur and cur[0]["status"] == "succeeded":
@@ -399,6 +401,7 @@ async def test_routine_ask_first_deny_and_skip_mark_run_failed(
         appr = store.list_thread_approvals(thread_id)[0]
         resolved = store.resolve_approval(str(appr["id"]), decision)
         await runner.on_approval_resolved(resolved, decision=decision)
+        await runner.wait_for_active_turn(thread_id)
 
         runs = store.list_routine_runs(str(routine["id"]))
         assert runs[0]["id"] == run["id"]
@@ -470,6 +473,7 @@ async def test_routine_approval_resume_when_routine_deleted_fails_gracefully(
 
         resolved = store.resolve_approval(str(appr["id"]), "allow_once")
         await runner.on_approval_resolved(resolved, decision="allow_once")
+        await runner.wait_for_active_turn(thread_id)
 
         msgs, _ = store.list_thread_messages(thread_id)
         assert any("no longer exists" in str(m["content"]) for m in msgs)
@@ -1524,6 +1528,7 @@ async def test_routine_wfi_approval_resolution_updates_routine_run_status(
 
         resolved = store.resolve_approval(str(appr["id"]), decision)
         await runner.on_approval_resolved(resolved, decision=decision)
+        await runner.wait_for_active_turn(thread_id)
 
         runs = store.list_routine_runs(str(rtn["id"]))
         assert runs[0]["id"] == run["id"]

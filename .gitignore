@@ -19,7 +19,7 @@ build/
 *.sqlite
 *.sqlite3
 var/
-artifacts/
+/artifacts/
 logs/
 *.log
 .browser_profiles/

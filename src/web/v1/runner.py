@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from src.adapters.config import FacilityConfig
+from src.adapters.web_search import EgressBlockedError, EgressGuard
 from src.contracts.common import InvalidStateTransitionError
 from src.contracts.enums import TERMINAL_TASK_STATUSES, TaskStatus
 from src.contracts.envelope import (
@@ -479,6 +480,7 @@ class AgentTurnRunner:
         facility_config: FacilityConfig | None = None,
         known_read_only_mcp_tools: Iterable[str] | None = None,
         webhook_secrets: Mapping[str, str] | None = None,
+        allow_loopback_webhooks: bool = False,
     ) -> None:
         self._store = store
         self._event_bus = event_bus
@@ -489,6 +491,7 @@ class AgentTurnRunner:
         self._computer_gateway = computer_gateway
         self._smtp_config = dict(smtp_config) if smtp_config is not None else None
         self._facility_config = facility_config
+        self._allow_loopback_webhooks = bool(allow_loopback_webhooks)
         self._known_read_only_mcp_tools: frozenset[str] = frozenset(
             str(t).strip().lower() for t in (known_read_only_mcp_tools or ()) if str(t).strip()
         )
@@ -511,8 +514,13 @@ class AgentTurnRunner:
 
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_turns: dict[str, str] = {}
+        self._active_runtime_runs: dict[str, str] = {}
+        self._active_routine_runs: dict[str, tuple[str | None, str]] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._routine_tasks: set[asyncio.Task[None]] = set()
+        self._routine_tasks_by_routine: dict[str, set[asyncio.Task[None]]] = {}
+        self._routine_coord_runs: dict[str, set[str]] = {}
+        self._thread_routine_tasks: dict[str, dict[tuple[str, str], asyncio.Task[None]]] = {}
         self._scheduler_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._stopping = False
@@ -596,7 +604,12 @@ class AgentTurnRunner:
                 await task
         self._active_tasks.clear()
         self._active_turns.clear()
+        self._active_runtime_runs.clear()
+        self._active_routine_runs.clear()
         self._routine_tasks.clear()
+        self._routine_tasks_by_routine.clear()
+        self._routine_coord_runs.clear()
+        self._thread_routine_tasks.clear()
 
     async def _scheduler_loop(self) -> None:
         assert self._stop_event is not None
@@ -738,6 +751,27 @@ class AgentTurnRunner:
         prev_task = self._active_tasks.get(thread_id)
         if prev_task is not None and not prev_task.done():
             prev_task.cancel()
+        extra_routine_tasks: list[asyncio.Task[None]] = []
+        popped_routines = self._thread_routine_tasks.pop(thread_id, {})
+        for (r_id, rr_id), r_task in popped_routines.items():
+            if not r_task.done():
+                r_task.cancel()
+                if r_task is not prev_task:
+                    extra_routine_tasks.append(r_task)
+            self._fail_interrupted_routine_run(
+                r_id,
+                rr_id,
+                thread_id=thread_id,
+                error="Routine superseded by new turn.",
+            )
+        prev_routine_ref = self._active_routine_runs.pop(thread_id, None)
+        if prev_routine_ref is not None:
+            self._fail_interrupted_routine_run(
+                prev_routine_ref[0],
+                prev_routine_ref[1],
+                thread_id=thread_id,
+                error="Runtime resume superseded by new turn.",
+            )
 
         turn_id = f"trn_{uuid.uuid4().hex[:12]}"
         self._active_turns[thread_id] = turn_id
@@ -747,6 +781,7 @@ class AgentTurnRunner:
         task = asyncio.create_task(
             self._run_thread_turn_serialized(
                 previous_task=prev_task,
+                extra_previous_tasks=tuple(extra_routine_tasks),
                 thread_id=thread_id,
                 turn_id=turn_id,
                 user_message=user_message,
@@ -774,6 +809,7 @@ class AgentTurnRunner:
         self,
         *,
         previous_task: asyncio.Task[None] | None,
+        extra_previous_tasks: tuple[asyncio.Task[None], ...] = (),
         thread_id: str,
         turn_id: str,
         user_message: dict[str, Any],
@@ -788,6 +824,10 @@ class AgentTurnRunner:
         if previous_task is not None and not previous_task.done():
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await previous_task
+        for extra_task in extra_previous_tasks:
+            if not extra_task.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await extra_task
 
         async with self._get_thread_lock(thread_id):
             if self._active_turns.get(thread_id) != turn_id:
@@ -805,16 +845,165 @@ class AgentTurnRunner:
                 ui_lane=ui_lane,
             )
 
+    async def wait_for_active_turn(self, thread_id: str) -> None:
+        """Await any currently tracked background turn/resume task for thread_id."""
+        task = self._active_tasks.get(thread_id)
+        if task is not None and not task.done():
+            await task
+        extra_tasks = list(self._thread_routine_tasks.get(thread_id, {}).values())
+        for extra_task in extra_tasks:
+            if not extra_task.done():
+                await extra_task
+
+    def _fail_interrupted_routine_run(
+        self,
+        routine_id: str | None,
+        routine_run_id: str,
+        *,
+        thread_id: str,
+        error: str,
+    ) -> bool:
+        existing_rtn_run = self._store.get_routine_run(routine_run_id)
+        if existing_rtn_run is None or existing_rtn_run.get("status") not in {
+            "waiting_approval",
+            "running",
+            "queued",
+        }:
+            return False
+        finished_at = utc_iso_now()
+        eff_routine_id = routine_id or str(existing_rtn_run.get("routine_id") or "")
+        if eff_routine_id:
+            if self._store.get_routine(eff_routine_id) is None:
+                return False
+            with contextlib.suppress(StoreNotFoundError):
+                self._store.update_routine(eff_routine_id, {"last_run_at": finished_at})
+        with contextlib.suppress(StoreNotFoundError):
+            failed_rtn = self._store.update_routine_run(
+                routine_run_id,
+                {
+                    "status": "failed",
+                    "error": error,
+                    "finished_at": finished_at,
+                },
+            )
+            self._event_bus.publish(
+                "routine.run.status",
+                {"routine_id": eff_routine_id, "run": failed_rtn},
+                bot_id=str(existing_rtn_run.get("bot_id") or ""),
+                thread_id=thread_id,
+            )
+            return True
+        return False
+
+    async def cancel_routine(self, routine_id: str) -> None:
+        """Cancel any active tasks and runtime runs for routine_id and await settlement."""
+        tasks_to_cancel: list[asyncio.Task[None]] = []
+        seen_tasks: set[int] = set()
+
+        def _collect(task: asyncio.Task[None] | None) -> None:
+            if task is not None and id(task) not in seen_tasks:
+                seen_tasks.add(id(task))
+                tasks_to_cancel.append(task)
+
+        for t in self._routine_tasks_by_routine.pop(routine_id, set()):
+            _collect(t)
+
+        affected_threads: set[str] = set()
+        for thread_id, rtn_map in list(self._thread_routine_tasks.items()):
+            for key in list(rtn_map):
+                if key[0] == routine_id:
+                    affected_threads.add(thread_id)
+                    _collect(rtn_map.pop(key, None))
+            if not rtn_map:
+                self._thread_routine_tasks.pop(thread_id, None)
+
+        for thread_id, ref in list(self._active_routine_runs.items()):
+            if ref[0] == routine_id:
+                affected_threads.add(thread_id)
+                self._active_routine_runs.pop(thread_id, None)
+
+        for thread_id in affected_threads:
+            active_turn = self._active_turns.get(thread_id) or ""
+            active_task = self._active_tasks.get(thread_id)
+            if active_turn.startswith("rtn_") or (
+                active_task is not None and id(active_task) in seen_tasks
+            ):
+                _collect(self._active_tasks.pop(thread_id, None))
+                self._active_turns.pop(thread_id, None)
+                self._active_runtime_runs.pop(thread_id, None)
+
+        for t in tasks_to_cancel:
+            if not t.done():
+                t.cancel()
+
+        for t in tasks_to_cancel:
+            if not t.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+
+        remaining_coord_runs = self._routine_coord_runs.pop(routine_id, set())
+        for coord_run_id in remaining_coord_runs:
+            try:
+                await maybe_await(
+                    self._coordinator.cancel_task(coord_run_id, reason="routine_deleted")
+                )
+            except (KeyError, InvalidStateTransitionError):
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed cancelling runtime run %s for deleted routine %s",
+                    coord_run_id,
+                    routine_id,
+                )
+
     async def interrupt(self, thread_id: str) -> bool:
         """Cancel any active turn for thread_id, mark streaming messages interrupted, reset bots."""
         task = self._active_tasks.pop(thread_id, None)
         turn_id = self._active_turns.pop(thread_id, None)
+        run_id = self._active_runtime_runs.pop(thread_id, None)
+        routine_ref = self._active_routine_runs.pop(thread_id, None)
+        popped_routines = self._thread_routine_tasks.pop(thread_id, {})
         was_running = False
+        tasks_to_await: list[asyncio.Task[None]] = []
         if task is not None and not task.done():
             was_running = True
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+            tasks_to_await.append(task)
+        for r_task in popped_routines.values():
+            if not r_task.done():
+                was_running = True
+                r_task.cancel()
+                if r_task is not task:
+                    tasks_to_await.append(r_task)
+        if run_id:
+            try:
+                await maybe_await(
+                    self._coordinator.cancel_task(run_id, reason="interrupted_by_operator")
+                )
+                was_running = True
+            except (KeyError, InvalidStateTransitionError):
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed cancelling runtime run %s on interrupt", run_id)
+        for t in tasks_to_await:
+            if not t.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+        if routine_ref is not None and self._fail_interrupted_routine_run(
+            routine_ref[0],
+            routine_ref[1],
+            thread_id=thread_id,
+            error="Interrupted by operator.",
+        ):
+            was_running = True
+        for r_id, rr_id in popped_routines:
+            if self._fail_interrupted_routine_run(
+                r_id,
+                rr_id,
+                thread_id=thread_id,
+                error="Interrupted by operator.",
+            ):
+                was_running = True
 
         interrupted_msgs = self._store.mark_streaming_interrupted(thread_id)
         for msg in interrupted_msgs:
@@ -914,7 +1103,7 @@ class AgentTurnRunner:
                     page_context_id=pending_ctx.get("page_context_id"),
                 )
             elif run_id_raw:
-                await self._resume_and_stream_runtime_run(
+                self._start_runtime_resume(
                     approval=approval,
                     run_id=str(run_id_raw),
                     decision=decision,
@@ -979,15 +1168,12 @@ class AgentTurnRunner:
                         bot_id=bot_id,
                         thread_id=thread_id,
                     )
-                    task = asyncio.create_task(
-                        self._run_routine_bg(
-                            routine=routine,
-                            run=run_obj,
-                            skip_auto_review=True,
-                        )
+                    self._start_routine_task(
+                        routine=routine,
+                        run=run_obj,
+                        thread_id=thread_id,
+                        skip_auto_review=True,
                     )
-                    self._routine_tasks.add(task)
-                    task.add_done_callback(self._routine_tasks.discard)
         else:
             if (
                 isinstance(pending_ctx, dict)
@@ -1055,6 +1241,133 @@ class AgentTurnRunner:
                 thread_id=thread_id,
             )
 
+    def _start_runtime_resume(
+        self,
+        *,
+        approval: dict[str, Any],
+        run_id: str,
+        decision: str,
+        pending_ctx: dict[str, Any],
+    ) -> str:
+        """Schedule runtime HITL resumption as a tracked, interruptible background task."""
+        thread_id = str(approval["thread_id"])
+        prev_task = self._active_tasks.get(thread_id)
+        if prev_task is not None and not prev_task.done():
+            prev_task.cancel()
+        extra_routine_tasks: list[asyncio.Task[None]] = []
+        popped_routines = self._thread_routine_tasks.pop(thread_id, {})
+        for (r_id, rr_id), r_task in popped_routines.items():
+            if not r_task.done():
+                r_task.cancel()
+                if r_task is not prev_task:
+                    extra_routine_tasks.append(r_task)
+            self._fail_interrupted_routine_run(
+                r_id,
+                rr_id,
+                thread_id=thread_id,
+                error="Routine superseded by runtime resume.",
+            )
+        prev_routine_ref = self._active_routine_runs.pop(thread_id, None)
+        if prev_routine_ref is not None:
+            self._fail_interrupted_routine_run(
+                prev_routine_ref[0],
+                prev_routine_ref[1],
+                thread_id=thread_id,
+                error="Runtime resume superseded by new turn.",
+            )
+
+        turn_id = f"trn_{uuid.uuid4().hex[:12]}"
+        self._active_turns[thread_id] = turn_id
+        self._active_runtime_runs[thread_id] = run_id
+        routine_id = (
+            str(pending_ctx["routine_id"]).strip()
+            if isinstance(pending_ctx.get("routine_id"), str)
+            and str(pending_ctx["routine_id"]).strip()
+            else None
+        )
+        routine_run_id = (
+            str(pending_ctx["routine_run_id"]).strip()
+            if isinstance(pending_ctx.get("routine_run_id"), str)
+            and str(pending_ctx["routine_run_id"]).strip()
+            else None
+        )
+        if routine_run_id:
+            self._active_routine_runs[thread_id] = (routine_id, routine_run_id)
+
+        task = asyncio.create_task(
+            self._resume_and_stream_runtime_run_serialized(
+                previous_task=prev_task,
+                extra_previous_tasks=tuple(extra_routine_tasks),
+                approval=approval,
+                run_id=run_id,
+                decision=decision,
+                pending_ctx=pending_ctx,
+                turn_id=turn_id,
+            )
+        )
+        self._active_tasks[thread_id] = task
+        if routine_id:
+            self._routine_tasks_by_routine.setdefault(routine_id, set()).add(task)
+            self._routine_coord_runs.setdefault(routine_id, set()).add(run_id)
+
+        def _cleanup(done_task: asyncio.Task[None]) -> None:
+            if routine_id:
+                r_set = self._routine_tasks_by_routine.get(routine_id)
+                if r_set is not None:
+                    r_set.discard(done_task)
+                    if not r_set:
+                        self._routine_tasks_by_routine.pop(routine_id, None)
+                c_set = self._routine_coord_runs.get(routine_id)
+                if c_set is not None:
+                    c_set.discard(run_id)
+                    if not c_set:
+                        self._routine_coord_runs.pop(routine_id, None)
+            if self._active_tasks.get(thread_id) is done_task:
+                self._active_tasks.pop(thread_id, None)
+            if self._active_turns.get(thread_id) == turn_id:
+                self._active_turns.pop(thread_id, None)
+            if self._active_runtime_runs.get(thread_id) == run_id:
+                self._active_runtime_runs.pop(thread_id, None)
+            if routine_run_id and self._active_routine_runs.get(thread_id) == (
+                routine_id,
+                routine_run_id,
+            ):
+                self._active_routine_runs.pop(thread_id, None)
+
+        task.add_done_callback(_cleanup)
+        return turn_id
+
+    async def _resume_and_stream_runtime_run_serialized(
+        self,
+        *,
+        previous_task: asyncio.Task[None] | None,
+        extra_previous_tasks: tuple[asyncio.Task[None], ...] = (),
+        approval: dict[str, Any],
+        run_id: str,
+        decision: str,
+        pending_ctx: dict[str, Any],
+        turn_id: str,
+    ) -> None:
+        thread_id = str(approval["thread_id"])
+        if previous_task is not None and not previous_task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await previous_task
+        for extra_task in extra_previous_tasks:
+            if not extra_task.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await extra_task
+
+        async with self._get_thread_lock(thread_id):
+            if self._active_turns.get(thread_id) != turn_id:
+                return
+            await self._resume_and_stream_runtime_run(
+                approval=approval,
+                run_id=run_id,
+                decision=decision,
+                pending_ctx=pending_ctx,
+                turn_id=turn_id,
+            )
+
     async def _resume_and_stream_runtime_run(
         self,
         *,
@@ -1062,6 +1375,7 @@ class AgentTurnRunner:
         run_id: str,
         decision: str,
         pending_ctx: dict[str, Any],
+        turn_id: str | None = None,
     ) -> None:
         bot_id = str(approval["bot_id"])
         thread_id = str(approval["thread_id"])
@@ -1091,7 +1405,7 @@ class AgentTurnRunner:
         bot = self._store.get_bot(bot_id)
         bot_name = str(bot["name"]) if bot is not None else "Bot"
         model_id = str(bot.get("model_id") or "") if bot is not None else ""
-        turn_id = f"trn_{uuid.uuid4().hex[:12]}"
+        turn_id = turn_id or f"trn_{uuid.uuid4().hex[:12]}"
 
         assistant_msg = self._store.create_message(
             thread_id=thread_id,
@@ -1130,6 +1444,7 @@ class AgentTurnRunner:
 
         seen_receipts: set[str] = {str(r) for r in pending_ctx.get("seen_receipts", [])}
         tool_calls: list[dict[str, Any]] = []
+        self._active_runtime_runs[thread_id] = run_id
 
         try:
             await maybe_await(
@@ -1229,6 +1544,48 @@ class AgentTurnRunner:
                 )
                 return
 
+            if snapshot is not None and snapshot.run.status == TaskStatus.CANCELLED and (
+                snapshot.run.transition_reason == "interrupted_by_operator"
+                or self._active_turns.get(thread_id) != turn_id
+            ):
+                cur_msg = self._store.get_message(msg_id)
+                if cur_msg is not None and cur_msg.get("status") == "streaming":
+                    updated = self._store.update_message(msg_id, {"status": "interrupted"})
+                    self._event_bus.publish(
+                        "message.completed",
+                        {"message_id": msg_id, "message": updated},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                    )
+                if routine_id and routine_run_id:
+                    finished_at = utc_iso_now()
+                    with contextlib.suppress(StoreNotFoundError):
+                        self._store.update_routine(routine_id, {"last_run_at": finished_at})
+                        failed_rtn = self._store.update_routine_run(
+                            routine_run_id,
+                            {
+                                "status": "failed",
+                                "error": "Runtime resume interrupted by operator.",
+                                "finished_at": finished_at,
+                            },
+                        )
+                        self._event_bus.publish(
+                            "routine.run.status",
+                            {"routine_id": routine_id, "run": failed_rtn},
+                            bot_id=bot_id,
+                            thread_id=thread_id,
+                        )
+                self._emit_presence(
+                    bot_id,
+                    state="idle",
+                    subtext="Interrupted by operator",
+                    computer_active=False,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+                return
+
             final_status = "done"
             verified_meta: dict[str, Any] | None = None
             if snapshot is not None and snapshot.run.status in TERMINAL_TASK_STATUSES:
@@ -1298,6 +1655,45 @@ class AgentTurnRunner:
                 thread_id=thread_id,
                 turn_id=turn_id,
             )
+        except asyncio.CancelledError:
+            with contextlib.suppress(StoreNotFoundError):
+                cur_msg = self._store.get_message(msg_id)
+                if cur_msg is not None and cur_msg.get("status") == "streaming":
+                    updated = self._store.update_message(msg_id, {"status": "interrupted"})
+                    self._event_bus.publish(
+                        "message.completed",
+                        {"message_id": msg_id, "message": updated},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                    )
+            if routine_id and routine_run_id:
+                finished_at = utc_iso_now()
+                with contextlib.suppress(StoreNotFoundError):
+                    self._store.update_routine(routine_id, {"last_run_at": finished_at})
+                    failed_rtn = self._store.update_routine_run(
+                        routine_run_id,
+                        {
+                            "status": "failed",
+                            "error": "Runtime resume interrupted by operator.",
+                            "finished_at": finished_at,
+                        },
+                    )
+                    self._event_bus.publish(
+                        "routine.run.status",
+                        {"routine_id": routine_id, "run": failed_rtn},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                    )
+            self._emit_presence(
+                bot_id,
+                state="idle",
+                subtext="Interrupted by operator",
+                computer_active=False,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to resume runtime run %s", run_id)
             err_msg = str(scrub_v1_payload(str(exc)))[:400]
@@ -1341,6 +1737,14 @@ class AgentTurnRunner:
                 thread_id=thread_id,
                 turn_id=turn_id,
             )
+        finally:
+            if self._active_runtime_runs.get(thread_id) == run_id:
+                self._active_runtime_runs.pop(thread_id, None)
+            if routine_run_id and self._active_routine_runs.get(thread_id) == (
+                routine_id,
+                routine_run_id,
+            ):
+                self._active_routine_runs.pop(thread_id, None)
 
     # ------------------------------------------------------------------
     # Mentions, Prompt Building & Draft Delivery
@@ -1876,11 +2280,15 @@ class AgentTurnRunner:
                     "transport": "webhook",
                     "error": "Routine Webhooks app is disabled in Connected Apps.",
                 }
-            if not webhook_url.startswith(("http://", "https://")):
+            try:
+                webhook_url = EgressGuard(
+                    allow_loopback_for_tests=self._allow_loopback_webhooks
+                ).validate_url(webhook_url)
+            except EgressBlockedError as exc:
                 return {
                     "delivered": False,
                     "transport": "webhook",
-                    "error": "Blocked non-HTTP(S) draft webhook URL.",
+                    "error": f"Blocked draft webhook URL (SSRF policy): {exc}",
                 }
             if webhook_secret_error:
                 return {
@@ -1929,12 +2337,24 @@ class AgentTurnRunner:
                     trust_env=False,
                     follow_redirects=False,
                 ) as client:
-                    resp = await client.post(webhook_url, content=body_bytes, headers=headers)
+                    resp = await client.post(
+                        webhook_url,
+                        content=body_bytes,
+                        headers=headers,
+                        follow_redirects=False,
+                    )
                 if 200 <= resp.status_code < 300:
                     return {
                         "delivered": True,
                         "transport": "webhook",
                         "status_code": resp.status_code,
+                    }
+                if 300 <= resp.status_code < 400:
+                    return {
+                        "delivered": False,
+                        "transport": "webhook",
+                        "status_code": resp.status_code,
+                        "error": f"Blocked webhook redirect response (HTTP {resp.status_code})",
                     }
                 return {
                     "delivered": False,
@@ -2210,6 +2630,22 @@ class AgentTurnRunner:
     ) -> None:
         target_bots, is_channel = self._resolve_target_bots(thread_id, user_message)
         if not target_bots:
+            if is_channel:
+                err_msg = self._store.create_message(
+                    thread_id=thread_id,
+                    sender_type="bot",
+                    sender_bot_id=None,
+                    sender_name="System",
+                    content="Channel has no active bots to handle this message.",
+                    status="error",
+                )
+                self._event_bus.publish(
+                    "message.completed",
+                    {"message_id": err_msg["id"], "message": err_msg},
+                    bot_id=None,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
             return
 
         content = str(user_message.get("content", ""))
@@ -2711,16 +3147,21 @@ class AgentTurnRunner:
                 query=raw_query or "Inspect equipment specs",
             )
             run = await maybe_await(self._coordinator.submit_task(task_spec))
-            snap = await self._await_runtime_run(
-                run.run_id,
-                bot_id=bot_id,
-                thread_id=thread_id,
-                turn_id=turn_id,
-                message_id=None,
-                seen_receipts=set(),
-                tool_calls=[],
-                timeout_s=30.0,
-            )
+            self._active_runtime_runs[thread_id] = run.run_id
+            try:
+                snap = await self._await_runtime_run(
+                    run.run_id,
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    message_id=None,
+                    seen_receipts=set(),
+                    tool_calls=[],
+                    timeout_s=30.0,
+                )
+            finally:
+                if self._active_runtime_runs.get(thread_id) == run.run_id:
+                    self._active_runtime_runs.pop(thread_id, None)
             if snap is not None and snap.result is not None:
                 if snap.result.answer:
                     plant_facts.append(snap.result.answer)
@@ -3513,6 +3954,7 @@ class AgentTurnRunner:
             query=prompt.strip() or "Inspect system status",
         )
         run = await maybe_await(self._coordinator.submit_task(task_spec))
+        self._active_runtime_runs[thread_id] = run.run_id
 
         tool_calls: list[dict[str, Any]] = [
             {
@@ -3533,15 +3975,43 @@ class AgentTurnRunner:
         )
 
         seen_receipts: set[str] = set()
-        snapshot = await self._await_runtime_run(
-            run.run_id,
-            bot_id=bot_id,
-            thread_id=thread_id,
-            turn_id=turn_id,
-            message_id=message_id,
-            seen_receipts=seen_receipts,
-            tool_calls=tool_calls,
-        )
+        try:
+            snapshot = await self._await_runtime_run(
+                run.run_id,
+                bot_id=bot_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_id=message_id,
+                seen_receipts=seen_receipts,
+                tool_calls=tool_calls,
+            )
+        finally:
+            if self._active_runtime_runs.get(thread_id) == run.run_id:
+                self._active_runtime_runs.pop(thread_id, None)
+
+        if snapshot is not None and snapshot.run.status == TaskStatus.CANCELLED and (
+            snapshot.run.transition_reason == "interrupted_by_operator"
+            or self._active_turns.get(thread_id) != turn_id
+        ):
+            cur_msg = self._store.get_message(message_id)
+            if cur_msg is not None and cur_msg.get("status") == "streaming":
+                updated = self._store.update_message(message_id, {"status": "interrupted"})
+                self._event_bus.publish(
+                    "message.completed",
+                    {"message_id": message_id, "message": updated},
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+            self._emit_presence(
+                bot_id,
+                state="idle",
+                subtext="Interrupted by operator",
+                computer_active=False,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            return ""
 
         final_answer = ""
         final_status = "done"
@@ -3641,6 +4111,61 @@ class AgentTurnRunner:
     # Routine Execution
     # ------------------------------------------------------------------
 
+    def _start_routine_task(
+        self,
+        *,
+        routine: dict[str, Any],
+        run: dict[str, Any],
+        thread_id: str | None,
+        skip_auto_review: bool = False,
+    ) -> asyncio.Task[None]:
+        routine_id = str(routine["id"])
+        run_id = str(run["id"])
+        routine_turn_id = f"rtn_{run_id}"
+        task = asyncio.create_task(
+            self._run_routine_bg(
+                routine=routine,
+                run=run,
+                skip_auto_review=skip_auto_review,
+            )
+        )
+        self._routine_tasks.add(task)
+        self._routine_tasks_by_routine.setdefault(routine_id, set()).add(task)
+
+        if thread_id:
+            self._thread_routine_tasks.setdefault(thread_id, {})[(routine_id, run_id)] = task
+            self._active_routine_runs[thread_id] = (routine_id, run_id)
+            cur_task = self._active_tasks.get(thread_id)
+            cur_turn = self._active_turns.get(thread_id) or ""
+            if cur_task is None or cur_task.done() or cur_turn.startswith("rtn_"):
+                self._active_tasks[thread_id] = task
+                self._active_turns[thread_id] = routine_turn_id
+
+        def _cleanup(done_task: asyncio.Task[None]) -> None:
+            self._routine_tasks.discard(done_task)
+            r_set = self._routine_tasks_by_routine.get(routine_id)
+            if r_set is not None:
+                r_set.discard(done_task)
+                if not r_set:
+                    self._routine_tasks_by_routine.pop(routine_id, None)
+            if not thread_id:
+                return
+            thread_rtns = self._thread_routine_tasks.get(thread_id)
+            if thread_rtns is not None:
+                if thread_rtns.get((routine_id, run_id)) is done_task:
+                    thread_rtns.pop((routine_id, run_id), None)
+                if not thread_rtns:
+                    self._thread_routine_tasks.pop(thread_id, None)
+            if self._active_tasks.get(thread_id) is done_task:
+                self._active_tasks.pop(thread_id, None)
+            if self._active_turns.get(thread_id) == routine_turn_id:
+                self._active_turns.pop(thread_id, None)
+            if self._active_routine_runs.get(thread_id) == (routine_id, run_id):
+                self._active_routine_runs.pop(thread_id, None)
+
+        task.add_done_callback(_cleanup)
+        return task
+
     async def execute_routine(
         self,
         routine_id: str,
@@ -3652,6 +4177,8 @@ class AgentTurnRunner:
         if routine is None:
             raise StoreNotFoundError(f"Routine not found: {routine_id}")
         bot_id = str(routine["bot_id"])
+        bot = self._store.get_bot(bot_id)
+        thread_id = str(bot["thread_id"]) if bot is not None else None
         run = self._store.create_routine_run(routine_id, bot_id, trigger=trigger)
         self._event_bus.publish(
             "routine.run.status",
@@ -3675,9 +4202,7 @@ class AgentTurnRunner:
             )
             return failed
 
-        task = asyncio.create_task(self._run_routine_bg(routine=routine, run=run))
-        self._routine_tasks.add(task)
-        task.add_done_callback(self._routine_tasks.discard)
+        self._start_routine_task(routine=routine, run=run, thread_id=thread_id)
         return run
 
     async def _run_routine_bg(
@@ -3712,19 +4237,22 @@ class AgentTurnRunner:
         bot_id = str(routine["bot_id"])
         bot = self._store.get_bot(bot_id)
         if bot is None:
-            failed = self._store.update_routine_run(
-                run_id,
-                {
-                    "status": "failed",
-                    "error": f"Bot {bot_id} no longer exists.",
-                    "finished_at": utc_iso_now(),
-                },
-            )
-            self._event_bus.publish(
-                "routine.run.status",
-                {"routine_id": routine_id, "run": failed},
-                bot_id=bot_id,
-            )
+            if self._store.get_routine(routine_id) is None:
+                return
+            with contextlib.suppress(StoreNotFoundError):
+                failed = self._store.update_routine_run(
+                    run_id,
+                    {
+                        "status": "failed",
+                        "error": f"Bot {bot_id} no longer exists.",
+                        "finished_at": utc_iso_now(),
+                    },
+                )
+                self._event_bus.publish(
+                    "routine.run.status",
+                    {"routine_id": routine_id, "run": failed},
+                    bot_id=bot_id,
+                )
             return
 
         thread_id = str(bot["thread_id"])
@@ -3744,16 +4272,21 @@ class AgentTurnRunner:
                     task_id=run_id,
                 )
             )
+            if self._store.get_routine(routine_id) is None:
+                return
             finished_at = utc_iso_now()
-            self._store.update_routine(routine_id, {"last_run_at": finished_at})
-            failed = self._store.update_routine_run(
-                run_id,
-                {
-                    "status": "failed",
-                    "error": f"Action blocked by safety floor: `{floor_violation}`.",
-                    "finished_at": finished_at,
-                },
-            )
+            try:
+                self._store.update_routine(routine_id, {"last_run_at": finished_at})
+                failed = self._store.update_routine_run(
+                    run_id,
+                    {
+                        "status": "failed",
+                        "error": f"Action blocked by safety floor: `{floor_violation}`.",
+                        "finished_at": finished_at,
+                    },
+                )
+            except StoreNotFoundError:
+                return
             self._event_bus.publish(
                 "routine.run.status",
                 {"routine_id": routine_id, "run": failed},
@@ -3768,6 +4301,18 @@ class AgentTurnRunner:
             rules = self._store.list_auto_review_rules()
             matched_rule = _match_ask_first_rule(instruction, rules)
             if matched_rule is not None:
+                if self._store.get_routine(routine_id) is None:
+                    return
+                try:
+                    waiting_run = self._store.update_routine_run(
+                        run_id,
+                        {
+                            "status": "waiting_approval",
+                            "summary": f"Waiting for approval: {matched_rule[:120]}",
+                        },
+                    )
+                except StoreNotFoundError:
+                    return
                 appr = self._store.create_approval(
                     bot_id=bot_id,
                     thread_id=thread_id,
@@ -3793,13 +4338,6 @@ class AgentTurnRunner:
                         "prompt": instruction,
                     },
                 )
-                waiting_run = self._store.update_routine_run(
-                    run_id,
-                    {
-                        "status": "waiting_approval",
-                        "summary": f"Waiting for approval: {matched_rule[:120]}",
-                    },
-                )
                 self._event_bus.publish(
                     "routine.run.status",
                     {"routine_id": routine_id, "run": waiting_run},
@@ -3823,6 +4361,7 @@ class AgentTurnRunner:
 
         summary = ""
         error_msg: str | None = None
+        self._active_routine_runs.setdefault(thread_id, (routine_id, run_id))
 
         try:
             use_agy = str(bot.get("engine_id")) == "agy" and find_agy_executable() is not None
@@ -3869,17 +4408,70 @@ class AgentTurnRunner:
                         query=instruction or routine["name"],
                     )
                     coord_run = await maybe_await(self._coordinator.submit_task(task_spec))
-                    snap = await self._await_runtime_run(
-                        coord_run.run_id,
-                        bot_id=bot_id,
-                        thread_id=thread_id,
-                        turn_id=f"rtn_{run_id}",
-                        message_id=None,
-                        seen_receipts=set(),
-                        tool_calls=[],
-                        timeout_s=90.0,
-                    )
+                    self._active_runtime_runs[thread_id] = coord_run.run_id
+                    self._active_routine_runs[thread_id] = (routine_id, run_id)
+                    self._routine_coord_runs.setdefault(routine_id, set()).add(coord_run.run_id)
+                    keep_coord_run = False
+                    snap: TaskSnapshot | None = None
+                    try:
+                        snap = await self._await_runtime_run(
+                            coord_run.run_id,
+                            bot_id=bot_id,
+                            thread_id=thread_id,
+                            turn_id=f"rtn_{run_id}",
+                            message_id=None,
+                            seen_receipts=set(),
+                            tool_calls=[],
+                            timeout_s=90.0,
+                        )
+                        if (
+                            snap is not None
+                            and snap.run.status == TaskStatus.WAITING_FOR_INPUT
+                            and self._store.get_routine(routine_id) is not None
+                        ):
+                            keep_coord_run = True
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception):
+                            await maybe_await(
+                                self._coordinator.cancel_task(
+                                    coord_run.run_id, reason="interrupted_by_operator"
+                                )
+                            )
+                        raise
+                    finally:
+                        if not keep_coord_run:
+                            c_set = self._routine_coord_runs.get(routine_id)
+                            if c_set is not None:
+                                c_set.discard(coord_run.run_id)
+                                if not c_set:
+                                    self._routine_coord_runs.pop(routine_id, None)
+                        if self._active_runtime_runs.get(thread_id) == coord_run.run_id:
+                            self._active_runtime_runs.pop(thread_id, None)
+                        if self._active_routine_runs.get(thread_id) == (routine_id, run_id):
+                            self._active_routine_runs.pop(thread_id, None)
                     if snap is not None and snap.run.status == TaskStatus.WAITING_FOR_INPUT:
+                        if self._store.get_routine(routine_id) is None:
+                            with contextlib.suppress(Exception):
+                                await maybe_await(
+                                    self._coordinator.cancel_task(
+                                        coord_run.run_id, reason="routine_deleted"
+                                    )
+                                )
+                            return
+                        try:
+                            req_act = snap.run.required_action or "input required"
+                            waiting_run = self._store.update_routine_run(
+                                run_id,
+                                {
+                                    "status": "waiting_approval",
+                                    "summary": (
+                                        f"Routine **{routine['name']}** paused for operator input "
+                                        f"(run `{coord_run.run_id}`): {req_act}."
+                                    )[:1000],
+                                },
+                            )
+                        except StoreNotFoundError:
+                            return
                         appr = self._store.create_approval(
                             bot_id=bot_id,
                             thread_id=thread_id,
@@ -3901,17 +4493,6 @@ class AgentTurnRunner:
                             bot_id=bot_id,
                             thread_id=thread_id,
                         )
-                        req_act = snap.run.required_action or "input required"
-                        waiting_run = self._store.update_routine_run(
-                            run_id,
-                            {
-                                "status": "waiting_approval",
-                                "summary": (
-                                    f"Routine **{routine['name']}** paused for operator input "
-                                    f"(run `{coord_run.run_id}`): {req_act}."
-                                )[:1000],
-                            },
-                        )
                         self._event_bus.publish(
                             "routine.run.status",
                             {"routine_id": routine_id, "run": waiting_run},
@@ -3926,13 +4507,16 @@ class AgentTurnRunner:
                             needs_attention=True,
                         )
                         return
-                    elif snap is not None and snap.run.status == TaskStatus.FAILED:
+                    elif snap is not None and snap.run.status in {
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    }:
                         error_msg = (
                             snap.result.answer
                             if snap.result is not None and snap.result.answer
                             else (
-                                f"Runtime routine run `{coord_run.run_id}` failed "
-                                f"({snap.run.transition_reason})."
+                                f"Runtime routine run `{coord_run.run_id}` "
+                                f"{snap.run.status.value} ({snap.run.transition_reason})."
                             )
                         )
                     elif snap is not None and snap.result is not None and snap.result.answer:
@@ -3944,23 +4528,50 @@ class AgentTurnRunner:
                             f"(run `{coord_run.run_id}`, status `{final_st}`)."
                         )
         except asyncio.CancelledError:
+            if not self._stopping:
+                self._fail_interrupted_routine_run(
+                    routine_id,
+                    run_id,
+                    thread_id=thread_id,
+                    error="Interrupted by operator.",
+                )
+                if self._active_turns.get(thread_id) == f"rtn_{run_id}":
+                    self._reset_routine_presence_idle(
+                        bot_id,
+                        thread_id,
+                        subtext="Interrupted by operator",
+                    )
             raise
         except Exception as exc:  # noqa: BLE001
             if self._stopping:
                 return
             error_msg = str(scrub_v1_payload(str(exc)))[:300]
+        finally:
+            if self._active_routine_runs.get(thread_id) == (routine_id, run_id):
+                self._active_routine_runs.pop(thread_id, None)
 
         if self._stopping:
             return
+        if self._store.get_routine(routine_id) is None:
+            return
+        cur_run = self._store.get_routine_run(run_id)
+        if cur_run is not None and cur_run.get("status") in {"failed", "cancelled"}:
+            return
 
         finished_at = utc_iso_now()
-        self._store.update_routine(routine_id, {"last_run_at": finished_at})
+        try:
+            self._store.update_routine(routine_id, {"last_run_at": finished_at})
+        except StoreNotFoundError:
+            return
 
         if error_msg:
-            updated_run = self._store.update_routine_run(
-                run_id,
-                {"status": "failed", "error": error_msg, "finished_at": finished_at},
-            )
+            try:
+                updated_run = self._store.update_routine_run(
+                    run_id,
+                    {"status": "failed", "error": error_msg, "finished_at": finished_at},
+                )
+            except StoreNotFoundError:
+                return
             self._event_bus.publish(
                 "routine.run.status",
                 {"routine_id": routine_id, "run": updated_run},
@@ -3968,6 +4579,9 @@ class AgentTurnRunner:
                 thread_id=thread_id,
             )
             self._reset_routine_presence_idle(bot_id, thread_id, subtext="Routine failed")
+            return
+
+        if self._store.get_routine(routine_id) is None:
             return
 
         message_id: str | None = None
@@ -3990,15 +4604,18 @@ class AgentTurnRunner:
                 thread_id=thread_id,
             )
 
-        updated_run = self._store.update_routine_run(
-            run_id,
-            {
-                "status": "succeeded",
-                "summary": summary[:1000],
-                "message_id": message_id,
-                "finished_at": finished_at,
-            },
-        )
+        try:
+            updated_run = self._store.update_routine_run(
+                run_id,
+                {
+                    "status": "succeeded",
+                    "summary": summary[:1000],
+                    "message_id": message_id,
+                    "finished_at": finished_at,
+                },
+            )
+        except StoreNotFoundError:
+            return
         self._event_bus.publish(
             "routine.run.status",
             {"routine_id": routine_id, "run": updated_run},

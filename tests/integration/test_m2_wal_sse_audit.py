@@ -2026,3 +2026,38 @@ async def test_memory_http_r11_json_in_json_values_arrays_and_skip_step0_roundtr
     assert ws_store.verify_audit_chain()["valid"] is True
     mem_store.close()
     ws_store.close()
+
+
+@pytest.mark.n2
+@pytest.mark.asyncio
+async def test_parse_event_cursor_and_replay_with_underscore_epoch(tmp_path: Path) -> None:
+    """Contract ep_20261126:1 and evt_1_ep_20261126 cursors parse and replay without resync."""
+    assert parse_event_cursor("ep_20261126:1") == ("ep_20261126", 1)
+    assert parse_event_cursor("evt_1_ep_20261126") == ("ep_20261126", 1)
+    assert parse_event_cursor("evt_000042") == (None, 42)
+    assert parse_event_cursor("42") == (None, 42)
+    assert parse_event_cursor("evt_1_") == (None, None)
+    assert parse_event_cursor(":1") == (None, None)
+
+    ws_store = WorkspaceStore(tmp_path / "sse_underscore_epoch.sqlite3")
+    bus = EventBus(store=ws_store, epoch="ep_20261126")
+    ev1 = bus.publish("bot.presence", {"state": "working"}, bot_id="bot_chief")
+    ev2 = bus.publish("bot.presence", {"state": "idle"}, bot_id="bot_chief")
+    assert ev1["id"] == "evt_000001_ep_20261126"
+    assert ev2["id"] == "evt_000002_ep_20261126"
+
+    for cursor in ("ep_20261126:1", "evt_1_ep_20261126", "evt_000001_ep_20261126"):
+        resync_ev, replay_items, last_seq = bus._prepare_replay(cursor)
+        assert resync_ev is None, f"Unexpected resync for {cursor}: {resync_ev}"
+        assert last_seq == 1
+        assert len(replay_items) == 1
+        assert replay_items[0][0] == 2
+        assert replay_items[0][1]["id"] == "evt_000002_ep_20261126"
+
+    # Cross-epoch cursor with underscore must trigger epoch_mismatch, not invalid_cursor
+    mismatch_ev, _, _ = bus._prepare_replay("ep_20261125:1")
+    assert mismatch_ev is not None
+    assert mismatch_ev["type"] == "stream.resync"
+    assert mismatch_ev["payload"]["reason"] == "epoch_mismatch"
+
+    ws_store.close()

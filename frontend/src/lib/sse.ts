@@ -22,7 +22,7 @@ export function parseSseEventId(raw: string): {
 } {
   const trimmed = raw.trim();
   if (!trimmed) return { epoch: null, seq: null };
-  const evtEpochMatch = /^evt_0*(\d+)_([A-Za-z0-9-]+)$/.exec(trimmed);
+  const evtEpochMatch = /^evt_0*(\d+)_([A-Za-z0-9_-]+)$/.exec(trimmed);
   if (evtEpochMatch && evtEpochMatch[1] !== undefined && evtEpochMatch[2] !== undefined) {
     return { epoch: evtEpochMatch[2], seq: Number(evtEpochMatch[1]) };
   }

@@ -360,6 +360,16 @@ def create_v1_router(
     ) -> JSONResponse:
         if not store.thread_exists(thread_id):
             _raise_http(status.HTTP_404_NOT_FOUND, f"Thread not found: {thread_id}")
+        chn = store.get_channel_by_thread(thread_id)
+        if chn is not None:
+            live_bot_ids = [
+                str(b) for b in (chn.get("bot_ids") or []) if store.get_bot(str(b)) is not None
+            ]
+            if not live_bot_ids:
+                _raise_http(
+                    status.HTTP_409_CONFLICT,
+                    f"Channel {chn['id']} has no active bots.",
+                )
         settings = store.get_settings()
         sender_name = str(settings.get("display_name") or "You")
         user_msg = store.create_message(
@@ -429,13 +439,28 @@ def create_v1_router(
         req = payload or MessageToPageRequest()
         thread_id = str(msg["thread_id"])
         bot_id = msg.get("sender_bot_id")
+        if bot_id and store.get_bot(str(bot_id)) is None:
+            bot_id = None
         if not bot_id:
             bot = store.get_bot_by_thread(thread_id)
             if bot is not None:
                 bot_id = bot["id"]
             else:
                 chn = store.get_channel_by_thread(thread_id)
-                bot_id = chn["bot_ids"][0] if (chn and chn["bot_ids"]) else "bot_chief"
+                if chn is not None:
+                    live_ids = [
+                        str(b)
+                        for b in (chn.get("bot_ids") or [])
+                        if store.get_bot(str(b)) is not None
+                    ]
+                    if not live_ids:
+                        _raise_http(
+                            status.HTTP_409_CONFLICT,
+                            f"Channel {chn['id']} has no active bots.",
+                        )
+                    bot_id = live_ids[0]
+                else:
+                    bot_id = "bot_chief"
 
         content = str(msg.get("content") or "")
         title = (req.title or "").strip()
@@ -646,16 +671,31 @@ def create_v1_router(
                 chn = store.get_channel(raw_channel_id)
                 if chn is None:
                     _raise_http(status.HTTP_404_NOT_FOUND, f"Channel not found: {raw_channel_id}")
-                bot_ids = list(chn.get("bot_ids") or [])
+                bot_ids = [
+                    str(b) for b in (chn.get("bot_ids") or []) if store.get_bot(str(b)) is not None
+                ]
                 if not bot_ids:
-                    _raise_http(422, f"Channel {raw_channel_id} has no bots.")
+                    _raise_http(
+                        status.HTTP_409_CONFLICT,
+                        f"Channel {raw_channel_id} has no active bots.",
+                    )
                 raw_body["bot_id"] = str(bot_ids[0])
                 if not raw_thread_id:
                     raw_body["thread_id"] = str(chn["thread_id"])
             elif raw_thread_id:
                 chn = store.get_channel_by_thread(raw_thread_id)
-                if chn is not None and chn.get("bot_ids"):
-                    raw_body["bot_id"] = str(chn["bot_ids"][0])
+                if chn is not None:
+                    live_ids = [
+                        str(b)
+                        for b in (chn.get("bot_ids") or [])
+                        if store.get_bot(str(b)) is not None
+                    ]
+                    if not live_ids:
+                        _raise_http(
+                            status.HTTP_409_CONFLICT,
+                            f"Channel {chn['id']} has no active bots.",
+                        )
+                    raw_body["bot_id"] = live_ids[0]
                 else:
                     bot_by_thr = store.get_bot_by_thread(raw_thread_id)
                     if bot_by_thr is not None:
@@ -1273,10 +1313,16 @@ def create_v1_router(
             routine = store.update_routine(routine_id, payload.model_dump(exclude_unset=True))
         except StoreNotFoundError as exc:
             _raise_http(status.HTTP_404_NOT_FOUND, exc, exc=exc)
+        except StoreValidationError as exc:
+            _raise_http(422, exc, exc=exc)
         return _json_response(routine)
 
     @router.delete("/routines/{routine_id}")
     async def delete_routine(routine_id: str) -> JSONResponse:
+        existing = store.get_routine(routine_id)
+        if existing is None:
+            _raise_http(status.HTTP_404_NOT_FOUND, f"Routine not found: {routine_id}")
+        await runner.cancel_routine(routine_id)
         deleted = store.delete_routine(routine_id)
         if not deleted:
             _raise_http(status.HTTP_404_NOT_FOUND, f"Routine not found: {routine_id}")
