@@ -1,5 +1,6 @@
 import type { QueryClient } from '@tanstack/react-query';
 import { withAuthToken } from './api';
+import { reportClientError } from './diagnostics';
 import type {
   ApprovalCard,
   ComputerStatus,
@@ -392,6 +393,17 @@ export function startSseBridge(queryClient: QueryClient): () => void {
     }
 
     es.onerror = () => {
+      if (!closed) {
+        reportClientError({
+          kind: 'sse_error',
+          message: `SSE stream disconnected or errored (attempt ${attempt + 1})`,
+          url: '/api/v1/events/stream',
+          extra: {
+            attempt: attempt + 1,
+            last_event_id: useChatStreamStore.getState().lastEventId,
+          },
+        });
+      }
       useChatStreamStore.getState().setSseConnected(false);
       if (es) {
         es.close();

@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -2045,9 +2046,17 @@ def create_computer_router(
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
-        except (OSError, TimeoutError, RfbHandshakeError):
+        except (OSError, TimeoutError, RfbHandshakeError) as exc:
+            logging.getLogger(__name__).warning(
+                "VNC bridge error for vm_id=%s (%s:%s): %s: %s",
+                vm_id,
+                gateway.vnc_host,
+                gateway.vnc_port,
+                type(exc).__name__,
+                exc,
+            )
             with contextlib.suppress(Exception):
-                await websocket.close(code=1011)
+                await websocket.close(code=1011, reason=str(exc)[:120])
         except WebSocketDisconnect:
             pass
         finally:

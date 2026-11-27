@@ -10,7 +10,7 @@ import secrets
 import sqlite3
 import threading
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -140,6 +140,7 @@ class EventBus:
         self._subscriber_queue_size = max(1, int(subscriber_queue_size))
         self._store: Any | None = None
         self._own_conn: sqlite3.Connection | None = None
+        self._observers: list[Callable[[dict[str, Any]], None]] = []
 
         if store is not None:
             self.attach_store(store)
@@ -157,6 +158,11 @@ class EventBus:
             if not self._buffer:
                 return None
             return str(self._buffer[-1][1]["id"])
+
+    def add_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Register a non-blocking observer invoked after every published event."""
+        with self._lock:
+            self._observers.append(callback)
 
     def close(self) -> None:
         with self._lock:
@@ -423,6 +429,11 @@ class EventBus:
             item = (seq, event)
             self._buffer.append(item)
             subscribers = list(self._subscribers)
+            observers = list(self._observers)
+
+        for observer in observers:
+            with contextlib.suppress(Exception):
+                observer(event)
 
         running_loop: asyncio.AbstractEventLoop | None = None
         with contextlib.suppress(RuntimeError):

@@ -63,6 +63,11 @@ from src.web.auth import (
     resolve_web_token,
     verify_websocket_token,
 )
+from src.web.diagnostics import (
+    DiagnosticsMiddleware,
+    DiagnosticsRecorder,
+    create_diagnostics_router,
+)
 from src.web.live_browser import LiveBrowserController
 from src.web.live_terminal import LiveTerminalSession
 from src.web.protocols import CoordinatorProtocol, SessionManagerProtocol, TaskSnapshot, maybe_await
@@ -852,7 +857,9 @@ def create_app(
     )
     live_browser = LiveBrowserController(profile_root=live_profile_root)
     workspace_store = WorkspaceStore(db_path=resolved_db)
+    diagnostics_recorder = DiagnosticsRecorder(logs_dir=workspace_store.db_path.parent / "logs")
     event_bus = EventBus(store=workspace_store)
+    event_bus.add_observer(diagnostics_recorder.observe_sse_event)
 
     def _memory_audit_fn(
         conn: sqlite3.Connection,
@@ -914,6 +921,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        diagnostics_recorder.install_logging_handler()
         await v1_runner.start_scheduler()
         try:
             if active_runtime is not None:
@@ -927,6 +935,7 @@ def create_app(
             memory_store.close()
             event_bus.close()
             workspace_store.close()
+            diagnostics_recorder.uninstall_logging_handler()
             if active_runtime is None and owns_session_manager and internal_sm is not None:
                 await internal_sm.close_all()
 
@@ -951,10 +960,12 @@ def create_app(
     app.state.web_token_configured = bool(configured_token)
     app.state.web_token = configured_token
     app.state.rate_limiter = rate_limiter
+    app.state.diagnostics = diagnostics_recorder
 
     # Register inner-to-outer (Starlette wraps middlewares LIFO).
     app.add_middleware(RateLimitMiddleware, limiter=rate_limiter, limits=effective_limits)
     app.add_middleware(TokenAuthMiddleware, expected_token=configured_token)
+    app.add_middleware(DiagnosticsMiddleware, recorder=diagnostics_recorder)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_cfg.allow_origins,
@@ -984,6 +995,7 @@ def create_app(
         )
     )
     app.include_router(create_memory_router(memory_store))
+    app.include_router(create_diagnostics_router(diagnostics_recorder))
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(

@@ -323,12 +323,29 @@ class RfbInputGate:
                 needed = 6
                 is_input = True
             elif msg_type == 0x06:
-                # ClientCutText: 8 + length bytes
+                # ClientCutText (standard >=0 len) or Extended Clipboard (<0 signed len)
                 if len(self._buf) < 8:
                     break
-                (text_len,) = struct.unpack("!I", self._buf[4:8])
-                needed = 8 + int(text_len)
-                is_input = True
+                (raw_len,) = struct.unpack("!i", self._buf[4:8])
+                if raw_len < 0:
+                    payload_len = -int(raw_len)
+                    if payload_len > _MAX_RFB_BUFFER_BYTES:
+                        self._buf.clear()
+                        raise ValueError("RFB Extended Clipboard payload exceeds limit.")
+                    needed = 8 + payload_len
+                    if len(self._buf) < needed:
+                        break
+                    # Allow passive Extended Clipboard capability announcement (caps-only,
+                    # no request/peek/notify/provide action bits) during read-only preview.
+                    is_caps_only = False
+                    if payload_len >= 4:
+                        (flags,) = struct.unpack("!I", self._buf[8:12])
+                        action_bits = flags & 0xFF000000
+                        is_caps_only = action_bits == 0x01000000
+                    is_input = not is_caps_only
+                else:
+                    needed = 8 + int(raw_len)
+                    is_input = True
             elif msg_type == 0x96:
                 # EnableContinuousUpdates: 10 bytes
                 needed = 10
@@ -346,6 +363,10 @@ class RfbInputGate:
                     break
                 num_screens = int(self._buf[6])
                 needed = 8 + 16 * num_screens
+                is_input = True
+            elif msg_type == 0xFC:
+                # XVP Client Message: 4 bytes
+                needed = 4
                 is_input = True
             elif msg_type == 0xFF:
                 # QEMU / Extended Client Message

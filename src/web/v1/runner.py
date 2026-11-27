@@ -3420,6 +3420,7 @@ class AgentTurnRunner:
         tool_name: str,
         category: str,
         summary: str,
+        command: str | None = None,
     ) -> tuple[bool, str | None]:
         """Enforce ConnectedApp toggles, human takeover lock, safety_floor, and PolicyGateway."""
         if category == "browser" and not self._is_app_enabled("app_playwright"):
@@ -3453,6 +3454,16 @@ class AgentTurnRunner:
             if is_mcp
             else ("write" if action_kind == "write" else "read")
         )
+        if category == "terminal":
+            full_cmd = (command or "").strip()
+            policy_args: dict[str, Any] = (
+                {"command": full_cmd}
+                if full_cmd
+                else {"summary": summary, "command": summary}
+            )
+        else:
+            policy_args = {"summary": summary}
+
         decision = self._policy_gateway.evaluate_and_record(
             PolicyRequest(
                 actor_id=bot_id,
@@ -3460,9 +3471,7 @@ class AgentTurnRunner:
                 lane=lane,
                 tool_id=tool_name,
                 action_kind=req_action_kind,
-                arguments={"summary": summary, "command": summary}
-                if category == "terminal"
-                else {"summary": summary},
+                arguments=policy_args,
                 is_mcp_tool=is_mcp,
                 mcp_known_read_only=mcp_known_ro,
                 task_id=turn_id,
@@ -3607,6 +3616,10 @@ class AgentTurnRunner:
                     tool_name = str(ev.get("tool_name") or "tool")
                     raw_state = str(ev.get("state") or "ACTIVE").upper()
                     summary = str(ev.get("summary") or tool_name)
+                    raw_cmd = ev.get("command")
+                    command_str = (
+                        str(raw_cmd) if isinstance(raw_cmd, str) and raw_cmd.strip() else None
+                    )
                     category = _infer_tool_category(tool_name)
 
                     allowed, block_reason = self._gate_mid_turn_tool(
@@ -3616,6 +3629,7 @@ class AgentTurnRunner:
                         tool_name=tool_name,
                         category=category,
                         summary=summary,
+                        command=command_str,
                     )
                     if not allowed:
                         entry = {
