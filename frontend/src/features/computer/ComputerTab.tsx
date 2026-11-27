@@ -34,8 +34,10 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
   const pushToast = useUiStore((s) => s.pushToast);
 
   const status = useComputerStore((s) => s.byVmId[vmId]);
+  const statusLoaded = useComputerStore((s) => Boolean(s.loadedByVmId[vmId]));
   const setStatus = useComputerStore((s) => s.setStatus);
   const preferredSource = useComputerStore((s) => s.preferredSource);
+  const hasExplicitSourceChoice = useComputerStore((s) => s.hasExplicitSourceChoice);
   const setPreferredSource = useComputerStore((s) => s.setPreferredSource);
   const teachSteps = useComputerStore((s) => s.teachSteps);
   const clearTeachSteps = useComputerStore((s) => s.clearTeachSteps);
@@ -59,6 +61,11 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
   const currentStatus = status ?? statusQuery.data;
   const isTakeover = currentStatus?.control_owner === 'human_takeover';
   const isTeaching = Boolean(currentStatus?.is_teaching_task);
+  const effectiveSource: 'vnc' | 'screencast' =
+    currentStatus && !currentStatus.vnc_available && !hasExplicitSourceChoice
+      ? 'screencast'
+      : preferredSource;
+  const canMountCanvas = statusLoaded || statusQuery.isError;
 
   const takeoverMutation = useMutation({
     mutationFn: () => computerApi.takeover(vmId, 'user_preview_takeover'),
@@ -229,8 +236,8 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
                 onClick={() => setPreferredSource('vnc')}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11.5px] font-medium"
                 style={{
-                  backgroundColor: preferredSource === 'vnc' ? 'var(--bg-canvas)' : 'transparent',
-                  color: preferredSource === 'vnc' ? 'var(--text-primary)' : 'var(--text-secondary)',
+                  backgroundColor: effectiveSource === 'vnc' ? 'var(--bg-canvas)' : 'transparent',
+                  color: effectiveSource === 'vnc' ? 'var(--text-primary)' : 'var(--text-secondary)',
                 }}
               >
                 <Monitor size={12} />
@@ -242,9 +249,9 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11.5px] font-medium"
                 style={{
                   backgroundColor:
-                    preferredSource === 'screencast' ? 'var(--bg-canvas)' : 'transparent',
+                    effectiveSource === 'screencast' ? 'var(--bg-canvas)' : 'transparent',
                   color:
-                    preferredSource === 'screencast'
+                    effectiveSource === 'screencast'
                       ? 'var(--text-primary)'
                       : 'var(--text-secondary)',
                 }}
@@ -342,10 +349,18 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
                   Exit full-screen
                 </button>
               </div>
+            ) : !canMountCanvas ? (
+              <div
+                className="h-full min-h-[220px] flex flex-col items-center justify-center gap-2 p-4 text-center"
+                style={{ backgroundColor: '#18191C', color: '#A1A7B5' }}
+              >
+                <Monitor size={22} className="text-[#A78BFA]" />
+                <div className="text-[12.5px]">Checking display availability…</div>
+              </div>
             ) : (
               <LiveVncCanvas
                 vmId={vmId}
-                source={preferredSource}
+                source={effectiveSource}
                 interactive={isTakeover}
               />
             )}

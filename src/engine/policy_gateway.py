@@ -6194,33 +6194,54 @@ def _shell_cmd_name(token: str) -> str:
     return cleaned.lower()
 
 
-def _unwrap_command_tokens(raw_tokens: list[str]) -> list[str]:
+def _consume_leading_redirection_with_flags(
+    tokens: list[str], flags: list[bool] | None
+) -> bool:
+    before = len(tokens)
+    if not _consume_leading_redirection(tokens):
+        return False
+    if flags is not None:
+        removed = before - len(tokens)
+        del flags[:removed]
+    return True
+
+
+def _unwrap_command_tokens_with_flags(
+    raw_tokens: list[str], raw_flags: list[bool] | None = None
+) -> tuple[list[str], list[bool]]:
     tokens = list(raw_tokens)
+    flags = list(raw_flags) if raw_flags is not None else [False] * len(tokens)
     while tokens:
         if "=" in tokens[0] and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
             tokens.pop(0)
+            flags.pop(0)
             continue
-        if _consume_leading_redirection(tokens):
+        if _consume_leading_redirection_with_flags(tokens, flags):
             continue
         break
     env_split_count = 0
     while tokens and _shell_cmd_name(tokens[0]) in _WRAPPER_COMMANDS:
         wrapper = _shell_cmd_name(tokens.pop(0))
+        flags.pop(0)
         arg_opts = _WRAPPER_ARG_OPTIONS.get(wrapper, frozenset())
         while tokens:
             tok = tokens[0]
             if tok == "--":
                 tokens.pop(0)
+                flags.pop(0)
                 break
-            if _consume_leading_redirection(tokens):
+            if _consume_leading_redirection_with_flags(tokens, flags):
                 continue
             if tok.startswith("-"):
                 tokens.pop(0)
+                tok_flag = flags.pop(0)
                 if wrapper == "env" and env_split_count < 8:
                     split_str: str | None = None
+                    split_flag = tok_flag
                     if tok == "--split-string":
                         if tokens:
                             split_str = tokens.pop(0)
+                            split_flag = flags.pop(0)
                     elif tok.startswith("--split-string="):
                         split_str = tok.split("=", 1)[1]
                     elif not tok.startswith("--") and len(tok) >= 2:
@@ -6232,30 +6253,42 @@ def _unwrap_command_tokens(raw_tokens: list[str]) -> list[str]:
                                         split_str = tok[idx_c + 1 :]
                                     elif tokens:
                                         split_str = tokens.pop(0)
+                                        split_flag = flags.pop(0)
                                 elif idx_c + 1 == len(tok) and tokens:
                                     tokens.pop(0)
+                                    flags.pop(0)
                                 break
                     elif _wrapper_short_cluster_takes_arg(tok, arg_opts) and tokens:
                         tokens.pop(0)
+                        flags.pop(0)
                     if split_str is not None:
                         env_split_count += 1
                         split_tokens = _split_env_string_tokens(split_str)
                         if split_tokens:
                             tokens = split_tokens + tokens
+                            flags = [split_flag] * len(split_tokens) + flags
                     continue
                 if _wrapper_short_cluster_takes_arg(tok, arg_opts) and tokens:
                     tokens.pop(0)
+                    flags.pop(0)
                 continue
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tok):
                 tokens.pop(0)
+                flags.pop(0)
                 continue
             break
-        while _consume_leading_redirection(tokens):
+        while _consume_leading_redirection_with_flags(tokens, flags):
             pass
         if wrapper == "timeout" and tokens and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", tokens[0]):
             tokens.pop(0)
-        while _consume_leading_redirection(tokens):
+            flags.pop(0)
+        while _consume_leading_redirection_with_flags(tokens, flags):
             pass
+    return tokens, flags
+
+
+def _unwrap_command_tokens(raw_tokens: list[str]) -> list[str]:
+    tokens, _ = _unwrap_command_tokens_with_flags(raw_tokens, None)
     return tokens
 
 
@@ -6490,45 +6523,58 @@ _SHELL_REDIR_OP_RE = re.compile(
 )
 
 
-def _is_shell_redirection_tail(tail: str) -> bool:
-    i = 0
-    n = len(tail)
-    while i < n:
-        while i < n:
-            if tail[i].isspace():
+def _is_shell_redirection_tail_span(text: str, start: int, end: int) -> bool:
+    i = start
+    while i < end:
+        while i < end:
+            if text[i].isspace():
                 i += 1
                 continue
-            if tail.startswith("\\\r\n", i):
+            if text.startswith("\\\r\n", i, end):
                 i += 3
                 continue
-            if tail.startswith("\\\n", i):
+            if text.startswith("\\\n", i, end):
                 i += 2
                 continue
             break
-        if i >= n:
+        if i >= end:
             return True
-        if i == n - 1 and tail[i] == "\\":
+        if i == end - 1 and text[i] == "\\":
             return True
-        m = _SHELL_REDIR_OP_RE.match(tail, i)
+        if text[i] == "#" and (
+            (i > start and (text[i - 1].isspace() or text[i - 1] in ";|&()<>"))
+            or (i == start and (start == 0 or text[start - 1] in ";|&()<> \t\r\n"))
+        ):
+            while i < end:
+                while i < end and text[i] not in "\r\n":
+                    i += 1
+                while i < end and text[i].isspace():
+                    i += 1
+                if i >= end:
+                    return True
+                if text[i] != "#":
+                    return False
+            return True
+        m = _SHELL_REDIR_OP_RE.match(text, i, end)
         if m is None:
             return False
         i = m.end()
-        while i < n and tail[i] in " \t":
+        while i < end and text[i] in " \t":
             i += 1
-        if i >= n:
+        if i >= end:
             return False
         word_start = i
         in_single = False
         in_double = False
-        while i < n:
-            ch = tail[i]
+        while i < end:
+            ch = text[i]
             if in_single:
                 if ch == "'":
                     in_single = False
                 i += 1
                 continue
             if in_double:
-                if ch == "\\" and i + 1 < n:
+                if ch == "\\" and i + 1 < end:
                     i += 2
                     continue
                 if ch == '"':
@@ -6536,7 +6582,7 @@ def _is_shell_redirection_tail(tail: str) -> bool:
                 i += 1
                 continue
             if ch == "\\":
-                if i + 1 >= n:
+                if i + 1 >= end:
                     break
                 i += 2
                 continue
@@ -6558,6 +6604,10 @@ def _is_shell_redirection_tail(tail: str) -> bool:
         if in_single or in_double or i == word_start:
             return False
     return True
+
+
+def _is_shell_redirection_tail(tail: str) -> bool:
+    return _is_shell_redirection_tail_span(tail, 0, len(tail))
 
 
 def _unwrap_matching_groups(text: str) -> str | None:
@@ -6583,7 +6633,7 @@ def _unwrap_matching_groups(text: str) -> str | None:
             end -= 1
             unwrapped_any = True
             continue
-        if _is_shell_redirection_tail(s[close_idx + 1 : end]):
+        if _is_shell_redirection_tail_span(s, close_idx + 1, end):
             start += 1
             end = close_idx
             unwrapped_any = True
@@ -6796,6 +6846,7 @@ def _replace_shell_positional_params(
     script: str,
     pos_args: Sequence[str],
     *,
+    pos_flags: Sequence[bool] | None = None,
     _char_budget: list[int] | None = None,
 ) -> str:
     if "$" not in script:
@@ -6836,6 +6887,14 @@ def _replace_shell_positional_params(
 
         match_len = m.end() - m.start()
         is_set = idx < len(pos_args)
+        is_unres = is_set and pos_flags is not None and idx < len(pos_flags) and pos_flags[idx]
+        if is_unres:
+            rep = (
+                f'"{_SHELL_AMBIGUOUS_VAR_SENTINEL}"'
+                if is_quoted
+                else _SHELL_AMBIGUOUS_VAR_SENTINEL
+            )
+            return _charge(rep, match_len)
         val = pos_args[idx] if is_set else ""
         if op is None:
             if not is_set:
@@ -6878,8 +6937,24 @@ def _replace_shell_at_star_params(
     if not has_at and not has_star:
         return script
     char_budget = _char_budget if _char_budget is not None else [0]
-    quoted_at = (shlex.quote(at_val) if quote_at else at_val) if at_val is not None else None
-    quoted_star = shlex.quote(star_val) if star_val is not None else None
+    quoted_at = (
+        (
+            f'"{_SHELL_AMBIGUOUS_VAR_SENTINEL}"'
+            if _SHELL_AMBIGUOUS_VAR_SENTINEL in at_val
+            else shlex.quote(at_val)
+        )
+        if quote_at
+        else at_val
+    ) if at_val is not None else None
+    quoted_star = (
+        (
+            f'"{_SHELL_AMBIGUOUS_VAR_SENTINEL}"'
+            if _SHELL_AMBIGUOUS_VAR_SENTINEL in star_val
+            else shlex.quote(star_val)
+        )
+        if star_val is not None
+        else None
+    )
 
     def _repl(m: re.Match[str]) -> str:
         if m.group(1) is not None:
@@ -6947,39 +7022,62 @@ def _find_python_c_script(tokens: list[str]) -> tuple[int | None, str | None]:
     return None, None
 
 
+def _inspect_sh_options(
+    tokens: list[str],
+    flags: Sequence[bool] | None = None,
+) -> tuple[int | None, bool]:
+    if len(tokens) < 2:
+        return None, False
+    idx = 1
+    while idx < len(tokens):
+        if flags is not None and idx < len(flags) and flags[idx]:
+            return None, True
+        tok = tokens[idx]
+        if tok == "--":
+            if flags is not None and idx + 1 < len(flags) and flags[idx + 1]:
+                return None, True
+            return None, False
+        if tok.startswith("--"):
+            idx += 1
+            if "=" not in tok and tok in {"--rcfile", "--init-file"} and idx < len(tokens):
+                if flags is not None and idx < len(flags) and flags[idx]:
+                    return None, True
+                idx += 1
+            continue
+        if not tok.startswith(("-", "+")) or len(tok) < 2:
+            return None, False
+        if tok == "-c" or (
+            tok.startswith("-") and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", tok) is not None
+        ):
+            if tok[-1] in {"o", "O"} and idx + 1 < len(tokens):
+                if flags is not None and idx + 1 < len(flags) and flags[idx + 1]:
+                    return None, True
+                script_idx = idx + 2
+            else:
+                script_idx = idx + 1
+            if script_idx < len(tokens) and tokens[script_idx] == "--":
+                script_idx += 1
+            return (script_idx if script_idx < len(tokens) else None), False
+        if tok in {"-o", "-O", "+o", "+O"} or re.fullmatch(r"[+-][A-Za-z]+[oO]", tok) is not None:
+            if flags is not None and idx + 1 < len(flags) and flags[idx + 1]:
+                return None, True
+            idx += 2
+            continue
+        if re.fullmatch(r"[+-][A-Za-z]+", tok) is not None:
+            idx += 1
+            continue
+        return None, False
+    return None, False
+
+
 def _find_sh_c_script_index(tokens: list[str], *, is_python: bool = False) -> int | None:
     if is_python:
         script_idx, _ = _find_python_c_script(tokens)
         return script_idx
     if len(tokens) < 3:
         return None
-    idx = 1
-    while idx < len(tokens):
-        tok = tokens[idx]
-        if tok == "--":
-            return None
-        if tok.startswith("--"):
-            idx += 1
-            if "=" not in tok and tok in {"--rcfile", "--init-file"} and idx < len(tokens):
-                idx += 1
-            continue
-        if not tok.startswith(("-", "+")) or len(tok) < 2:
-            return None
-        if tok == "-c" or (
-            tok.startswith("-") and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", tok) is not None
-        ):
-            script_idx = idx + (2 if tok[-1] in {"o", "O"} else 1)
-            if script_idx < len(tokens) and tokens[script_idx] == "--":
-                script_idx += 1
-            return script_idx if script_idx < len(tokens) else None
-        if tok in {"-o", "-O", "+o", "+O"} or re.fullmatch(r"[+-][A-Za-z]+[oO]", tok) is not None:
-            idx += 2
-            continue
-        if re.fullmatch(r"[+-][A-Za-z]+", tok) is not None:
-            idx += 1
-            continue
-        return None
-    return None
+    script_idx, _ = _inspect_sh_options(tokens, None)
+    return script_idx
 
 
 def _expand_loop_var_tokens(
@@ -7067,6 +7165,736 @@ def _expand_loop_var_tokens(
                 break
         expanded_sets = next_sets
     return expanded_sets
+
+
+_SHELL_VAR_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?=)(.*)$", re.DOTALL)
+_SHELL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SHELL_DECL_BUILTINS: frozenset[str] = frozenset(
+    {"export", "local", "declare", "typeset", "readonly"}
+)
+_SHELL_EXPANDABLE_VAR_RE = re.compile(
+    r"\$(?:[A-Za-z0-9_@*]|\{[A-Za-z0-9_!#@*?])"
+)
+_SHELL_PURE_VAR_REF_RE = re.compile(
+    r"^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*]|\{[A-Za-z0-9_!#@*?][^}]*\})$"
+)
+_SHELL_AMBIGUOUS_VAR_SENTINEL: str = "$__AMBIGUOUS__"
+_SHELL_KEYWORD_STAGE_HEADS: frozenset[str] = frozenset(
+    {"for", "while", "until", "if", "case", "then", "do", "else", "elif", "done", "fi", "esac"}
+)
+
+
+class _AmbiguousPipedCompoundShell(Exception):
+    pass
+
+
+def _tokenize_raw_with_expand_segments(
+    stage_str: str, *, strip_flow_prefixes: bool = True
+) -> list[list[tuple[str, bool, bool]]]:
+    s = stage_str.strip()
+    if not s:
+        return []
+    if "\\\n" in s:
+        s = _strip_shell_line_continuations(s)
+    if "$'" in s:
+        s = _normalize_ansi_c_quotes(s)
+    if '$"' in s:
+        s = _normalize_locale_dquotes(s)
+    if "#" in s:
+        s = _strip_shell_comments(s)
+    s = _strip_unquoted_redirections(s)
+    spaced = _space_unquoted_parens(s).strip()
+    if not spaced:
+        return []
+
+    tokens_segs: list[list[tuple[str, bool, bool]]] = []
+    n = len(spaced)
+    i = 0
+    try:
+        while i < n:
+            while i < n and spaced[i] in " \t\r\n":
+                i += 1
+            if i >= n:
+                break
+            cur_segs: list[tuple[str, bool, bool]] = []
+            lit_buf: list[str] = []
+            has_token = False
+
+            def _flush_lit(
+                is_exp: bool,
+                is_unq: bool,
+                _buf: list[str] = lit_buf,
+                _segs: list[tuple[str, bool, bool]] = cur_segs,
+            ) -> None:
+                if _buf:
+                    _segs.append(("".join(_buf), is_exp, is_unq))
+                    _buf.clear()
+
+            while i < n:
+                ch = spaced[i]
+                if ch in " \t\r\n":
+                    _flush_lit(True, True)
+                    break
+                if ch == "'":
+                    _flush_lit(True, True)
+                    has_token = True
+                    close_sq = spaced.find("'", i + 1)
+                    if close_sq == -1:
+                        raise ValueError("No closing quotation")
+                    if close_sq > i + 1:
+                        cur_segs.append((spaced[i + 1 : close_sq], False, False))
+                    i = close_sq + 1
+                    continue
+                if ch == '"':
+                    _flush_lit(True, True)
+                    has_token = True
+                    j = i + 1
+                    dq_buf: list[str] = []
+                    closed = False
+                    while j < n:
+                        dch = spaced[j]
+                        if dch == '"':
+                            i = j + 1
+                            closed = True
+                            break
+                        if dch == "\\":
+                            if j + 1 >= n:
+                                raise ValueError("No escaped character")
+                            nxt = spaced[j + 1]
+                            if nxt in ('"', "\\", "$", "`"):
+                                if dq_buf:
+                                    cur_segs.append(("".join(dq_buf), True, False))
+                                    dq_buf.clear()
+                                cur_segs.append((nxt, False, False))
+                            else:
+                                dq_buf.append("\\")
+                                dq_buf.append(nxt)
+                            j += 2
+                            continue
+                        dq_buf.append(dch)
+                        j += 1
+                    if not closed:
+                        raise ValueError("No closing quotation")
+                    if dq_buf:
+                        cur_segs.append(("".join(dq_buf), True, False))
+                    continue
+                if ch == "\\":
+                    _flush_lit(True, True)
+                    has_token = True
+                    if i + 1 >= n:
+                        raise ValueError("No escaped character")
+                    cur_segs.append((spaced[i + 1], False, False))
+                    i += 2
+                    continue
+                has_token = True
+                lit_buf.append(ch)
+                i += 1
+            _flush_lit(True, True)
+            if has_token:
+                if not cur_segs:
+                    cur_segs.append(("", False, False))
+                tokens_segs.append(cur_segs)
+    except ValueError:
+        tokens_segs = [[(w, True, True)] for w in spaced.split()]
+
+    if strip_flow_prefixes:
+        while tokens_segs:
+            head_txt = "".join(c for c, _, _ in tokens_segs[0])
+            if head_txt in {"(", "{"} or (
+                head_txt in _SHELL_FLOW_PREFIX_TOKENS and len(tokens_segs) > 1
+            ):
+                tokens_segs.pop(0)
+            else:
+                break
+        while tokens_segs:
+            tail_txt = "".join(c for c, _, _ in tokens_segs[-1])
+            if tail_txt in {")", "}"}:
+                tokens_segs.pop()
+            else:
+                break
+    return tokens_segs
+
+
+def _expand_annotated_tokens(
+    annotated_tokens: list[list[tuple[str, bool, bool]]],
+    loop_vars: Mapping[str, list[str]],
+    *,
+    _step_budget: list[int] | None = None,
+    _char_budget: list[int] | None = None,
+    word_split_unquoted: bool = True,
+    out_unquoted_flags: list[list[bool]] | None = None,
+) -> list[tuple[list[str], list[bool]]]:
+    if not annotated_tokens:
+        if out_unquoted_flags is not None:
+            out_unquoted_flags.append([])
+        return [([], [])]
+    char_budget = _char_budget if _char_budget is not None else [0]
+    referenced_set: set[str] = set()
+    if loop_vars:
+        for segs in annotated_tokens:
+            for chunk, is_exp, _ in segs:
+                if is_exp and "$" in chunk:
+                    for m in _SHELL_VAR_REF_RE.finditer(chunk):
+                        vn = m.group(1) or m.group(2)
+                        if vn in loop_vars and loop_vars[vn]:
+                            referenced_set.add(vn)
+
+    single_vals: dict[str, str] = {}
+    multi_vars: list[str] = []
+    if referenced_set:
+        for vn in loop_vars:
+            if vn not in referenced_set:
+                continue
+            vals = loop_vars[vn]
+            if len(vals) == 1:
+                single_vals[vn] = vals[0]
+            else:
+                multi_vars.append(vn)
+
+    # Represent each token as list of:
+    # (piece_text, still_check_unresolved, is_orig_unquoted, was_unquoted_expanded)
+    base_state: list[list[tuple[str, bool, bool, bool]]] = []
+    for segs in annotated_tokens:
+        tok_state: list[tuple[str, bool, bool, bool]] = []
+        for chunk, is_exp, is_unq in segs:
+            if is_exp and single_vals and "$" in chunk:
+                pos = 0
+                changed = False
+                for m in _SHELL_VAR_REF_RE.finditer(chunk):
+                    vn = m.group(1) or m.group(2)
+                    if vn in single_vals:
+                        if m.start() > pos:
+                            tok_state.append((chunk[pos : m.start()], True, is_unq, False))
+                        rep = single_vals[vn]
+                        char_budget[0] += max(1, len(rep))
+                        if char_budget[0] > _MAX_SHELL_EXPANDED_CHARS:
+                            raise _ShellComplexityBudgetExceeded()
+                        is_ambig = _SHELL_AMBIGUOUS_VAR_SENTINEL in rep
+                        tok_state.append((rep, is_ambig, is_unq, is_unq))
+                        pos = m.end()
+                        changed = True
+                if changed:
+                    if pos < len(chunk):
+                        tok_state.append((chunk[pos:], True, is_unq, False))
+                    continue
+            tok_state.append((chunk, is_exp, is_unq, False))
+        base_state.append(tok_state)
+
+    states: list[list[list[tuple[str, bool, bool, bool]]]] = [base_state]
+    for vn in multi_vars:
+        values = loop_vars[vn]
+        next_states: list[list[list[tuple[str, bool, bool, bool]]]] = []
+        for cur_st in states:
+            for val in values:
+                if _step_budget is not None:
+                    _step_budget[0] += 1
+                    if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                        break
+                new_st: list[list[tuple[str, bool, bool, bool]]] = []
+                for tok_segs in cur_st:
+                    new_tok_segs: list[tuple[str, bool, bool, bool]] = []
+                    for chunk, is_exp, is_unq_orig, was_unq_exp in tok_segs:
+                        if is_exp and "$" in chunk:
+                            pos = 0
+                            changed = False
+                            for m in _SHELL_VAR_REF_RE.finditer(chunk):
+                                if (m.group(1) or m.group(2)) == vn:
+                                    if m.start() > pos:
+                                        new_tok_segs.append(
+                                            (
+                                                chunk[pos : m.start()],
+                                                True,
+                                                is_unq_orig,
+                                                was_unq_exp,
+                                            )
+                                        )
+                                    char_budget[0] += max(1, len(val))
+                                    if char_budget[0] > _MAX_SHELL_EXPANDED_CHARS:
+                                        raise _ShellComplexityBudgetExceeded()
+                                    is_ambig = _SHELL_AMBIGUOUS_VAR_SENTINEL in val
+                                    new_tok_segs.append(
+                                        (val, is_ambig, is_unq_orig, is_unq_orig)
+                                    )
+                                    pos = m.end()
+                                    changed = True
+                            if changed:
+                                if pos < len(chunk):
+                                    new_tok_segs.append(
+                                        (chunk[pos:], True, is_unq_orig, was_unq_exp)
+                                    )
+                                continue
+                        new_tok_segs.append((chunk, is_exp, is_unq_orig, was_unq_exp))
+                    new_st.append(new_tok_segs)
+                next_states.append(new_st)
+                if len(next_states) >= 32:
+                    break
+            if len(next_states) >= 32:
+                break
+        if next_states:
+            states = next_states
+
+    results: list[tuple[list[str], list[bool]]] = []
+    for st in states:
+        out_toks: list[str] = []
+        out_flags: list[bool] = []
+        out_unq: list[bool] = []
+        for tok_segs in st:
+            if not word_split_unquoted:
+                full_str = "".join(ch for ch, _, _, _ in tok_segs)
+                has_unres = False
+                has_unq_unres = False
+                for ch, is_exp, is_unq_orig, _ in tok_segs:
+                    if is_exp and "$" in ch and _SHELL_EXPANDABLE_VAR_RE.search(ch) is not None:
+                        has_unres = True
+                        if is_unq_orig:
+                            has_unq_unres = True
+                out_toks.append(full_str)
+                out_flags.append(has_unres)
+                out_unq.append(has_unq_unres)
+                continue
+
+            cur_word: list[str] = []
+            cur_has_unres = False
+            cur_has_unq_unres = False
+            has_any_content = False
+
+            for piece, is_exp, is_unq_orig, was_unq_exp in tok_segs:
+                piece_unres = (
+                    is_exp and "$" in piece and _SHELL_EXPANDABLE_VAR_RE.search(piece) is not None
+                )
+                piece_unq_unres = piece_unres and is_unq_orig
+                if not was_unq_exp:
+                    cur_word.append(piece)
+                    has_any_content = True
+                    if piece_unres:
+                        cur_has_unres = True
+                    if piece_unq_unres:
+                        cur_has_unq_unres = True
+                    continue
+                if not piece:
+                    if piece_unres:
+                        cur_has_unres = True
+                        if piece_unq_unres:
+                            cur_has_unq_unres = True
+                        has_any_content = True
+                    continue
+                if not any(ws in piece for ws in " \t\n\r"):
+                    cur_word.append(piece)
+                    has_any_content = True
+                    if piece_unres:
+                        cur_has_unres = True
+                    if piece_unq_unres:
+                        cur_has_unq_unres = True
+                    continue
+                p_len = len(piece)
+                p_idx = 0
+                while p_idx < p_len:
+                    if piece[p_idx] in " \t\n\r":
+                        if has_any_content:
+                            out_toks.append("".join(cur_word))
+                            out_flags.append(cur_has_unres)
+                            out_unq.append(cur_has_unq_unres)
+                            cur_word.clear()
+                            cur_has_unres = False
+                            cur_has_unq_unres = False
+                            has_any_content = False
+                        while p_idx < p_len and piece[p_idx] in " \t\n\r":
+                            p_idx += 1
+                    else:
+                        run_s = p_idx
+                        while p_idx < p_len and piece[p_idx] not in " \t\n\r":
+                            p_idx += 1
+                        cur_word.append(piece[run_s:p_idx])
+                        has_any_content = True
+                        if piece_unres:
+                            cur_has_unres = True
+                        if piece_unq_unres:
+                            cur_has_unq_unres = True
+            if has_any_content:
+                out_toks.append("".join(cur_word))
+                out_flags.append(cur_has_unres)
+                out_unq.append(cur_has_unq_unres)
+        results.append((out_toks, out_flags))
+        if out_unquoted_flags is not None:
+            out_unquoted_flags.append(out_unq)
+    return results
+
+
+def _parse_var_assignment_chain(
+    text: str,
+    c_s: int,
+    c_e: int,
+    loop_vars: Mapping[str, list[str]],
+    *,
+    _step_budget: list[int] | None = None,
+    _char_budget: list[int] | None = None,
+) -> tuple[str, list[tuple[str, list[str]]]] | None:
+    pos = _strip_non_opener_flow_prefixes_span(text, c_s, c_e)
+    raw = text[pos:c_e].strip()
+    if not raw:
+        return None
+    has_eq = "=" in raw
+    is_unset = raw.startswith("unset") and (len(raw) == 5 or raw[5].isspace())
+    if not has_eq and not is_unset:
+        return None
+    if (
+        "|" in raw
+        and len(_split_shell_outside_quotes(raw, _SHELL_PIPE_SEPS, respect_groups=True)) > 1
+    ):
+        return None
+    if not any(ch in raw for ch in "'\"\\#$<>{}()") and not is_unset:
+        words = raw.split()
+        if not words:
+            return None
+        if words[0] in _SHELL_DECL_BUILTINS:
+            idx_w = 1
+            while idx_w < len(words) and words[idx_w].startswith(("-", "+")):
+                if any(f in words[idx_w] for f in ("f", "F", "p")):
+                    return None
+                idx_w += 1
+            words = words[idx_w:]
+            if not words:
+                return None
+        parsed_fast: list[tuple[str, list[str]]] = []
+        for w in words:
+            m = _SHELL_VAR_ASSIGN_RE.fullmatch(w)
+            if m is None:
+                return None
+            var_name, op, rhs_raw = m.group(1), m.group(2), m.group(3)
+            if "$" in rhs_raw and loop_vars:
+                rhs_exp = _expand_annotated_tokens(
+                    [[(rhs_raw, True, True)]],
+                    loop_vars,
+                    _step_budget=_step_budget,
+                    _char_budget=_char_budget,
+                    word_split_unquoted=False,
+                )
+                rhs_vals = [
+                    _SHELL_AMBIGUOUS_VAR_SENTINEL if any(flags) else toks[0]
+                    for toks, flags in rhs_exp
+                    if toks
+                ]
+            else:
+                rhs_vals = [rhs_raw]
+            if op == "+=":
+                prev_vals = loop_vars.get(var_name) or [""]
+                combined: list[str] = []
+                for pv in prev_vals:
+                    for rv in rhs_vals:
+                        if (
+                            pv == _SHELL_AMBIGUOUS_VAR_SENTINEL
+                            or rv == _SHELL_AMBIGUOUS_VAR_SENTINEL
+                        ):
+                            combined.append(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                        else:
+                            combined.append(pv + rv)
+                        if len(combined) >= 32:
+                            break
+                    if len(combined) >= 32:
+                        break
+                rhs_vals = combined
+            parsed_fast.append((var_name, rhs_vals))
+        return ("assign", parsed_fast)
+
+    ann_tokens = _tokenize_raw_with_expand_segments(raw, strip_flow_prefixes=False)
+    if not ann_tokens:
+        return None
+    first_str = "".join(c for c, _, _ in ann_tokens[0])
+    if first_str == "unset":
+        unset_vars: list[tuple[str, list[str]]] = []
+        for segs in ann_tokens[1:]:
+            tok = "".join(c for c, _, _ in segs)
+            if tok.startswith("-"):
+                if "f" in tok:
+                    return None
+                continue
+            if _SHELL_IDENT_RE.fullmatch(tok):
+                unset_vars.append((tok, []))
+        return ("unset", unset_vars) if unset_vars else None
+
+    if first_str in _SHELL_DECL_BUILTINS:
+        idx_a = 1
+        while idx_a < len(ann_tokens):
+            opt_s = "".join(c for c, _, _ in ann_tokens[idx_a])
+            if opt_s.startswith(("-", "+")):
+                if any(f in opt_s for f in ("f", "F", "p")):
+                    return None
+                idx_a += 1
+                continue
+            break
+        ann_tokens = ann_tokens[idx_a:]
+        if not ann_tokens:
+            return None
+
+    bindings: list[tuple[str, list[str]]] = []
+    for segs in ann_tokens:
+        if not segs or not segs[0][1]:
+            return None
+        first_chunk = segs[0][0]
+        m = _SHELL_VAR_ASSIGN_RE.match(first_chunk)
+        if m is None:
+            return None
+        var_name, op, first_rhs = m.group(1), m.group(2), m.group(3)
+        rhs_segs: list[tuple[str, bool, bool]] = []
+        if first_rhs or len(segs) == 1:
+            rhs_segs.append((first_rhs, segs[0][1], segs[0][2]))
+        rhs_segs.extend(segs[1:])
+        exp_rhs = _expand_annotated_tokens(
+            [rhs_segs],
+            loop_vars,
+            _step_budget=_step_budget,
+            _char_budget=_char_budget,
+            word_split_unquoted=False,
+        )
+        rhs_vals = [
+            _SHELL_AMBIGUOUS_VAR_SENTINEL if any(flags) else toks[0]
+            for toks, flags in exp_rhs
+            if toks
+        ]
+        if op == "+=":
+            prev_vals = loop_vars.get(var_name) or [""]
+            combined = []
+            for pv in prev_vals:
+                for rv in rhs_vals:
+                    if (
+                        pv == _SHELL_AMBIGUOUS_VAR_SENTINEL
+                        or rv == _SHELL_AMBIGUOUS_VAR_SENTINEL
+                    ):
+                        combined.append(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                    else:
+                        combined.append(pv + rv)
+                    if len(combined) >= 32:
+                        break
+                if len(combined) >= 32:
+                    break
+            rhs_vals = combined
+        bindings.append((var_name, rhs_vals))
+    return ("assign", bindings) if bindings else None
+
+
+_SHELL_READ_ARG_OPTS: frozenset[str] = frozenset({"p", "d", "n", "N", "t", "u", "a", "i"})
+
+
+def _parse_read_var_names_in_chain(text: str, c_s: int, c_e: int) -> list[str] | None:
+    if text.find("read", c_s, c_e) == -1:
+        return None
+    pos = _strip_non_opener_flow_prefixes_span(text, c_s, c_e)
+    while pos < c_e:
+        if _match_shell_kw_boundary(
+            text, pos, c_e, "while", allow_group_after=False
+        ) or _match_shell_kw_boundary(text, pos, c_e, "until", allow_group_after=False):
+            pos += 5
+        else:
+            break
+        while pos < c_e and text[pos].isspace():
+            pos += 1
+    raw = text[pos:c_e].strip()
+    if not raw or "read" not in raw:
+        return None
+    if "|" in raw:
+        return None
+    try:
+        toks = _fast_posix_shlex_split(raw)
+    except ValueError:
+        return None
+    idx = 0
+    while idx < len(toks) and _SHELL_VAR_ASSIGN_RE.match(toks[idx]) is not None:
+        idx += 1
+    if idx >= len(toks) or _shell_cmd_name(toks[idx]) != "read":
+        return None
+    idx += 1
+    while idx < len(toks):
+        tok = toks[idx]
+        if tok == "--":
+            idx += 1
+            break
+        if tok.startswith("-") and len(tok) > 1:
+            idx += 1
+            for opt_idx in range(1, len(tok)):
+                if tok[opt_idx] in _SHELL_READ_ARG_OPTS:
+                    if opt_idx + 1 == len(tok) and idx < len(toks):
+                        idx += 1
+                    break
+            continue
+        break
+    var_names: list[str] = []
+    for tok in toks[idx:]:
+        if _SHELL_IDENT_RE.fullmatch(tok) is not None:
+            var_names.append(tok)
+        else:
+            return None
+    return var_names if var_names else ["REPLY"]
+
+
+def _update_cond_stack(text: str, c_s: int, c_e: int, cond_stack: list[str]) -> None:
+    pos = _strip_non_opener_flow_prefixes_span(text, c_s, c_e)
+    if pos >= c_e:
+        return
+    if _match_shell_kw_boundary(text, pos, c_e, "fi", allow_group_after=False):
+        if cond_stack and cond_stack[-1] == "if":
+            cond_stack.pop()
+        return
+    if _match_shell_kw_boundary(text, pos, c_e, "esac", allow_group_after=False):
+        if cond_stack and cond_stack[-1] == "case":
+            cond_stack.pop()
+        return
+    if _match_shell_kw_boundary(text, pos, c_e, "done", allow_group_after=False):
+        if cond_stack and cond_stack[-1] == "loop":
+            cond_stack.pop()
+        return
+    if _match_shell_kw_boundary(text, pos, c_e, "if", allow_group_after=True):
+        cond_stack.append("if")
+    elif (
+        _match_shell_kw_boundary(text, pos, c_e, "while", allow_group_after=True)
+        or _match_shell_kw_boundary(text, pos, c_e, "until", allow_group_after=True)
+        or _match_shell_kw_boundary(text, pos, c_e, "for", allow_group_after=True)
+    ):
+        cond_stack.append("loop")
+    elif _strip_case_header_span(text, pos, c_e) is not None:
+        cond_stack.append("case")
+
+
+def _apply_var_bindings(
+    loop_vars: dict[str, list[str]],
+    kind: str,
+    bindings: list[tuple[str, list[str]]],
+    in_cond: bool,
+    _step_budget: list[int] | None = None,
+) -> dict[str, list[str]]:
+    next_vars = dict(loop_vars)
+    if kind == "unset":
+        if not in_cond:
+            for var_name, _ in bindings:
+                next_vars.pop(var_name, None)
+        return next_vars
+    for var_name, new_vals in bindings:
+        if _step_budget is not None:
+            _step_budget[0] += len(new_vals)
+            if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                raise _ShellComplexityBudgetExceeded()
+        if not in_cond:
+            next_vars[var_name] = list(dict.fromkeys(new_vals))[:32]
+        else:
+            merged = list(next_vars.get(var_name, ()))
+            for v in new_vals:
+                if v not in merged:
+                    merged.append(v)
+            if len(merged) > 32:
+                merged = [*merged[:31], _SHELL_AMBIGUOUS_VAR_SENTINEL]
+            next_vars[var_name] = merged
+    return next_vars
+
+
+def _check_unresolved_cmd_args(
+    cmd: str,
+    tokens: list[str],
+    flags: list[bool],
+    *,
+    has_upstream_crit: bool = False,
+    has_echo_samples: bool = False,
+    unquoted_flags: Sequence[bool] | None = None,
+) -> str | None:
+    if not tokens or not flags:
+        return None
+    if flags[0]:
+        return "safety_floor:shell_ambiguous_variable_expansion"
+    if cmd == "rm":
+        if len(tokens) > 1 and any(flags[1:]):
+            has_rec, has_frc, targets = _parse_rm_tokens(tokens[1:])
+            if (
+                has_rec
+                or has_frc
+                or has_upstream_crit
+                or has_echo_samples
+                or any(_is_critical_rm_target(t) for t in targets)
+            ):
+                return "safety_floor:shell_ambiguous_variable_expansion"
+            after_dd = False
+            unres_before_dd_count = 0
+            has_ambig_arg_before_dd = False
+            for idx_t, tok in enumerate(tokens[1:], start=1):
+                clean = tok.strip("\"'")
+                if not after_dd and clean == "--":
+                    after_dd = True
+                    continue
+                if not after_dd and idx_t < len(flags) and flags[idx_t]:
+                    unres_before_dd_count += 1
+                    is_unquoted = (
+                        unquoted_flags is not None
+                        and idx_t < len(unquoted_flags)
+                        and unquoted_flags[idx_t]
+                    )
+                    if (
+                        is_unquoted
+                        or _SHELL_PURE_VAR_REF_RE.fullmatch(clean) is not None
+                        or (clean.startswith("-") and "$" in clean)
+                    ):
+                        has_ambig_arg_before_dd = True
+            if has_ambig_arg_before_dd or unres_before_dd_count >= 2:
+                return "safety_floor:shell_ambiguous_variable_expansion"
+    elif cmd == "chmod":
+        if len(tokens) > 1 and any(flags[1:]):
+            has_rec = False
+            permissive = False
+            after_dd = False
+            seen_mode = False
+            for idx_t, tok in enumerate(tokens[1:], start=1):
+                clean = tok.strip("\"'")
+                low = clean.lower()
+                if not after_dd and clean == "--":
+                    after_dd = True
+                    continue
+                if not after_dd and clean.startswith("-"):
+                    if flags[idx_t]:
+                        return "safety_floor:shell_ambiguous_variable_expansion"
+                    if low == "--recursive" or (not clean.startswith("--") and "r" in low[1:]):
+                        has_rec = True
+                    continue
+                if not seen_mode and _is_permissive_chmod_mode(clean):
+                    permissive = True
+                    seen_mode = True
+                    continue
+                seen_mode = True
+            if has_rec or permissive or has_upstream_crit or flags[1]:
+                return "safety_floor:shell_ambiguous_variable_expansion"
+    elif cmd == "dd":
+        for idx_t in range(1, len(tokens)):
+            if flags[idx_t]:
+                tok_low = tokens[idx_t].lower()
+                if (
+                    tok_low.startswith("of=")
+                    or "=" not in tok_low
+                    or "$" in tok_low.split("=", 1)[0]
+                ):
+                    return "safety_floor:shell_ambiguous_variable_expansion"
+    elif cmd in {"wipefs", "fdisk", "parted", "mkfs"} or cmd.startswith("mkfs."):
+        if len(tokens) > 1 and any(flags[1:]):
+            return "safety_floor:shell_ambiguous_variable_expansion"
+    elif cmd == "git":
+        if len(tokens) > 1 and (
+            flags[1]
+            or (
+                any(t.lower() in {"push", "reset"} for t in tokens[1:])
+                and any(flags[1:])
+            )
+        ):
+            return "safety_floor:shell_ambiguous_variable_expansion"
+    elif cmd in {"sh", "bash", "dash", "zsh", "ksh"}:
+        script_idx, has_ambig_opt = _inspect_sh_options(tokens, flags)
+        if has_ambig_opt:
+            return "safety_floor:shell_ambiguous_variable_expansion"
+        if (
+            script_idx is not None
+            and script_idx < len(flags)
+            and flags[script_idx]
+            and _SHELL_PURE_VAR_REF_RE.fullmatch(tokens[script_idx].strip()) is not None
+        ):
+            return "safety_floor:shell_ambiguous_variable_expansion"
+    elif _is_python_cmd_name(cmd):
+        script_idx, _ = _find_python_c_script(tokens)
+        if script_idx is not None and script_idx < len(flags) and flags[script_idx]:
+            return "safety_floor:shell_ambiguous_variable_expansion"
+    return None
 
 
 _PRINTF_SPEC_RE = re.compile(r"%(%|[-+ #0]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[A-Za-z])")
@@ -7697,6 +8525,10 @@ _MAX_SHELL_WORKLIST_STEPS: int = 65_536
 _SHELL_COMPLEXITY_EXCEEDED: object = object()
 _SHELL_CHAIN_SEPS: tuple[str, ...] = (";;&", ";;", ";&", "\r\n", "\n", "&&", "||", ";", "&")
 _SHELL_PIPE_SEPS: tuple[str, ...] = ("|&", "|")
+_ORDERED_SEPS_BY_SEPS: dict[tuple[str, ...], tuple[str, ...]] = {
+    _SHELL_CHAIN_SEPS: tuple(sorted(_SHELL_CHAIN_SEPS, key=len, reverse=True)),
+    _SHELL_PIPE_SEPS: tuple(sorted(_SHELL_PIPE_SEPS, key=len, reverse=True)),
+}
 _SHELL_CASE_END_SEPS: frozenset[str] = frozenset({";;", ";&", ";;&"})
 
 _SHELL_FLOW_PREFIX_TOKENS: frozenset[str] = frozenset(
@@ -7712,7 +8544,7 @@ def _strip_leading_shell_keywords_span(text: str, start: int, end: int) -> int:
     cur = start
     while cur < end and text[cur].isspace():
         cur += 1
-    while cur < end:
+    while cur < end and text[cur] in "!deituw":
         m = _SHELL_FLOW_PREFIX_RE.match(text, cur, end)
         if m is None:
             break
@@ -7855,27 +8687,36 @@ def _strip_esac_prefix_span(text: str, start: int, end: int) -> int | None:
 
 
 def _unwrap_span_groups(
-    text: str, start: int, end: int, pairs: dict[int, int]
+    text: str,
+    start: int,
+    end: int,
+    pairs: dict[int, int],
+    *,
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
 ) -> tuple[int, int, bool]:
+    if unwrap_cache is not None:
+        cached = unwrap_cache.get((start, end))
+        if cached is not None:
+            return cached
     cur_s = start
     cur_e = end
     unwrapped_any = False
     while True:
-        cur_s = _strip_leading_shell_keywords_span(text, cur_s, cur_e)
-        while cur_e > cur_s and text[cur_e - 1].isspace():
+        cand_s = _strip_leading_shell_keywords_span(text, cur_s, cur_e)
+        while cur_e > cand_s and text[cur_e - 1].isspace():
             cur_e -= 1
-        if cur_e - cur_s < 2 or text[cur_s] not in {"(", "{"}:
+        if cur_e - cand_s < 2 or text[cand_s] not in {"(", "{"}:
             break
-        close_idx = pairs.get(cur_s)
+        close_idx = pairs.get(cand_s)
         if close_idx is None or close_idx >= cur_e:
             break
         if close_idx == cur_e - 1:
-            cur_s += 1
+            cur_s = cand_s + 1
             cur_e -= 1
             unwrapped_any = True
             continue
-        if _is_shell_redirection_tail(text[close_idx + 1 : cur_e]):
-            cur_s += 1
+        if _is_shell_redirection_tail_span(text, close_idx + 1, cur_e):
+            cur_s = cand_s + 1
             cur_e = close_idx
             unwrapped_any = True
             continue
@@ -7884,11 +8725,16 @@ def _unwrap_span_groups(
         cur_s += 1
     while cur_e > cur_s and text[cur_e - 1].isspace():
         cur_e -= 1
-    return cur_s, cur_e, unwrapped_any
+    res = (cur_s, cur_e, unwrapped_any)
+    if unwrap_cache is not None and len(unwrap_cache) < 32_768:
+        unwrap_cache[(start, end)] = res
+    return res
 
 
 _SPLIT_SCAN_GRP_RE = re.compile(r"""[\\'"#(){};\r\n&|]""")
 _SPLIT_SCAN_NOGRP_RE = re.compile(r"""[\\'"#;\r\n&|]""")
+_PIPE_FAST_DISALLOW_GRP_RE = re.compile(r"""[\\'"#(){}&>]|\|\|""")
+_PIPE_FAST_DISALLOW_NOGRP_RE = re.compile(r"""[\\'"#&>]|\|\|""")
 
 
 def _split_span_outside_quotes(
@@ -7900,32 +8746,33 @@ def _split_span_outside_quotes(
     closers: set[int],
     *,
     respect_groups: bool = True,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
 ) -> list[tuple[int, int, str | None]]:
-    if (
-        seps is _SHELL_PIPE_SEPS
-        and text.find("'", start, end) == -1
-        and text.find('"', start, end) == -1
-        and text.find("\\", start, end) == -1
-        and text.find("#", start, end) == -1
-        and text.find("&", start, end) == -1
-        and text.find(">", start, end) == -1
-        and text.find("||", start, end) == -1
-        and (
-            not respect_groups
-            or (text.find("(", start, end) == -1 and text.find("{", start, end) == -1)
-        )
-    ):
+    if split_cache is not None:
+        cache_key = (start, end, seps, respect_groups)
+        cached_parts = split_cache.get(cache_key)
+        if cached_parts is not None:
+            return cached_parts
+    disallow_re = _PIPE_FAST_DISALLOW_GRP_RE if respect_groups else _PIPE_FAST_DISALLOW_NOGRP_RE
+    if seps is _SHELL_PIPE_SEPS and disallow_re.search(text, start, end) is None:
         parts_fast: list[tuple[int, int, str | None]] = []
         p_s = start
         while True:
             pipe_idx = text.find("|", p_s, end)
             if pipe_idx == -1:
                 parts_fast.append((p_s, end, None))
+                if split_cache is not None and len(split_cache) < 32_768:
+                    split_cache[(start, end, seps, respect_groups)] = parts_fast
                 return parts_fast
             parts_fast.append((p_s, pipe_idx, "|"))
             p_s = pipe_idx + 1
 
-    ordered_seps = tuple(sorted(seps, key=len, reverse=True))
+    ordered_seps = _ORDERED_SEPS_BY_SEPS.get(seps)
+    if ordered_seps is None:
+        ordered_seps = tuple(sorted(seps, key=len, reverse=True))
     scan_re = _SPLIT_SCAN_GRP_RE if respect_groups else _SPLIT_SCAN_NOGRP_RE
     group_depth = 0
     parts: list[tuple[int, int, str | None]] = []
@@ -8051,6 +8898,8 @@ def _split_span_outside_quotes(
         prev_was_escaped = False
         i += 1
     parts.append((part_start, end, None))
+    if split_cache is not None and len(split_cache) < 32_768:
+        split_cache[(start, end, seps, respect_groups)] = parts
     return parts
 
 
@@ -8105,7 +8954,9 @@ def _extract_for_loop_binding(
     effective_pos_samples: list[str] | None,
     positional_sample: str | None,
     *,
+    loop_vars: Mapping[str, list[str]] | None = None,
     _step_budget: list[int] | None = None,
+    _char_budget: list[int] | None = None,
 ) -> tuple[str, list[str]] | None:
     i = start
     while i < end:
@@ -8137,8 +8988,36 @@ def _extract_for_loop_binding(
             words = _posix_shlex_split(words_raw)
         except ValueError:
             words = words_raw.split()
+        word_flags: list[bool] | None = None
+        if words_raw and "$" in words_raw:
+            ann_words = _tokenize_raw_with_expand_segments(words_raw, strip_flow_prefixes=False)
+            if ann_words:
+                exp_sets = _expand_annotated_tokens(
+                    ann_words,
+                    loop_vars or {},
+                    _step_budget=_step_budget,
+                    _char_budget=_char_budget,
+                    word_split_unquoted=True,
+                )
+                merged_words: list[str] = []
+                merged_flags: list[bool] = []
+                seen_pairs: set[tuple[str, bool]] = set()
+                for w_list, f_list in exp_sets:
+                    for w_item, w_flag in zip(w_list, f_list, strict=True):
+                        if (w_item, w_flag) not in seen_pairs:
+                            seen_pairs.add((w_item, w_flag))
+                            merged_words.append(w_item)
+                            merged_flags.append(w_flag)
+                        if len(merged_words) >= 64:
+                            break
+                    if len(merged_words) >= 64:
+                        break
+                if merged_words:
+                    words = merged_words
+                    word_flags = merged_flags
         expanded_words: list[str] = []
-        for word in words:
+        for idx_w, word in enumerate(words):
+            is_unres_w = word_flags is not None and idx_w < len(word_flags) and word_flags[idx_w]
             if word in {"$@", "${@}", "$*", "${*}"}:
                 if effective_pos_samples is not None:
                     if (
@@ -8154,19 +9033,19 @@ def _extract_for_loop_binding(
                         break
                     expanded_words.extend(effective_pos_samples)
                 else:
-                    expanded_words.append(word)
+                    expanded_words.append(_SHELL_AMBIGUOUS_VAR_SENTINEL if is_unres_w else word)
             elif word in {"$1", "${1}"}:
                 if effective_pos_samples:
                     expanded_words.append(effective_pos_samples[0])
                 else:
-                    expanded_words.append(word)
+                    expanded_words.append(_SHELL_AMBIGUOUS_VAR_SENTINEL if is_unres_w else word)
             elif word in {"$0", "${0}"}:
                 if positional_sample is not None:
                     expanded_words.append(positional_sample)
                 else:
-                    expanded_words.append(word)
+                    expanded_words.append(_SHELL_AMBIGUOUS_VAR_SENTINEL if is_unres_w else word)
             else:
-                expanded_words.append(word)
+                expanded_words.append(_SHELL_AMBIGUOUS_VAR_SENTINEL if is_unres_w else word)
         return var_name, expanded_words
     m_for_bare = re.match(r"^for\s+([A-Za-z_][A-Za-z0-9_]*)$", stripped_chain)
     if m_for_bare is not None:
@@ -8183,27 +9062,345 @@ def _strip_case_prefix_in_chain(
     pairs: dict[int, int],
     case_depth: int,
     expect_case_pattern: bool,
+    cond_stack: list[str] | None = None,
 ) -> tuple[int, int, bool]:
-    c_s = _strip_leading_shell_keywords_span(text, start, end)
+    c_s = start
+    while c_s < end and text[c_s].isspace():
+        c_s += 1
+    did_update = False
+    if cond_stack is not None and not (case_depth > 0 and expect_case_pattern):
+        _update_cond_stack(text, c_s, end, cond_stack)
+        did_update = True
+    c_s = _strip_leading_shell_keywords_span(text, c_s, end)
     while c_s < end:
         if case_depth > 0 and (esac_next := _strip_esac_prefix_span(text, c_s, end)) is not None:
             case_depth -= 1
             expect_case_pattern = False
-            c_s = _strip_leading_shell_keywords_span(text, esac_next, end)
+            if cond_stack is not None and cond_stack and cond_stack[-1] == "case":
+                cond_stack.pop()
+            c_s = esac_next
+            while c_s < end and text[c_s].isspace():
+                c_s += 1
+            if cond_stack is not None:
+                _update_cond_stack(text, c_s, end, cond_stack)
+            c_s = _strip_leading_shell_keywords_span(text, c_s, end)
             continue
         if expect_case_pattern:
             pat_next = _strip_case_pattern_span(text, c_s, end, pairs)
             if pat_next is not None:
                 expect_case_pattern = False
-                c_s = _strip_leading_shell_keywords_span(text, pat_next, end)
+                c_s = pat_next
+                while c_s < end and text[c_s].isspace():
+                    c_s += 1
+                if cond_stack is not None:
+                    _update_cond_stack(text, c_s, end, cond_stack)
+                c_s = _strip_leading_shell_keywords_span(text, c_s, end)
                 continue
+            if cond_stack is not None and not did_update:
+                _update_cond_stack(text, c_s, end, cond_stack)
+                did_update = True
         if (case_next := _strip_case_header_span(text, c_s, end)) is not None:
             case_depth += 1
             expect_case_pattern = True
+            if cond_stack is not None:
+                cond_stack.append("case")
             c_s = _strip_leading_shell_keywords_span(text, case_next, end)
             continue
         break
     return c_s, case_depth, expect_case_pattern
+
+
+_NON_OPENER_FLOW_PREFIX_RE = re.compile(
+    r"(?:!|elif|do|then|else)(?:\s+|(?=[({]))"
+    r"|time(?:\s+-p)*(?:\s+(?!-)|(?=[({]))"
+)
+
+
+def _strip_non_opener_flow_prefixes_span(text: str, start: int, end: int) -> int:
+    cur = start
+    while cur < end and text[cur].isspace():
+        cur += 1
+    while cur < end and text[cur] in "!det":
+        m = _NON_OPENER_FLOW_PREFIX_RE.match(text, cur, end)
+        if m is None:
+            break
+        cur = m.end()
+        while cur < end and text[cur].isspace():
+            cur += 1
+    return cur
+
+
+def _match_shell_kw_boundary(
+    text: str,
+    pos: int,
+    end: int,
+    kw: str,
+    *,
+    allow_group_after: bool,
+) -> bool:
+    if not text.startswith(kw, pos, end):
+        return False
+    after = pos + len(kw)
+    if after >= end:
+        return True
+    nxt = text[after]
+    if nxt.isspace() or nxt in ";|&<>":
+        return True
+    return bool(allow_group_after and nxt in "({")
+
+
+def _coalesce_piped_compound_chains(
+    text: str,
+    u_start: int,
+    u_end: int,
+    chains: list[tuple[int, int, str | None]],
+    pairs: dict[int, int],
+    closers: set[int],
+    *,
+    respect_groups: bool,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
+) -> (
+    list[tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]]
+    | None
+):
+    if len(chains) < 2 or text.find("|", u_start, u_end) == -1:
+        return None
+    if (
+        text.find("done", u_start, u_end) == -1
+        and text.find("fi", u_start, u_end) == -1
+        and text.find("esac", u_start, u_end) == -1
+    ):
+        return None
+
+    out: list[tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]] = []
+    # (kind, comp_s, open_out_idx, prefix_stages, pipeline_start, opened_after_pipe)
+    compound_stack: list[
+        tuple[str, int, int, tuple[tuple[bool, int, int], ...], int, bool]
+    ] = []
+    case_depth = 0
+    expect_case_pattern = False
+    coalesced_any = False
+
+    def _push_openers_in_span(
+        scan_pos: int,
+        scan_end: int,
+        full_chain_end: int,
+        open_out_idx: int,
+        prefix_stages: tuple[tuple[bool, int, int], ...],
+        pipeline_start: int,
+        opened_after_pipe: bool,
+    ) -> bool:
+        nonlocal case_depth, expect_case_pattern
+        pushed = False
+        cur_pos = scan_pos
+        cur_prefix = prefix_stages
+        cur_after_pipe = opened_after_pipe
+        cur_out_idx = open_out_idx
+        cur_pipe_start = pipeline_start
+        while cur_pos < scan_end:
+            if _match_shell_kw_boundary(text, cur_pos, scan_end, "for", allow_group_after=True):
+                compound_stack.append(
+                    ("loop", cur_pos, cur_out_idx, cur_prefix, cur_pipe_start, cur_after_pipe)
+                )
+                return True
+            if _match_shell_kw_boundary(text, cur_pos, scan_end, "while", allow_group_after=True):
+                compound_stack.append(
+                    ("loop", cur_pos, cur_out_idx, cur_prefix, cur_pipe_start, cur_after_pipe)
+                )
+                pushed = True
+                cur_prefix = ()
+                cur_after_pipe = False
+                cur_out_idx = len(out)
+                cur_pipe_start = cur_pos
+                cur_pos = _strip_non_opener_flow_prefixes_span(text, cur_pos + 5, scan_end)
+                continue
+            if _match_shell_kw_boundary(text, cur_pos, scan_end, "until", allow_group_after=True):
+                compound_stack.append(
+                    ("loop", cur_pos, cur_out_idx, cur_prefix, cur_pipe_start, cur_after_pipe)
+                )
+                pushed = True
+                cur_prefix = ()
+                cur_after_pipe = False
+                cur_out_idx = len(out)
+                cur_pipe_start = cur_pos
+                cur_pos = _strip_non_opener_flow_prefixes_span(text, cur_pos + 5, scan_end)
+                continue
+            if _match_shell_kw_boundary(text, cur_pos, scan_end, "if", allow_group_after=True):
+                compound_stack.append(
+                    ("if", cur_pos, cur_out_idx, cur_prefix, cur_pipe_start, cur_after_pipe)
+                )
+                pushed = True
+                cur_prefix = ()
+                cur_after_pipe = False
+                cur_out_idx = len(out)
+                cur_pipe_start = cur_pos
+                cur_pos = _strip_non_opener_flow_prefixes_span(text, cur_pos + 2, scan_end)
+                continue
+            case_next = _strip_case_header_span(text, cur_pos, full_chain_end)
+            if case_next is not None:
+                compound_stack.append(
+                    ("case", cur_pos, cur_out_idx, cur_prefix, cur_pipe_start, cur_after_pipe)
+                )
+                pushed = True
+                case_depth += 1
+                expect_case_pattern = True
+                cur_prefix = ()
+                cur_after_pipe = False
+                cur_out_idx = len(out)
+                cur_pipe_start = cur_pos
+                pat_next = _strip_case_pattern_span(text, case_next, full_chain_end, pairs)
+                if pat_next is not None:
+                    expect_case_pattern = False
+                    cur_pos = _strip_non_opener_flow_prefixes_span(
+                        text, pat_next, full_chain_end
+                    )
+                    scan_end = full_chain_end
+                    continue
+                return True
+            break
+        return pushed
+
+    for c_start, c_end, trailing_sep in chains:
+        c_e = c_end
+        while c_e > c_start and text[c_e - 1].isspace():
+            c_e -= 1
+        pos = c_start
+        while pos < c_e and text[pos].isspace():
+            pos += 1
+        if case_depth > 0 and expect_case_pattern and pos < c_e:
+            pat_next = _strip_case_pattern_span(text, pos, c_e, pairs)
+            if pat_next is not None:
+                expect_case_pattern = False
+                pos = pat_next
+                while pos < c_e and text[pos].isspace():
+                    pos += 1
+
+        pos = _strip_non_opener_flow_prefixes_span(text, pos, c_e)
+
+        matched_closer: tuple[str, int] | None = None
+        if pos < c_e:
+            if _match_shell_kw_boundary(text, pos, c_e, "done", allow_group_after=False):
+                matched_closer = ("loop", 4)
+            elif _match_shell_kw_boundary(text, pos, c_e, "fi", allow_group_after=False):
+                matched_closer = ("if", 2)
+            elif _match_shell_kw_boundary(text, pos, c_e, "esac", allow_group_after=False):
+                matched_closer = ("case", 4)
+
+        if matched_closer is not None:
+            close_kind, kw_len = matched_closer
+            if compound_stack and compound_stack[-1][0] == close_kind:
+                (
+                    _,
+                    comp_s,
+                    open_out_idx,
+                    prefix_stages,
+                    pipeline_start,
+                    opened_after_pipe,
+                ) = compound_stack.pop()
+                if close_kind == "case":
+                    case_depth = max(0, case_depth - 1)
+                    expect_case_pattern = False
+                if text.find("|", pos + kw_len, c_e) != -1:
+                    pipe_stages = _split_span_outside_quotes(
+                        text,
+                        pos,
+                        c_e,
+                        _SHELL_PIPE_SEPS,
+                        pairs,
+                        closers,
+                        respect_groups=respect_groups,
+                        split_cache=split_cache,
+                    )
+                    if len(pipe_stages) >= 2:
+                        _p0_s, p0_e, _p0_sep = pipe_stages[0]
+                        if _is_shell_redirection_tail_span(text, pos + kw_len, p0_e):
+                            cur_stages: list[tuple[bool, int, int]] = list(prefix_stages)
+                            cur_stages.append((True, comp_s, p0_e))
+                            opened_next = False
+                            for st_s, st_e, _ in pipe_stages[1:]:
+                                st_pos = _strip_non_opener_flow_prefixes_span(text, st_s, st_e)
+                                if _push_openers_in_span(
+                                    st_pos,
+                                    st_e,
+                                    c_e,
+                                    open_out_idx,
+                                    tuple(cur_stages),
+                                    pipeline_start,
+                                    True,
+                                ):
+                                    opened_next = True
+                                    break
+                                cur_stages.append((False, st_s, st_e))
+                            if opened_next:
+                                out.append((c_start, c_end, trailing_sep, None))
+                                if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                                    expect_case_pattern = True
+                                continue
+                            del out[open_out_idx:]
+                            out.append(
+                                (
+                                    pipeline_start,
+                                    c_end,
+                                    trailing_sep,
+                                    tuple(cur_stages),
+                                )
+                            )
+                            coalesced_any = True
+                            if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                                expect_case_pattern = True
+                            continue
+                elif opened_after_pipe and _is_shell_redirection_tail_span(text, pos + kw_len, c_e):
+                    final_stages = (*prefix_stages, (True, comp_s, c_e))
+                    del out[open_out_idx:]
+                    out.append((pipeline_start, c_end, trailing_sep, final_stages))
+                    coalesced_any = True
+                    if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                        expect_case_pattern = True
+                    continue
+            out.append((c_start, c_end, trailing_sep, None))
+            if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                expect_case_pattern = True
+            continue
+
+        pushed_direct = _push_openers_in_span(pos, c_e, c_e, len(out), (), c_start, False)
+        if not pushed_direct and pos < c_e and text.find("|", pos, c_e) != -1:
+            pipe_stages = _split_span_outside_quotes(
+                text,
+                pos,
+                c_e,
+                _SHELL_PIPE_SEPS,
+                pairs,
+                closers,
+                respect_groups=respect_groups,
+                split_cache=split_cache,
+            )
+            if len(pipe_stages) >= 2:
+                cur_prefix: list[tuple[bool, int, int]] = []
+                for idx_st, (st_s, st_e, _) in enumerate(pipe_stages):
+                    if idx_st > 0:
+                        st_pos = _strip_non_opener_flow_prefixes_span(text, st_s, st_e)
+                        if _push_openers_in_span(
+                            st_pos,
+                            st_e,
+                            c_e,
+                            len(out),
+                            tuple(cur_prefix),
+                            c_start,
+                            True,
+                        ):
+                            break
+                    cur_prefix.append((False, st_s, st_e))
+
+        out.append((c_start, c_end, trailing_sep, None))
+        if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+            expect_case_pattern = True
+
+    if any(frame[5] for frame in compound_stack):
+        raise _AmbiguousPipedCompoundShell()
+    return out if coalesced_any else None
 
 
 def _loop_vars_cache_key(
@@ -8245,6 +9442,38 @@ _STDIN_PASSTHROUGH_CMDS: frozenset[str] = frozenset(
 )
 
 
+def _span_has_nonspace(text: str, start: int, end: int) -> bool:
+    return any(not text[idx].isspace() for idx in range(start, end))
+
+
+def _expand_upstream_stage_tokens(
+    raw_stage_str: str,
+    base_tokens: list[str],
+    loop_vars: Mapping[str, list[str]] | None,
+    *,
+    _step_budget: list[int] | None = None,
+    _char_budget: list[int] | None = None,
+) -> list[tuple[list[str], list[bool]]]:
+    if loop_vars and "$" in raw_stage_str:
+        ann_toks = _tokenize_raw_with_expand_segments(raw_stage_str, strip_flow_prefixes=True)
+        exp_pairs = _expand_annotated_tokens(
+            ann_toks,
+            loop_vars,
+            _step_budget=_step_budget,
+            _char_budget=_char_budget,
+            word_split_unquoted=True,
+        )
+        out: list[tuple[list[str], list[bool]]] = []
+        for toks, flags in exp_pairs:
+            if not toks:
+                continue
+            toks, flags = _unwrap_command_tokens_with_flags(toks, flags)
+            if toks:
+                out.append((toks, flags))
+        return out
+    return [(base_tokens, [False] * len(base_tokens))]
+
+
 def _group_is_stdin_passthrough(
     text: str,
     root_start: int,
@@ -8254,8 +9483,30 @@ def _group_is_stdin_passthrough(
     parsed_tok_cache: dict[str, list[str]],
     *,
     _step_budget: list[int],
+    loop_vars: Mapping[str, list[str]] | None = None,
+    group_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    group_may_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
 ) -> bool | object:
-    work: list[tuple[int, int]] = [(root_start, root_end)]
+    root_u_s, root_u_e, _ = _unwrap_span_groups(
+        text, root_start, root_end, pairs, unwrap_cache=unwrap_cache
+    )
+    if root_u_s >= root_u_e:
+        return False
+    root_key = _loop_vars_cache_key(root_u_s, root_u_e, loop_vars or {})
+    if group_passthrough_cache is not None and root_key in group_passthrough_cache:
+        return group_passthrough_cache[root_key]
+    work: list[tuple[int, int]] = [(root_u_s, root_u_e)]
     visited = 0
     while work:
         visited += 1
@@ -8265,34 +9516,222 @@ def _group_is_stdin_passthrough(
         if visited > 64:
             return False
         cur_s, cur_e = work.pop()
-        u_s, u_e, _ = _unwrap_span_groups(text, cur_s, cur_e, pairs)
+        u_s, u_e, _ = _unwrap_span_groups(
+            text, cur_s, cur_e, pairs, unwrap_cache=unwrap_cache
+        )
         if u_s >= u_e:
+            if group_passthrough_cache is not None and len(group_passthrough_cache) < 32_768:
+                group_passthrough_cache[root_key] = False
             return False
         chains = _split_span_outside_quotes(
-            text, u_s, u_e, _SHELL_CHAIN_SEPS, pairs, closers, respect_groups=True
+            text,
+            u_s,
+            u_e,
+            _SHELL_CHAIN_SEPS,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
         )
-        non_empty = [(cs, ce) for cs, ce, _ in chains if text[cs:ce].strip()]
+        non_empty = [(cs, ce) for cs, ce, _ in chains if _span_has_nonspace(text, cs, ce)]
         if len(non_empty) != 1:
+            if group_passthrough_cache is not None and len(group_passthrough_cache) < 32_768:
+                group_passthrough_cache[root_key] = False
             return False
         c_s, c_e = non_empty[0]
-        g_s, g_e, unwrapped_chain = _unwrap_span_groups(text, c_s, c_e, pairs)
+        g_s, g_e, unwrapped_chain = _unwrap_span_groups(
+            text, c_s, c_e, pairs, unwrap_cache=unwrap_cache
+        )
         if unwrapped_chain:
             work.append((g_s, g_e))
             continue
         pipe_stages = _split_span_outside_quotes(
-            text, c_s, c_e, _SHELL_PIPE_SEPS, pairs, closers, respect_groups=True
+            text,
+            c_s,
+            c_e,
+            _SHELL_PIPE_SEPS,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
         )
         if not pipe_stages:
+            if group_passthrough_cache is not None and len(group_passthrough_cache) < 32_768:
+                group_passthrough_cache[root_key] = False
             return False
         for p_s, p_e, _ in pipe_stages:
-            sg_s, sg_e, is_grp = _unwrap_span_groups(text, p_s, p_e, pairs)
+            sg_s, sg_e, is_grp = _unwrap_span_groups(
+                text, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+            )
             if is_grp:
                 work.append((sg_s, sg_e))
             else:
                 toks = _parse_stage_cached(text[p_s:p_e], parsed_tok_cache)
-                if not toks or _shell_cmd_name(toks[0]) not in _STDIN_PASSTHROUGH_CMDS:
+                if not toks:
+                    if (
+                        group_passthrough_cache is not None
+                        and len(group_passthrough_cache) < 32_768
+                    ):
+                        group_passthrough_cache[root_key] = False
                     return False
+                if loop_vars and "$" in text[p_s:p_e]:
+                    exp_pairs = _expand_upstream_stage_tokens(
+                        text[p_s:p_e],
+                        toks,
+                        loop_vars,
+                        _step_budget=_step_budget,
+                    )
+                    ok_pt = bool(exp_pairs) and all(
+                        bool(et)
+                        and not fl[0]
+                        and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+                        for et, fl in exp_pairs
+                    )
+                else:
+                    ok_pt = _shell_cmd_name(toks[0]) in _STDIN_PASSTHROUGH_CMDS
+                if not ok_pt:
+                    if (
+                        group_passthrough_cache is not None
+                        and len(group_passthrough_cache) < 32_768
+                    ):
+                        group_passthrough_cache[root_key] = False
+                    return False
+    if group_passthrough_cache is not None and len(group_passthrough_cache) < 32_768:
+        group_passthrough_cache[root_key] = True
     return True
+
+
+_MAY_PASSTHROUGH_WORDS: tuple[str, ...] = (*_STDIN_PASSTHROUGH_CMDS, "read", "$")
+
+
+def _group_may_passthrough_stdin(
+    text: str,
+    root_start: int,
+    root_end: int,
+    pairs: dict[int, int],
+    closers: set[int],
+    parsed_tok_cache: dict[str, list[str]],
+    *,
+    _step_budget: list[int],
+    loop_vars: Mapping[str, list[str]] | None = None,
+    group_may_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
+) -> bool:
+    root_u_s, root_u_e, _ = _unwrap_span_groups(
+        text, root_start, root_end, pairs, unwrap_cache=unwrap_cache
+    )
+    if root_u_s >= root_u_e:
+        return False
+    root_key = _loop_vars_cache_key(root_u_s, root_u_e, loop_vars or {})
+    if group_may_passthrough_cache is not None and root_key in group_may_passthrough_cache:
+        return group_may_passthrough_cache[root_key]
+    slice_low = text[root_u_s:root_u_e].lower()
+    if not any(w in slice_low for w in _MAY_PASSTHROUGH_WORDS):
+        if (
+            group_may_passthrough_cache is not None
+            and len(group_may_passthrough_cache) < 32_768
+        ):
+            group_may_passthrough_cache[root_key] = False
+        return False
+    work: list[tuple[int, int]] = [(root_u_s, root_u_e)]
+    visited = 0
+    while work:
+        visited += 1
+        _step_budget[0] += 1
+        if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+            raise _ShellComplexityBudgetExceeded()
+        if visited > 64:
+            if (
+                group_may_passthrough_cache is not None
+                and len(group_may_passthrough_cache) < 32_768
+            ):
+                group_may_passthrough_cache[root_key] = True
+            return True
+        cur_s, cur_e = work.pop()
+        u_s, u_e, _ = _unwrap_span_groups(
+            text, cur_s, cur_e, pairs, unwrap_cache=unwrap_cache
+        )
+        if u_s >= u_e:
+            continue
+        chains = _split_span_outside_quotes(
+            text,
+            u_s,
+            u_e,
+            _SHELL_CHAIN_SEPS,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
+        )
+        for cs, ce, _ in chains:
+            if not _span_has_nonspace(text, cs, ce):
+                continue
+            c_s = _strip_leading_shell_keywords_span(text, cs, ce)
+            g_s, g_e, unwrapped_chain = _unwrap_span_groups(
+                text, c_s, ce, pairs, unwrap_cache=unwrap_cache
+            )
+            if unwrapped_chain:
+                work.append((g_s, g_e))
+                continue
+            pipe_stages = _split_span_outside_quotes(
+                text,
+                c_s,
+                ce,
+                _SHELL_PIPE_SEPS,
+                pairs,
+                closers,
+                respect_groups=True,
+                split_cache=split_cache,
+            )
+            for p_s, p_e, _ in pipe_stages:
+                sg_s, sg_e, is_grp = _unwrap_span_groups(
+                    text, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                )
+                if is_grp:
+                    work.append((sg_s, sg_e))
+                else:
+                    toks = _parse_stage_cached(text[p_s:p_e], parsed_tok_cache)
+                    if not toks:
+                        continue
+                    cmd = _shell_cmd_name(toks[0])
+                    if cmd in _STDIN_PASSTHROUGH_CMDS or cmd == "read":
+                        if (
+                            group_may_passthrough_cache is not None
+                            and len(group_may_passthrough_cache) < 32_768
+                        ):
+                            group_may_passthrough_cache[root_key] = True
+                        return True
+                    if loop_vars and "$" in text[p_s:p_e]:
+                        for exp_t, exp_f in _expand_upstream_stage_tokens(
+                            text[p_s:p_e],
+                            toks,
+                            loop_vars,
+                            _step_budget=_step_budget,
+                        ):
+                            if exp_t and (
+                                exp_f[0]
+                                or _shell_cmd_name(exp_t[0]) in _STDIN_PASSTHROUGH_CMDS
+                                or _shell_cmd_name(exp_t[0]) == "read"
+                            ):
+                                if (
+                                    group_may_passthrough_cache is not None
+                                    and len(group_may_passthrough_cache) < 32_768
+                                ):
+                                    group_may_passthrough_cache[root_key] = True
+                                return True
+    if (
+        group_may_passthrough_cache is not None
+        and len(group_may_passthrough_cache) < 32_768
+    ):
+        group_may_passthrough_cache[root_key] = False
+    return False
 
 
 def _find_group_upstream_critical_path(
@@ -8312,6 +9751,11 @@ def _find_group_upstream_critical_path(
     has_for_keyword: bool = True,
     _step_budget: list[int] | None = None,
     _char_budget: list[int] | None = None,
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
 ) -> str | None | object:
     if _step_budget is None:
         _step_budget = [0]
@@ -8331,7 +9775,9 @@ def _find_group_upstream_critical_path(
             if finish_key is not None and finish_key not in group_crit_cache:
                 group_crit_cache[finish_key] = None
             continue
-        u_s, u_e, _ = _unwrap_span_groups(text, s_pos, e_pos, pairs)
+        u_s, u_e, _ = _unwrap_span_groups(
+            text, s_pos, e_pos, pairs, unwrap_cache=unwrap_cache
+        )
         if u_s >= u_e:
             continue
         ckey = _loop_vars_cache_key(u_s, u_e, cur_lvars)
@@ -8345,19 +9791,89 @@ def _find_group_upstream_critical_path(
         block_lvars = dict(cur_lvars)
         case_depth = 0
         expect_case_pattern = False
+        cond_stack: list[str] = []
         has_inner_groups = bool(pairs) and (
             text.find("(", u_s, u_e) != -1 or text.find("{", u_s, u_e) != -1
         )
         chains = _split_span_outside_quotes(
-            text, u_s, u_e, _SHELL_CHAIN_SEPS, pairs, closers, respect_groups=True
+            text,
+            u_s,
+            u_e,
+            _SHELL_CHAIN_SEPS,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
         )
-        for c_start, c_end, trailing_sep in chains:
+        coalesced_chains = _coalesce_piped_compound_chains(
+            text,
+            u_s,
+            u_e,
+            chains,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
+        )
+        chain_items: list[
+            tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]
+        ] = (
+            coalesced_chains
+            if coalesced_chains is not None
+            else [(cs, ce, sep, None) for cs, ce, sep in chains]
+        )
+        for c_start, c_end, trailing_sep, pipeline_override in chain_items:
             _step_budget[0] += 1
             if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                 return _SHELL_COMPLEXITY_EXCEEDED
             c_e = c_end
+            if pipeline_override is not None:
+                c_s = c_start
+                while c_s < c_e and text[c_s].isspace():
+                    c_s += 1
+                while c_e > c_s and text[c_e - 1].isspace():
+                    c_e -= 1
+                if c_s < c_e:
+                    for is_comp, p_s, p_e in pipeline_override:
+                        _step_budget[0] += 1
+                        if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                            return _SHELL_COMPLEXITY_EXCEEDED
+                        if is_comp:
+                            child_groups.append((p_s, p_e, block_lvars))
+                            continue
+                        if has_inner_groups:
+                            sg_s, sg_e, is_grp = _unwrap_span_groups(
+                                text, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                            )
+                        else:
+                            sg_s, sg_e, is_grp = p_s, p_e, False
+                        if is_grp:
+                            child_groups.append((sg_s, sg_e, block_lvars))
+                        else:
+                            toks = _parse_stage_cached(text[p_s:p_e], parsed_tok_cache)
+                            if toks:
+                                expanded_pairs = _expand_upstream_stage_tokens(
+                                    text[p_s:p_e],
+                                    toks,
+                                    block_lvars,
+                                    _step_budget=_step_budget,
+                                    _char_budget=_char_budget,
+                                )
+                                for expanded_up, _ in expanded_pairs:
+                                    _step_budget[0] += 1
+                                    if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                                        return _SHELL_COMPLEXITY_EXCEEDED
+                                    crit_p = _upstream_stage_critical_path(
+                                        expanded_up, _char_budget=_char_budget
+                                    )
+                                    if crit_p is not None:
+                                        group_crit_cache[ckey] = crit_p
+                                        return crit_p
+                if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                    expect_case_pattern = True
+                continue
             c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
-                text, c_start, c_e, pairs, case_depth, expect_case_pattern
+                text, c_start, c_e, pairs, case_depth, expect_case_pattern, cond_stack
             )
             while c_e > c_s and text[c_e - 1].isspace():
                 c_e -= 1
@@ -8370,7 +9886,9 @@ def _find_group_upstream_critical_path(
                         pairs,
                         effective_pos_samples,
                         positional_sample,
+                        loop_vars=block_lvars,
                         _step_budget=_step_budget,
+                        _char_budget=_char_budget,
                     )
                     if has_for_keyword
                     else None
@@ -8384,22 +9902,52 @@ def _find_group_upstream_critical_path(
                         block_lvars = dict(block_lvars)
                         block_lvars[var_name] = expanded_words
                 else:
+                    var_binding = _parse_var_assignment_chain(
+                        text,
+                        c_s,
+                        c_e,
+                        block_lvars,
+                        _step_budget=_step_budget,
+                        _char_budget=_char_budget,
+                    )
+                    if var_binding is not None:
+                        block_lvars = _apply_var_bindings(
+                            block_lvars,
+                            var_binding[0],
+                            var_binding[1],
+                            bool(cond_stack),
+                            _step_budget=_step_budget,
+                        )
+                        if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                            expect_case_pattern = True
+                        continue
                     if has_inner_groups:
-                        g_s, g_e, unwrapped_chain = _unwrap_span_groups(text, c_s, c_e, pairs)
+                        g_s, g_e, unwrapped_chain = _unwrap_span_groups(
+                            text, c_s, c_e, pairs, unwrap_cache=unwrap_cache
+                        )
                     else:
                         g_s, g_e, unwrapped_chain = c_s, c_e, False
                     if unwrapped_chain:
                         child_groups.append((g_s, g_e, block_lvars))
                     else:
                         pipe_stages = _split_span_outside_quotes(
-                            text, c_s, c_e, _SHELL_PIPE_SEPS, pairs, closers, respect_groups=True
+                            text,
+                            c_s,
+                            c_e,
+                            _SHELL_PIPE_SEPS,
+                            pairs,
+                            closers,
+                            respect_groups=True,
+                            split_cache=split_cache,
                         )
                         for p_s, p_e, _ in pipe_stages:
                             _step_budget[0] += 1
                             if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                 return _SHELL_COMPLEXITY_EXCEEDED
                             if has_inner_groups:
-                                sg_s, sg_e, is_grp = _unwrap_span_groups(text, p_s, p_e, pairs)
+                                sg_s, sg_e, is_grp = _unwrap_span_groups(
+                                    text, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                                )
                             else:
                                 sg_s, sg_e, is_grp = p_s, p_e, False
                             if is_grp:
@@ -8407,17 +9955,14 @@ def _find_group_upstream_critical_path(
                             else:
                                 toks = _parse_stage_cached(text[p_s:p_e], parsed_tok_cache)
                                 if toks:
-                                    expanded_list = (
-                                        _expand_loop_var_tokens(
-                                            toks,
-                                            block_lvars,
-                                            _step_budget=_step_budget,
-                                            _char_budget=_char_budget,
-                                        )
-                                        if block_lvars
-                                        else (toks,)
+                                    expanded_pairs = _expand_upstream_stage_tokens(
+                                        text[p_s:p_e],
+                                        toks,
+                                        block_lvars,
+                                        _step_budget=_step_budget,
+                                        _char_budget=_char_budget,
                                     )
-                                    for expanded_up in expanded_list:
+                                    for expanded_up, _ in expanded_pairs:
                                         _step_budget[0] += 1
                                         if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                             return _SHELL_COMPLEXITY_EXCEEDED
@@ -8496,19 +10041,44 @@ def _extract_xargs_echo_samples(
     *,
     _step_budget: list[int],
     _char_budget: list[int],
-) -> tuple[list[tuple[str | None, list[str]]], bool]:
+    raw_stage_str: str | None = None,
+) -> tuple[list[tuple[str | None, list[str]]], bool, bool]:
     if not prev_tokens:
-        return [], False
-    expanded_prevs: Sequence[list[str]] = (
-        _expand_loop_var_tokens(
-            prev_tokens,
+        return [], False, False
+    has_unresolved_var = False
+    expanded_prevs: list[list[str]]
+    if raw_stage_str is not None and "$" in raw_stage_str:
+        ann_toks = _tokenize_raw_with_expand_segments(raw_stage_str, strip_flow_prefixes=True)
+        exp_pairs = _expand_annotated_tokens(
+            ann_toks,
             loop_vars,
             _step_budget=_step_budget,
             _char_budget=_char_budget,
+            word_split_unquoted=True,
         )
-        if loop_vars
-        else (prev_tokens,)
-    )
+        expanded_prevs = []
+        for toks, flags in exp_pairs:
+            if not toks:
+                continue
+            if loop_vars:
+                toks, flags = _unwrap_command_tokens_with_flags(toks, flags)
+            if not toks:
+                continue
+            up_cmd_c = _shell_cmd_name(toks[0])
+            if flags[0] or (up_cmd_c in {"echo", "printf"} and any(flags[1:])):
+                has_unresolved_var = True
+            expanded_prevs.append(toks)
+    else:
+        expanded_prevs = (
+            _expand_loop_var_tokens(
+                prev_tokens,
+                loop_vars,
+                _step_budget=_step_budget,
+                _char_budget=_char_budget,
+            )
+            if loop_vars
+            else [prev_tokens]
+        )
     samples: list[tuple[str | None, list[str]]] = []
     seen_lines: set[str] = set()
     batch_count = 0
@@ -8557,7 +10127,7 @@ def _extract_xargs_echo_samples(
                 batch_count += 1
             else:
                 has_unsupported = True
-    return samples, has_unsupported
+    return samples, has_unsupported, has_unresolved_var
 
 
 def _find_group_upstream_echo_samples(
@@ -8574,15 +10144,48 @@ def _find_group_upstream_echo_samples(
     has_for_keyword: bool,
     _step_budget: list[int],
     _char_budget: list[int],
-) -> tuple[list[tuple[str | None, list[str]]], bool]:
+    group_echo_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]],
+        tuple[list[tuple[str | None, list[str]]], bool, bool],
+    ]
+    | None = None,
+    group_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    group_may_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
+    stdin_line_samples: tuple[str, ...] = (),
+) -> tuple[list[tuple[str | None, list[str]]], bool, bool]:
+    root_u_s, root_u_e, _ = _unwrap_span_groups(
+        text, root_start, root_end, pairs, unwrap_cache=unwrap_cache
+    )
+    if root_u_s >= root_u_e:
+        return [], False, False
+    root_key = _loop_vars_cache_key(root_u_s, root_u_e, loop_vars)
+    if (
+        not stdin_line_samples
+        and group_echo_cache is not None
+        and root_key in group_echo_cache
+    ):
+        cached_samples, cached_unsup, cached_unres = group_echo_cache[root_key]
+        return list(cached_samples), cached_unsup, cached_unres
     work: list[tuple[int, int, dict[str, list[str]]]] = [
-        (root_start, root_end, dict(loop_vars))
+        (root_u_s, root_u_e, dict(loop_vars))
     ]
     visited = 0
     samples: list[tuple[str | None, list[str]]] = []
     seen_lines: set[str] = set()
     batch_count = 0
     has_unsupported = False
+    has_unresolved_var = False
     while work:
         if len(seen_lines) >= 64:
             has_unsupported = True
@@ -8595,25 +10198,162 @@ def _find_group_upstream_echo_samples(
             has_unsupported = True
             break
         s_pos, e_pos, cur_lvars = work.pop()
-        u_s, u_e, _ = _unwrap_span_groups(text, s_pos, e_pos, pairs)
+        u_s, u_e, _ = _unwrap_span_groups(
+            text, s_pos, e_pos, pairs, unwrap_cache=unwrap_cache
+        )
         if u_s >= u_e:
             continue
         block_lvars = dict(cur_lvars)
         case_depth = 0
         expect_case_pattern = False
+        cond_stack: list[str] = []
         has_inner_groups = bool(pairs) and (
             text.find("(", u_s, u_e) != -1 or text.find("{", u_s, u_e) != -1
         )
         chains = _split_span_outside_quotes(
-            text, u_s, u_e, _SHELL_CHAIN_SEPS, pairs, closers, respect_groups=True
+            text,
+            u_s,
+            u_e,
+            _SHELL_CHAIN_SEPS,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
         )
-        for c_start, c_end, trailing_sep in chains:
+        coalesced_chains = _coalesce_piped_compound_chains(
+            text,
+            u_s,
+            u_e,
+            chains,
+            pairs,
+            closers,
+            respect_groups=True,
+            split_cache=split_cache,
+        )
+        chain_items: list[
+            tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]
+        ] = (
+            coalesced_chains
+            if coalesced_chains is not None
+            else [(cs, ce, sep, None) for cs, ce, sep in chains]
+        )
+        for c_start, c_end, trailing_sep, pipeline_override in chain_items:
             _step_budget[0] += 1
             if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                 raise _ShellComplexityBudgetExceeded()
             c_e = c_end
+            if pipeline_override is not None:
+                c_s = c_start
+                while c_s < c_e and text[c_s].isspace():
+                    c_s += 1
+                while c_e > c_s and text[c_e - 1].isspace():
+                    c_e -= 1
+                if c_s < c_e:
+                    n_ov = len(pipeline_override)
+                    for rev_idx, (is_comp, p_s, p_e) in enumerate(reversed(pipeline_override)):
+                        _step_budget[0] += 1
+                        if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                            raise _ShellComplexityBudgetExceeded()
+                        if is_comp:
+                            sg_s, sg_e, is_grp = p_s, p_e, True
+                        elif has_inner_groups:
+                            sg_s, sg_e, is_grp = _unwrap_span_groups(
+                                text, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                            )
+                        else:
+                            sg_s, sg_e, is_grp = p_s, p_e, False
+                        if is_grp:
+                            is_pt = _group_is_stdin_passthrough(
+                                text,
+                                sg_s,
+                                sg_e,
+                                pairs,
+                                closers,
+                                parsed_tok_cache,
+                                _step_budget=_step_budget,
+                                loop_vars=block_lvars,
+                                group_passthrough_cache=group_passthrough_cache,
+                                unwrap_cache=unwrap_cache,
+                                split_cache=split_cache,
+                            )
+                            if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
+                                raise _ShellComplexityBudgetExceeded()
+                            if is_pt:
+                                continue
+                            work.append((sg_s, sg_e, block_lvars))
+                            if rev_idx + 1 < n_ov and _group_may_passthrough_stdin(
+                                text,
+                                sg_s,
+                                sg_e,
+                                pairs,
+                                closers,
+                                parsed_tok_cache,
+                                _step_budget=_step_budget,
+                                loop_vars=block_lvars,
+                                group_may_passthrough_cache=group_may_passthrough_cache,
+                                unwrap_cache=unwrap_cache,
+                                split_cache=split_cache,
+                            ):
+                                continue
+                            break
+                        toks = _parse_stage_cached(text[p_s:p_e], parsed_tok_cache)
+                        if not toks:
+                            break
+                        exp_pairs = _expand_upstream_stage_tokens(
+                            text[p_s:p_e],
+                            toks,
+                            block_lvars,
+                            _step_budget=_step_budget,
+                            _char_budget=_char_budget,
+                        )
+                        if any(fl[0] for _, fl in exp_pairs):
+                            has_unresolved_var = True
+                        if any(
+                            not fl[0] and _shell_cmd_name(et[0]) in {"echo", "printf"}
+                            for et, fl in exp_pairs
+                        ):
+                            sub_samples, sub_unsup, sub_unres = _extract_xargs_echo_samples(
+                                toks,
+                                block_lvars,
+                                _step_budget=_step_budget,
+                                _char_budget=_char_budget,
+                                raw_stage_str=text[p_s:p_e],
+                            )
+                            if sub_unsup:
+                                has_unsupported = True
+                            if sub_unres:
+                                has_unresolved_var = True
+                            for line_s, w_list in sub_samples:
+                                if line_s is None:
+                                    if batch_count < 64:
+                                        samples.append((None, w_list))
+                                        batch_count += 1
+                                    else:
+                                        has_unsupported = True
+                                elif line_s not in seen_lines:
+                                    if len(seen_lines) < 64:
+                                        seen_lines.add(line_s)
+                                        samples.append((line_s, w_list))
+                                    else:
+                                        has_unsupported = True
+                            if not any(
+                                not fl[0]
+                                and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+                                for et, fl in exp_pairs
+                            ):
+                                break
+                        if any(
+                            not fl[0]
+                            and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+                            for et, fl in exp_pairs
+                        ):
+                            continue
+                        break
+                if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                    expect_case_pattern = True
+                continue
             c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
-                text, c_start, c_e, pairs, case_depth, expect_case_pattern
+                text, c_start, c_e, pairs, case_depth, expect_case_pattern, cond_stack
             )
             while c_e > c_s and text[c_e - 1].isspace():
                 c_e -= 1
@@ -8626,7 +10366,9 @@ def _find_group_upstream_echo_samples(
                         pairs,
                         effective_pos_samples,
                         positional_sample,
+                        loop_vars=block_lvars,
                         _step_budget=_step_budget,
+                        _char_budget=_char_budget,
                     )
                     if has_for_keyword
                     else None
@@ -8640,22 +10382,59 @@ def _find_group_upstream_echo_samples(
                         block_lvars = dict(block_lvars)
                         block_lvars[var_name] = expanded_words
                 else:
+                    var_binding = _parse_var_assignment_chain(
+                        text,
+                        c_s,
+                        c_e,
+                        block_lvars,
+                        _step_budget=_step_budget,
+                        _char_budget=_char_budget,
+                    )
+                    if var_binding is not None:
+                        block_lvars = _apply_var_bindings(
+                            block_lvars,
+                            var_binding[0],
+                            var_binding[1],
+                            bool(cond_stack),
+                            _step_budget=_step_budget,
+                        )
+                        if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                            expect_case_pattern = True
+                        continue
+                    if stdin_line_samples and text.find("read", c_s, c_e) != -1:
+                        read_vars = _parse_read_var_names_in_chain(text, c_s, c_e)
+                        if read_vars is not None:
+                            block_lvars = dict(block_lvars)
+                            for rv in read_vars:
+                                block_lvars[rv] = list(stdin_line_samples)
                     if has_inner_groups:
-                        g_s, g_e, unwrapped_chain = _unwrap_span_groups(text, c_s, c_e, pairs)
+                        g_s, g_e, unwrapped_chain = _unwrap_span_groups(
+                            text, c_s, c_e, pairs, unwrap_cache=unwrap_cache
+                        )
                     else:
                         g_s, g_e, unwrapped_chain = c_s, c_e, False
                     if unwrapped_chain:
                         work.append((g_s, g_e, block_lvars))
                     else:
                         pipe_stages = _split_span_outside_quotes(
-                            text, c_s, c_e, _SHELL_PIPE_SEPS, pairs, closers, respect_groups=True
+                            text,
+                            c_s,
+                            c_e,
+                            _SHELL_PIPE_SEPS,
+                            pairs,
+                            closers,
+                            respect_groups=True,
+                            split_cache=split_cache,
                         )
-                        for p_s, p_e, _ in reversed(pipe_stages):
+                        n_ps = len(pipe_stages)
+                        for rev_idx, (p_s, p_e, _) in enumerate(reversed(pipe_stages)):
                             _step_budget[0] += 1
                             if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                 raise _ShellComplexityBudgetExceeded()
                             if has_inner_groups:
-                                sg_s, sg_e, is_grp = _unwrap_span_groups(text, p_s, p_e, pairs)
+                                sg_s, sg_e, is_grp = _unwrap_span_groups(
+                                    text, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                                )
                             else:
                                 sg_s, sg_e, is_grp = p_s, p_e, False
                             if is_grp:
@@ -8667,26 +10446,58 @@ def _find_group_upstream_echo_samples(
                                     closers,
                                     parsed_tok_cache,
                                     _step_budget=_step_budget,
+                                    loop_vars=block_lvars,
+                                    group_passthrough_cache=group_passthrough_cache,
+                                    unwrap_cache=unwrap_cache,
+                                    split_cache=split_cache,
                                 )
                                 if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                                     raise _ShellComplexityBudgetExceeded()
                                 if is_pt:
                                     continue
                                 work.append((sg_s, sg_e, block_lvars))
+                                if rev_idx + 1 < n_ps and _group_may_passthrough_stdin(
+                                    text,
+                                    sg_s,
+                                    sg_e,
+                                    pairs,
+                                    closers,
+                                    parsed_tok_cache,
+                                    _step_budget=_step_budget,
+                                    loop_vars=block_lvars,
+                                    group_may_passthrough_cache=group_may_passthrough_cache,
+                                    unwrap_cache=unwrap_cache,
+                                    split_cache=split_cache,
+                                ):
+                                    continue
                                 break
                             toks = _parse_stage_cached(text[p_s:p_e], parsed_tok_cache)
                             if not toks:
                                 break
-                            up_cmd = _shell_cmd_name(toks[0])
-                            if up_cmd in {"echo", "printf"}:
-                                sub_samples, sub_unsup = _extract_xargs_echo_samples(
+                            exp_pairs = _expand_upstream_stage_tokens(
+                                text[p_s:p_e],
+                                toks,
+                                block_lvars,
+                                _step_budget=_step_budget,
+                                _char_budget=_char_budget,
+                            )
+                            if any(fl[0] for _, fl in exp_pairs):
+                                has_unresolved_var = True
+                            if any(
+                                not fl[0] and _shell_cmd_name(et[0]) in {"echo", "printf"}
+                                for et, fl in exp_pairs
+                            ):
+                                sub_samples, sub_unsup, sub_unres = _extract_xargs_echo_samples(
                                     toks,
                                     block_lvars,
                                     _step_budget=_step_budget,
                                     _char_budget=_char_budget,
+                                    raw_stage_str=text[p_s:p_e],
                                 )
                                 if sub_unsup:
                                     has_unsupported = True
+                                if sub_unres:
+                                    has_unresolved_var = True
                                 for line_s, w_list in sub_samples:
                                     if line_s is None:
                                         if batch_count < 64:
@@ -8700,13 +10511,30 @@ def _find_group_upstream_echo_samples(
                                             samples.append((line_s, w_list))
                                         else:
                                             has_unsupported = True
-                                break
-                            if up_cmd in _STDIN_PASSTHROUGH_CMDS:
+                                if not any(
+                                    not fl[0]
+                                    and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+                                    for et, fl in exp_pairs
+                                ):
+                                    break
+                            if any(
+                                not fl[0]
+                                and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+                                for et, fl in exp_pairs
+                            ):
                                 continue
                             break
             if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
                 expect_case_pattern = True
-    return samples, has_unsupported
+    if (
+        not stdin_line_samples
+        and visited <= 64
+        and len(seen_lines) < 64
+        and group_echo_cache is not None
+        and len(group_echo_cache) < 32_768
+    ):
+        group_echo_cache[root_key] = (list(samples), has_unsupported, has_unresolved_var)
+    return samples, has_unsupported, has_unresolved_var
 
 
 def _collect_upstream_xargs_echo_samples(
@@ -8723,9 +10551,63 @@ def _collect_upstream_xargs_echo_samples(
     has_for_keyword: bool,
     inherited_echo_samples: list[tuple[str | None, list[str]]] | None,
     inherited_unsupported: bool,
+    inherited_unresolved_var: bool = False,
     _step_budget: list[int],
     _char_budget: list[int],
-) -> tuple[list[tuple[str | None, list[str]]], bool]:
+    group_echo_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]],
+        tuple[list[tuple[str | None, list[str]]], bool, bool],
+    ]
+    | None = None,
+    group_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    group_may_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ]
+    | None = None,
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
+    ]
+    | None = None,
+) -> tuple[list[tuple[str | None, list[str]]], bool, bool]:
+    merged_samples: list[tuple[str | None, list[str]]] = []
+    seen_lines: set[str] = set()
+    batch_count = 0
+    merged_unsup = False
+    merged_unres = False
+
+    def _merge(
+        s_list: list[tuple[str | None, list[str]]],
+        unsup: bool,
+        unres: bool,
+    ) -> None:
+        nonlocal batch_count, merged_unsup, merged_unres
+        if unsup:
+            merged_unsup = True
+        if unres:
+            merged_unres = True
+        for ln_s, w_l in s_list:
+            if ln_s is None:
+                if batch_count < 64:
+                    merged_samples.append((None, w_l))
+                    batch_count += 1
+                else:
+                    merged_unsup = True
+            elif ln_s not in seen_lines:
+                if len(seen_lines) < 64:
+                    seen_lines.add(ln_s)
+                    merged_samples.append((ln_s, w_l))
+                else:
+                    merged_unsup = True
+
+    has_inherited_echo = (
+        inherited_echo_samples is not None
+        or inherited_unsupported
+        or inherited_unresolved_var
+    )
     idx = target_stage_idx - 1
     while idx >= 0:
         _step_budget[0] += 1
@@ -8741,13 +10623,55 @@ def _collect_upstream_xargs_echo_samples(
                 closers,
                 parsed_tok_cache,
                 _step_budget=_step_budget,
+                loop_vars=loop_vars,
+                group_passthrough_cache=group_passthrough_cache,
+                unwrap_cache=unwrap_cache,
+                split_cache=split_cache,
             )
             if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                 raise _ShellComplexityBudgetExceeded()
             if is_pt:
                 idx -= 1
                 continue
-            return _find_group_upstream_echo_samples(
+            grp_stdin_lines: list[str] = []
+            if text.find("read", up_s, up_e) != -1 and (idx > 0 or has_inherited_echo):
+                if idx > 0:
+                    up_echo_s, _, up_echo_unres = _collect_upstream_xargs_echo_samples(
+                        text,
+                        idx,
+                        stage_entries,
+                        pairs,
+                        closers,
+                        parsed_tok_cache,
+                        effective_pos_samples=effective_pos_samples,
+                        positional_sample=positional_sample,
+                        loop_vars=loop_vars,
+                        has_for_keyword=has_for_keyword,
+                        inherited_echo_samples=inherited_echo_samples,
+                        inherited_unsupported=inherited_unsupported,
+                        inherited_unresolved_var=inherited_unresolved_var,
+                        _step_budget=_step_budget,
+                        _char_budget=_char_budget,
+                        group_echo_cache=group_echo_cache,
+                        group_passthrough_cache=group_passthrough_cache,
+                        group_may_passthrough_cache=group_may_passthrough_cache,
+                        unwrap_cache=unwrap_cache,
+                        split_cache=split_cache,
+                    )
+                else:
+                    up_echo_s = list(inherited_echo_samples or [])
+                    up_echo_unres = inherited_unresolved_var
+                seen_in: set[str] = set()
+                if up_echo_unres:
+                    seen_in.add(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                    grp_stdin_lines.append(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                for ln_s, _ in up_echo_s:
+                    if ln_s is not None and ln_s not in seen_in:
+                        seen_in.add(ln_s)
+                        grp_stdin_lines.append(ln_s)
+                        if len(grp_stdin_lines) >= 64:
+                            break
+            g_samples, g_unsup, g_unres = _find_group_upstream_echo_samples(
                 text,
                 up_s,
                 up_e,
@@ -8760,24 +10684,76 @@ def _collect_upstream_xargs_echo_samples(
                 has_for_keyword=has_for_keyword,
                 _step_budget=_step_budget,
                 _char_budget=_char_budget,
+                group_echo_cache=group_echo_cache,
+                group_passthrough_cache=group_passthrough_cache,
+                group_may_passthrough_cache=group_may_passthrough_cache,
+                unwrap_cache=unwrap_cache,
+                split_cache=split_cache,
+                stdin_line_samples=tuple(grp_stdin_lines),
             )
+            _merge(g_samples, g_unsup, g_unres)
+            if (idx > 0 or has_inherited_echo) and _group_may_passthrough_stdin(
+                text,
+                up_s,
+                up_e,
+                pairs,
+                closers,
+                parsed_tok_cache,
+                _step_budget=_step_budget,
+                loop_vars=loop_vars,
+                group_may_passthrough_cache=group_may_passthrough_cache,
+                unwrap_cache=unwrap_cache,
+                split_cache=split_cache,
+            ):
+                idx -= 1
+                continue
+            return merged_samples, merged_unsup, merged_unres
         if not up_toks:
-            return [], False
-        up_cmd = _shell_cmd_name(up_toks[0])
-        if up_cmd in {"echo", "printf"}:
-            return _extract_xargs_echo_samples(
+            return merged_samples, merged_unsup, merged_unres
+        exp_ups = _expand_upstream_stage_tokens(
+            text[up_s:up_e],
+            up_toks,
+            loop_vars,
+            _step_budget=_step_budget,
+            _char_budget=_char_budget,
+        )
+        if any(fl[0] for _, fl in exp_ups):
+            merged_unres = True
+        if any(
+            not fl[0] and _shell_cmd_name(et[0]) in {"echo", "printf"}
+            for et, fl in exp_ups
+        ):
+            e_samples, e_unsup, e_unres = _extract_xargs_echo_samples(
                 up_toks,
                 loop_vars,
                 _step_budget=_step_budget,
                 _char_budget=_char_budget,
+                raw_stage_str=text[up_s:up_e],
             )
-        if up_cmd in _STDIN_PASSTHROUGH_CMDS:
+            _merge(e_samples, e_unsup, e_unres)
+            if not any(
+                not fl[0] and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+                for et, fl in exp_ups
+            ):
+                return merged_samples, merged_unsup, merged_unres
+        if any(
+            not fl[0] and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
+            for et, fl in exp_ups
+        ):
             idx -= 1
             continue
-        return [], False
-    if inherited_echo_samples is not None or inherited_unsupported:
-        return list(inherited_echo_samples or []), inherited_unsupported
-    return [], False
+        return merged_samples, merged_unsup, merged_unres
+    if (
+        inherited_echo_samples is not None
+        or inherited_unsupported
+        or inherited_unresolved_var
+    ):
+        _merge(
+            list(inherited_echo_samples or []),
+            inherited_unsupported,
+            inherited_unresolved_var,
+        )
+    return merged_samples, merged_unsup, merged_unres
 
 
 def _inspect_python_stage_tokens(
@@ -8838,6 +10814,7 @@ def _check_expanded_subcommand(
     _ast_depth: int,
     _positional_sample: str | None = None,
     _positional_samples: list[str] | None = None,
+    _loop_multiplier: int = 1,
     _step_budget: list[int],
     _ast_step_budget: list[int],
     _char_budget: list[int],
@@ -8866,6 +10843,7 @@ def _check_expanded_subcommand(
         _ast_depth=_ast_depth,
         _positional_sample=_positional_sample,
         _positional_samples=_positional_samples,
+        _loop_multiplier=_loop_multiplier,
         _step_budget=_step_budget,
         _ast_step_budget=_ast_step_budget,
         _char_budget=_char_budget,
@@ -8889,6 +10867,7 @@ def _check_deobfuscated_commands(
     _char_budget: list[int] | None = None,
     _seen_texts: set[str] | None = None,
     _truncated_out: list[bool] | None = None,
+    _is_embedded_fragment: bool = False,
 ) -> str | None:
     try:
         return _check_deobfuscated_commands_impl(
@@ -8905,9 +10884,12 @@ def _check_deobfuscated_commands(
             _char_budget=_char_budget,
             _seen_texts=_seen_texts,
             _truncated_out=_truncated_out,
+            _is_embedded_fragment=_is_embedded_fragment,
         )
     except _ShellComplexityBudgetExceeded:
         return "safety_floor:shell_complexity_budget_exceeded"
+    except _AmbiguousPipedCompoundShell:
+        return "safety_floor:ambiguous_piped_compound_shell"
 
 
 def _check_deobfuscated_commands_impl(
@@ -8920,11 +10902,13 @@ def _check_deobfuscated_commands_impl(
     _positional_sample: str | None = None,
     _positional_samples: list[str] | None = None,
     _loop_vars: Mapping[str, list[str]] | None = None,
+    _loop_multiplier: int = 1,
     _step_budget: list[int] | None = None,
     _ast_step_budget: list[int] | None = None,
     _char_budget: list[int] | None = None,
     _seen_texts: set[str] | None = None,
     _truncated_out: list[bool] | None = None,
+    _is_embedded_fragment: bool = False,
 ) -> str | None:
     if _step_budget is None:
         _step_budget = [0]
@@ -8933,7 +10917,7 @@ def _check_deobfuscated_commands_impl(
     if _char_budget is None:
         _char_budget = [0]
     if _cmd_depth > 0:
-        _step_budget[0] += 16
+        _step_budget[0] += 16 * max(1, _loop_multiplier)
         if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
             return "safety_floor:shell_complexity_budget_exceeded"
     segment_normalized = False
@@ -8953,9 +10937,25 @@ def _check_deobfuscated_commands_impl(
     )
     pairs, closers = _match_shell_groups(segment_source)
     has_for_keyword = "for" in segment_source
+    segment_source_low: str | None = None
+    segment_low_offsets: list[int] | None = None
     parsed_tok_cache: dict[str, list[str]] = {}
     group_crit_cache: dict[
         tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], str | None
+    ] = {}
+    group_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ] = {}
+    group_may_passthrough_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], bool
+    ] = {}
+    group_echo_cache: dict[
+        tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]],
+        tuple[list[tuple[str | None, list[str]]], bool, bool],
+    ] = {}
+    unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] = {}
+    split_cache: dict[
+        tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
     ] = {}
     init_loop_vars: dict[str, list[str]] = (
         {k: list(v) for k, v in _loop_vars.items()} if _loop_vars else {}
@@ -8968,8 +10968,21 @@ def _check_deobfuscated_commands_impl(
             str | None,
             list[tuple[str | None, list[str]]] | None,
             bool,
+            bool,
+            int,
         ]
-    ] = [(0, len(segment_source), init_loop_vars, None, None, False)]
+    ] = [
+        (
+            0,
+            len(segment_source),
+            init_loop_vars,
+            None,
+            None,
+            False,
+            False,
+            max(1, _loop_multiplier),
+        )
+    ]
 
     while worklist:
         _step_budget[0] += 1
@@ -8982,8 +10995,12 @@ def _check_deobfuscated_commands_impl(
             inherited_upstream_crit,
             inherited_echo_samples,
             inherited_echo_unsupported,
+            inherited_echo_unresolved,
+            cur_loop_mult,
         ) = worklist.pop()
-        u_start, u_end, _ = _unwrap_span_groups(segment_source, cur_start, cur_end, pairs)
+        u_start, u_end, _ = _unwrap_span_groups(
+            segment_source, cur_start, cur_end, pairs, unwrap_cache=unwrap_cache
+        )
         if u_start >= u_end:
             continue
         chains = _split_span_outside_quotes(
@@ -8994,93 +11011,235 @@ def _check_deobfuscated_commands_impl(
             pairs,
             closers,
             respect_groups=_respect_groups,
+            split_cache=split_cache,
+        )
+        coalesced_chains = _coalesce_piped_compound_chains(
+            segment_source,
+            u_start,
+            u_end,
+            chains,
+            pairs,
+            closers,
+            respect_groups=_respect_groups,
+            split_cache=split_cache,
+        )
+        chain_items: list[
+            tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]
+        ] = (
+            coalesced_chains
+            if coalesced_chains is not None
+            else [(cs, ce, sep, None) for cs, ce, sep in chains]
         )
         loop_vars = cur_loop_vars
         case_depth = 0
         expect_case_pattern = False
+        cond_stack: list[str] = []
+        for_mult_stack: list[int] = []
+        loop_mult = cur_loop_mult
 
-        for c_start, c_end, trailing_sep in chains:
+        def _recompute_loop_mult(
+            base_mult: int = cur_loop_mult, stack: list[int] = for_mult_stack
+        ) -> int:
+            mult = base_mult
+            for fm in stack:
+                mult = min(_MAX_SHELL_WORKLIST_STEPS + 1, mult * fm)
+            return mult
+
+        for c_start, c_end, trailing_sep, pipeline_override in chain_items:
             _step_budget[0] += 1
             if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                 return "safety_floor:shell_complexity_budget_exceeded"
             c_e = c_end
-            c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
-                segment_source, c_start, c_e, pairs, case_depth, expect_case_pattern
-            )
-            while c_e > c_s and segment_source[c_e - 1].isspace():
-                c_e -= 1
-            if c_s >= c_e:
-                if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
-                    expect_case_pattern = True
-                continue
+            stage_entries: list[tuple[bool, int, int, list[str]]] = []
+            pending_subgroups: list[tuple[int, int, int, dict[str, list[str]], int]] = []
+            if pipeline_override is not None:
+                c_s = c_start
+                while c_s < c_e and segment_source[c_s].isspace():
+                    c_s += 1
+                while c_e > c_s and segment_source[c_e - 1].isspace():
+                    c_e -= 1
+                if c_s >= c_e:
+                    if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                        expect_case_pattern = True
+                    continue
+                for stage_pos, (is_comp, p_s, p_e) in enumerate(pipeline_override):
+                    _step_budget[0] += 1
+                    if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                        return "safety_floor:shell_complexity_budget_exceeded"
+                    if is_comp:
+                        pending_subgroups.append((stage_pos, p_s, p_e, loop_vars, loop_mult))
+                        stage_entries.append((True, p_s, p_e, []))
+                        continue
+                    if _respect_groups:
+                        sg_s, sg_e, is_grp = _unwrap_span_groups(
+                            segment_source, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                        )
+                        if is_grp:
+                            pending_subgroups.append(
+                                (stage_pos, sg_s, sg_e, loop_vars, loop_mult)
+                            )
+                            stage_entries.append((True, sg_s, sg_e, []))
+                            continue
+                    toks = _parse_stage_cached(segment_source[p_s:p_e], parsed_tok_cache)
+                    stage_entries.append((False, p_s, p_e, toks))
+            else:
+                prev_loop_depth = sum(1 for item in cond_stack if item == "loop")
+                c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
+                    segment_source,
+                    c_start,
+                    c_e,
+                    pairs,
+                    case_depth,
+                    expect_case_pattern,
+                    cond_stack,
+                )
+                new_loop_depth = sum(1 for item in cond_stack if item == "loop")
+                if new_loop_depth > prev_loop_depth:
+                    for_mult_stack.append(1)
+                elif new_loop_depth < prev_loop_depth and for_mult_stack:
+                    for_mult_stack.pop()
+                    loop_mult = _recompute_loop_mult()
+                while c_e > c_s and segment_source[c_e - 1].isspace():
+                    c_e -= 1
+                if c_s >= c_e:
+                    if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                        expect_case_pattern = True
+                    continue
 
-            for_binding = (
-                _extract_for_loop_binding(
+                for_binding = (
+                    _extract_for_loop_binding(
+                        segment_source,
+                        c_s,
+                        c_e,
+                        pairs,
+                        effective_pos_samples,
+                        _positional_sample,
+                        loop_vars=loop_vars,
+                        _step_budget=_step_budget,
+                        _char_budget=_char_budget,
+                    )
+                    if has_for_keyword
+                    else None
+                )
+                if for_binding is not None:
+                    var_name, expanded_words = for_binding
+                    if (
+                        not expanded_words
+                        and _is_embedded_fragment
+                        and effective_pos_samples is None
+                    ):
+                        expanded_words = ["/tmp/work"]
+                    _step_budget[0] += len(expanded_words)
+                    if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                        return "safety_floor:shell_complexity_budget_exceeded"
+                    if expanded_words or var_name not in loop_vars:
+                        loop_vars = dict(loop_vars)
+                        loop_vars[var_name] = expanded_words
+                    if new_loop_depth > prev_loop_depth and for_mult_stack:
+                        for_mult_stack[-1] = max(1, len(expanded_words))
+                    else:
+                        for_mult_stack.append(max(1, len(expanded_words)))
+                    loop_mult = _recompute_loop_mult()
+                    if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                        expect_case_pattern = True
+                    continue
+
+                var_binding = _parse_var_assignment_chain(
                     segment_source,
                     c_s,
                     c_e,
-                    pairs,
-                    effective_pos_samples,
-                    _positional_sample,
+                    loop_vars,
                     _step_budget=_step_budget,
+                    _char_budget=_char_budget,
                 )
-                if has_for_keyword
-                else None
-            )
-            if for_binding is not None:
-                var_name, expanded_words = for_binding
-                _step_budget[0] += len(expanded_words)
-                if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
-                    return "safety_floor:shell_complexity_budget_exceeded"
-                if expanded_words or var_name not in loop_vars:
-                    loop_vars = dict(loop_vars)
-                    loop_vars[var_name] = expanded_words
-                if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
-                    expect_case_pattern = True
-                continue
-
-            if _respect_groups:
-                g_s, g_e, unwrapped_chain = _unwrap_span_groups(
-                    segment_source, c_s, c_e, pairs
-                )
-                if unwrapped_chain:
-                    worklist.append(
-                        (
-                            g_s,
-                            g_e,
-                            loop_vars,
-                            inherited_upstream_crit,
-                            inherited_echo_samples,
-                            inherited_echo_unsupported,
-                        )
+                if var_binding is not None:
+                    loop_vars = _apply_var_bindings(
+                        loop_vars,
+                        var_binding[0],
+                        var_binding[1],
+                        bool(cond_stack),
+                        _step_budget=_step_budget,
                     )
                     if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
                         expect_case_pattern = True
                     continue
 
-            pipe_stages = _split_span_outside_quotes(
-                segment_source,
-                c_s,
-                c_e,
-                _SHELL_PIPE_SEPS,
-                pairs,
-                closers,
-                respect_groups=_respect_groups,
-            )
-            stage_entries: list[tuple[bool, int, int, list[str]]] = []
-            pending_subgroups: list[tuple[int, int, int, dict[str, list[str]]]] = []
-            for stage_pos, (p_s, p_e, _) in enumerate(pipe_stages):
-                _step_budget[0] += 1
-                if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
-                    return "safety_floor:shell_complexity_budget_exceeded"
+                if segment_source.find("read", c_s, c_e) != -1 and (
+                    inherited_upstream_crit is not None
+                    or inherited_echo_samples
+                    or inherited_echo_unresolved
+                ):
+                    read_vars = _parse_read_var_names_in_chain(segment_source, c_s, c_e)
+                    if read_vars is not None:
+                        stdin_lines: list[str] = []
+                        seen_in_lines: set[str] = set()
+                        if inherited_echo_unresolved:
+                            seen_in_lines.add(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                            stdin_lines.append(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                        if (
+                            inherited_upstream_crit is not None
+                            and inherited_upstream_crit not in seen_in_lines
+                        ):
+                            seen_in_lines.add(inherited_upstream_crit)
+                            stdin_lines.append(inherited_upstream_crit)
+                        for ln_s, _ in inherited_echo_samples or ():
+                            if ln_s is not None and ln_s not in seen_in_lines:
+                                seen_in_lines.add(ln_s)
+                                stdin_lines.append(ln_s)
+                                if len(stdin_lines) >= 64:
+                                    break
+                        if stdin_lines:
+                            loop_vars = dict(loop_vars)
+                            for rv in read_vars:
+                                loop_vars[rv] = list(stdin_lines)
+
                 if _respect_groups:
-                    sg_s, sg_e, is_grp = _unwrap_span_groups(segment_source, p_s, p_e, pairs)
-                    if is_grp:
-                        pending_subgroups.append((stage_pos, sg_s, sg_e, loop_vars))
-                        stage_entries.append((True, sg_s, sg_e, []))
+                    g_s, g_e, unwrapped_chain = _unwrap_span_groups(
+                        segment_source, c_s, c_e, pairs, unwrap_cache=unwrap_cache
+                    )
+                    if unwrapped_chain:
+                        worklist.append(
+                            (
+                                g_s,
+                                g_e,
+                                loop_vars,
+                                inherited_upstream_crit,
+                                inherited_echo_samples,
+                                inherited_echo_unsupported,
+                                inherited_echo_unresolved,
+                                loop_mult,
+                            )
+                        )
+                        if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
+                            expect_case_pattern = True
                         continue
-                toks = _parse_stage_cached(segment_source[p_s:p_e], parsed_tok_cache)
-                stage_entries.append((False, p_s, p_e, toks))
+
+                pipe_stages = _split_span_outside_quotes(
+                    segment_source,
+                    c_s,
+                    c_e,
+                    _SHELL_PIPE_SEPS,
+                    pairs,
+                    closers,
+                    respect_groups=_respect_groups,
+                    split_cache=split_cache,
+                )
+                for stage_pos, (p_s, p_e, _) in enumerate(pipe_stages):
+                    _step_budget[0] += 1
+                    if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
+                        return "safety_floor:shell_complexity_budget_exceeded"
+                    if _respect_groups:
+                        sg_s, sg_e, is_grp = _unwrap_span_groups(
+                            segment_source, p_s, p_e, pairs, unwrap_cache=unwrap_cache
+                        )
+                        if is_grp:
+                            pending_subgroups.append(
+                                (stage_pos, sg_s, sg_e, loop_vars, loop_mult)
+                            )
+                            stage_entries.append((True, sg_s, sg_e, []))
+                            continue
+                    toks = _parse_stage_cached(segment_source[p_s:p_e], parsed_tok_cache)
+                    stage_entries.append((False, p_s, p_e, toks))
 
             running_upstream_critical_path: str | None = None
             inherited_active_crit: str | None = inherited_upstream_crit
@@ -9114,6 +11273,8 @@ def _check_deobfuscated_commands_impl(
                             has_for_keyword=has_for_keyword,
                             _step_budget=_step_budget,
                             _char_budget=_char_budget,
+                            unwrap_cache=unwrap_cache,
+                            split_cache=split_cache,
                         )
                         if grp_crit is _SHELL_COMPLEXITY_EXCEEDED:
                             return _SHELL_COMPLEXITY_EXCEEDED
@@ -9129,24 +11290,37 @@ def _check_deobfuscated_commands_impl(
                                 closers,
                                 parsed_tok_cache,
                                 _step_budget=_step_budget,
+                                loop_vars=cur_lvars,
+                                group_passthrough_cache=group_passthrough_cache,
+                                unwrap_cache=unwrap_cache,
+                                split_cache=split_cache,
                             )
                             if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                                 return _SHELL_COMPLEXITY_EXCEEDED
-                            if not is_pt:
+                            if not is_pt and not _group_may_passthrough_stdin(
+                                segment_source,
+                                up_s,
+                                up_e,
+                                pairs,
+                                closers,
+                                parsed_tok_cache,
+                                _step_budget=_step_budget,
+                                loop_vars=cur_lvars,
+                                group_may_passthrough_cache=group_may_passthrough_cache,
+                                unwrap_cache=unwrap_cache,
+                                split_cache=split_cache,
+                            ):
                                 inherited_active_crit = None
                     elif up_toks:
                         found_crit = False
-                        expanded_ups = (
-                            _expand_loop_var_tokens(
-                                up_toks,
-                                cur_lvars,
-                                _step_budget=_step_budget,
-                                _char_budget=_char_budget,
-                            )
-                            if cur_lvars
-                            else (up_toks,)
+                        expanded_ups = _expand_upstream_stage_tokens(
+                            segment_source[up_s:up_e],
+                            up_toks,
+                            cur_lvars,
+                            _step_budget=_step_budget,
+                            _char_budget=_char_budget,
                         )
-                        for expanded_up in expanded_ups:
+                        for expanded_up, _ in expanded_ups:
                             _step_budget[0] += 1
                             if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                 return _SHELL_COMPLEXITY_EXCEEDED
@@ -9158,12 +11332,14 @@ def _check_deobfuscated_commands_impl(
                                 inherited_active_crit = None
                                 found_crit = True
                                 break
-                        if (
-                            not found_crit
-                            and inherited_active_crit is not None
-                            and _shell_cmd_name(up_toks[0]) not in _STDIN_PASSTHROUGH_CMDS
-                        ):
-                            inherited_active_crit = None
+                        if not found_crit and inherited_active_crit is not None:
+                            is_exp_pt = any(
+                                bool(eu)
+                                and (fl[0] or _shell_cmd_name(eu[0]) in _STDIN_PASSTHROUGH_CMDS)
+                                for eu, fl in expanded_ups
+                            )
+                            if not is_exp_pt:
+                                inherited_active_crit = None
                 return None
 
             resolved_subgroups: list[
@@ -9174,16 +11350,20 @@ def _check_deobfuscated_commands_impl(
                     str | None,
                     list[tuple[str | None, list[str]]] | None,
                     bool,
+                    bool,
+                    int,
                 ]
             ] = []
-            for sg_stage_idx, sg_s, sg_e, sg_lvars in pending_subgroups:
+            for sg_stage_idx, sg_s, sg_e, sg_lvars, sg_loop_mult in pending_subgroups:
                 sg_inherited: str | None = None
                 sg_echo: list[tuple[str | None, list[str]]] | None = None
                 sg_unsup = False
+                sg_unres = False
                 if sg_stage_idx == 0:
                     sg_inherited = inherited_upstream_crit
                     sg_echo = inherited_echo_samples
                     sg_unsup = inherited_echo_unsupported
+                    sg_unres = inherited_echo_unresolved
                 else:
                     if (
                         _advance_upstream_critical_path(sg_stage_idx, stage_entries, sg_lvars)
@@ -9195,13 +11375,25 @@ def _check_deobfuscated_commands_impl(
                         if running_upstream_critical_path is not None
                         else inherited_active_crit
                     )
-                    sub_slice_low = segment_source[sg_s:sg_e].lower()
-                    if "xargs" in sub_slice_low or (
-                        "x" in sub_slice_low
-                        and "rgs" in sub_slice_low
-                        and any(q in sub_slice_low for q in ("'", '"', "\\", "$"))
-                    ):
-                        sg_echo, sg_unsup = _collect_upstream_xargs_echo_samples(
+                    if segment_source_low is None:
+                        segment_source_low = segment_source.lower()
+                        if len(segment_source_low) != len(segment_source):
+                            offsets = [0] * (len(segment_source) + 1)
+                            acc = 0
+                            for idx_ch, ch_val in enumerate(segment_source):
+                                acc += len(ch_val.lower())
+                                offsets[idx_ch + 1] = acc
+                            segment_low_offsets = offsets
+                    low_s = sg_s if segment_low_offsets is None else segment_low_offsets[sg_s]
+                    low_e = sg_e if segment_low_offsets is None else segment_low_offsets[sg_e]
+                    has_xargs_hint = segment_source_low.find("xargs", low_s, low_e) != -1
+                    if not has_xargs_hint:
+                        for q_ch in ("'", '"', "\\", "$"):
+                            if segment_source.find(q_ch, sg_s, sg_e) != -1:
+                                has_xargs_hint = True
+                                break
+                    if has_xargs_hint:
+                        sg_echo, sg_unsup, sg_unres = _collect_upstream_xargs_echo_samples(
                             segment_source,
                             sg_stage_idx,
                             stage_entries,
@@ -9214,42 +11406,118 @@ def _check_deobfuscated_commands_impl(
                             has_for_keyword=has_for_keyword,
                             inherited_echo_samples=inherited_echo_samples,
                             inherited_unsupported=inherited_echo_unsupported,
+                            inherited_unresolved_var=inherited_echo_unresolved,
                             _step_budget=_step_budget,
                             _char_budget=_char_budget,
+                            group_echo_cache=group_echo_cache,
+                            group_passthrough_cache=group_passthrough_cache,
+                            group_may_passthrough_cache=group_may_passthrough_cache,
+                            unwrap_cache=unwrap_cache,
+                            split_cache=split_cache,
                         )
                 resolved_subgroups.append(
-                    (sg_s, sg_e, sg_lvars, sg_inherited, sg_echo, sg_unsup)
+                    (
+                        sg_s,
+                        sg_e,
+                        sg_lvars,
+                        sg_inherited,
+                        sg_echo,
+                        sg_unsup,
+                        sg_unres,
+                        sg_loop_mult,
+                    )
                 )
             for sg_item in reversed(resolved_subgroups):
                 worklist.append(sg_item)
 
             for stage_idx, (is_grp, _st_s, _st_e, base_tokens) in enumerate(stage_entries):
-                if is_grp or not base_tokens:
+                if is_grp:
                     continue
-                expanded_stage_tokens = (
-                    _expand_loop_var_tokens(
-                        base_tokens,
+                raw_stage_slice = segment_source[_st_s:_st_e]
+                if len(stage_entries) >= 2:
+                    kw_s = _st_s
+                    while kw_s < _st_e and segment_source[kw_s].isspace():
+                        kw_s += 1
+                    while kw_s < _st_e:
+                        if segment_source[kw_s] == "!" and (
+                            kw_s + 1 >= _st_e
+                            or segment_source[kw_s + 1].isspace()
+                            or segment_source[kw_s + 1] in "({"
+                        ):
+                            kw_s += 1
+                            while kw_s < _st_e and segment_source[kw_s].isspace():
+                                kw_s += 1
+                            continue
+                        if segment_source.startswith("time", kw_s, _st_e):
+                            m_time = re.match(
+                                r"time(?:\s+-p)*(?:\s+(?!-)|(?=[({]))",
+                                segment_source[kw_s:_st_e],
+                            )
+                            if m_time is not None:
+                                kw_s += m_time.end()
+                                while kw_s < _st_e and segment_source[kw_s].isspace():
+                                    kw_s += 1
+                                continue
+                        break
+                    if stage_idx > 0:
+                        for kw in _SHELL_KEYWORD_STAGE_HEADS:
+                            if _match_shell_kw_boundary(
+                                segment_source, kw_s, _st_e, kw, allow_group_after=True
+                            ):
+                                return "safety_floor:ambiguous_piped_compound_shell"
+                    else:
+                        for kw in ("done", "fi", "esac"):
+                            if _match_shell_kw_boundary(
+                                segment_source, kw_s, _st_e, kw, allow_group_after=False
+                            ):
+                                return "safety_floor:ambiguous_piped_compound_shell"
+
+                if not base_tokens:
+                    continue
+                expanded_unq_flags: list[list[bool]] = []
+                if "$" in raw_stage_slice:
+                    ann_toks = _tokenize_raw_with_expand_segments(
+                        raw_stage_slice, strip_flow_prefixes=True
+                    )
+                    expanded_pairs = _expand_annotated_tokens(
+                        ann_toks,
                         loop_vars,
                         _step_budget=_step_budget,
                         _char_budget=_char_budget,
+                        word_split_unquoted=True,
+                        out_unquoted_flags=expanded_unq_flags,
                     )
-                    if loop_vars
-                    else (base_tokens,)
-                )
-                for tokens in expanded_stage_tokens:
-                    _step_budget[0] += 1
+                else:
+                    expanded_pairs = [(base_tokens, [False] * len(base_tokens))]
+                    expanded_unq_flags = [[False] * len(base_tokens)]
+
+                stage_loop_mult = max(1, loop_mult // max(1, len(expanded_pairs)))
+                for (tokens, unresolved_flags), unquoted_flags in zip(
+                    expanded_pairs, expanded_unq_flags, strict=True
+                ):
+                    _step_budget[0] += stage_loop_mult
                     if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                         return "safety_floor:shell_complexity_budget_exceeded"
-                    if loop_vars and tokens is not base_tokens and tokens:
+                    if not tokens:
+                        continue
+                    if "$" in raw_stage_slice or (loop_vars and tokens is not base_tokens):
                         first_head = _shell_cmd_name(tokens[0])
                         if first_head in _WRAPPER_COMMANDS or (
                             "=" in tokens[0]
                             and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]) is not None
                         ):
-                            tokens = _unwrap_command_tokens(tokens)
+                            orig_tokens_for_unq = list(tokens)
+                            tokens, unresolved_flags = _unwrap_command_tokens_with_flags(
+                                tokens, unresolved_flags
+                            )
+                            _, unquoted_flags = _unwrap_command_tokens_with_flags(
+                                orig_tokens_for_unq, unquoted_flags
+                            )
                             if not tokens:
                                 continue
-                    raw_stage_slice = segment_source[_st_s:_st_e]
+                    if _is_embedded_fragment:
+                        unresolved_flags = [False] * len(tokens)
+                        unquoted_flags = [False] * len(tokens)
                     if (
                         tokens is not base_tokens
                         or _cmd_depth > 0
@@ -9259,36 +11527,85 @@ def _check_deobfuscated_commands_impl(
                         stage_pattern_violation = _match_safety_patterns(" ".join(tokens))
                         if stage_pattern_violation is not None:
                             return stage_pattern_violation
+                    if unresolved_flags and unresolved_flags[0]:
+                        return "safety_floor:shell_ambiguous_variable_expansion"
                     cmd = _shell_cmd_name(tokens[0])
+                    if cmd in {"dd", "git"}:
+                        unres_viol = _check_unresolved_cmd_args(
+                            cmd, tokens, unresolved_flags
+                        )
+                        if unres_viol is not None:
+                            return unres_viol
                     if cmd == "rm":
                         has_recursive, has_force, targets = _parse_rm_tokens(tokens[1:])
                         rm_violation = _check_rm_targets(has_recursive, has_force, targets)
                         if rm_violation is not None:
                             return rm_violation
+                        unres_viol = _check_unresolved_cmd_args(
+                            "rm",
+                            tokens,
+                            unresolved_flags,
+                            unquoted_flags=unquoted_flags,
+                        )
+                        if unres_viol is not None:
+                            return unres_viol
 
                     elif cmd == "find":
                         starting_paths, expr_idx = _extract_find_starting_paths(tokens)
                         has_critical_start = (not starting_paths) or any(
                             _is_critical_rm_target(p) for p in starting_paths
                         )
-                        if "-delete" in tokens[1:] and has_critical_start:
-                            return "safety_floor:destructive_rm_root_or_glob"
+                        start_has_unres = any(unresolved_flags[1:expr_idx])
+                        if "-delete" in tokens[1:]:
+                            if has_critical_start:
+                                return "safety_floor:destructive_rm_root_or_glob"
+                            if start_has_unres:
+                                return "safety_floor:shell_ambiguous_variable_expansion"
                         j = expr_idx
                         while j < len(tokens):
                             if tokens[j].lower() in {"-exec", "-execdir", "-ok", "-okdir"}:
                                 inner_raw: list[str] = []
+                                inner_raw_flags: list[bool] = []
+                                inner_raw_unq_flags: list[bool] = []
                                 k = j + 1
                                 while k < len(tokens):
                                     t = tokens[k]
                                     if t in {"+", ";", r"\;", "\\"}:
                                         break
                                     inner_raw.append(t)
+                                    inner_raw_flags.append(
+                                        unresolved_flags[k] if k < len(unresolved_flags) else False
+                                    )
+                                    inner_raw_unq_flags.append(
+                                        unquoted_flags[k] if k < len(unquoted_flags) else False
+                                    )
                                     k += 1
                                 j = k + 1
-                                inner = _unwrap_command_tokens(inner_raw)
+                                orig_inner_for_unq = list(inner_raw)
+                                inner, inner_flags = _unwrap_command_tokens_with_flags(
+                                    inner_raw, inner_raw_flags
+                                )
+                                _, inner_unq_flags = _unwrap_command_tokens_with_flags(
+                                    orig_inner_for_unq, inner_raw_unq_flags
+                                )
                                 if not inner:
                                     continue
+                                if inner_flags and inner_flags[0]:
+                                    return "safety_floor:shell_ambiguous_variable_expansion"
                                 inner_cmd = Path(inner[0].strip("\"'")).name.lower()
+                                if start_has_unres and (
+                                    inner_cmd
+                                    in {"rm", "chmod", "dd", "sh", "bash", "dash", "zsh", "ksh"}
+                                    or _is_python_cmd_name(inner_cmd)
+                                ):
+                                    return "safety_floor:shell_ambiguous_variable_expansion"
+                                sh_script_idx: int | None = None
+                                if inner_cmd in {"sh", "bash", "dash", "zsh", "ksh"}:
+                                    sh_script_idx, sh_has_ambig_opt = _inspect_sh_options(
+                                        inner, inner_flags
+                                    )
+                                    if sh_has_ambig_opt:
+                                        return "safety_floor:shell_ambiguous_variable_expansion"
                                 sample_path = next(
                                     (p for p in starting_paths if _is_critical_rm_target(p)),
                                     starting_paths[0] if starting_paths else "/",
@@ -9314,17 +11631,34 @@ def _check_deobfuscated_commands_impl(
                                         has_rec or has_frc or uses_placeholder
                                     ):
                                         return "safety_floor:destructive_rm_root_or_glob"
-                                elif (
-                                    inner_cmd in {"sh", "bash", "dash", "zsh", "ksh"}
-                                    and (script_idx := _find_sh_c_script_index(inner)) is not None
-                                ):
+                                    unres_viol = _check_unresolved_cmd_args(
+                                        "rm",
+                                        inner,
+                                        inner_flags,
+                                        has_upstream_crit=has_critical_start,
+                                        unquoted_flags=inner_unq_flags,
+                                    )
+                                    if unres_viol is not None:
+                                        return unres_viol
+                                elif sh_script_idx is not None:
+                                    script_idx = sh_script_idx
+                                    if (
+                                        script_idx < len(inner_flags)
+                                        and inner_flags[script_idx]
+                                        and _SHELL_PURE_VAR_REF_RE.fullmatch(
+                                            inner[script_idx].strip()
+                                        )
+                                        is not None
+                                    ):
+                                        return "safety_floor:shell_ambiguous_variable_expansion"
                                     if _cmd_depth >= 3:
                                         if _truncated_out is not None:
                                             _truncated_out[0] = True
                                         return "safety_floor:shell_complexity_budget_exceeded"
                                     extra_args = inner[script_idx + 1 :]
+                                    extra_flags = inner_flags[script_idx + 1 :]
                                     if extra_args:
-                                        _step_budget[0] += len(extra_args)
+                                        _step_budget[0] += len(extra_args) * stage_loop_mult
                                         if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                             return "safety_floor:shell_complexity_budget_exceeded"
                                     _char_budget[0] += len(inner[script_idx])
@@ -9334,15 +11668,26 @@ def _check_deobfuscated_commands_impl(
                                         inner[script_idx], "{}", sample_path, _char_budget
                                     )
                                     resolved_pos: list[str] = []
+                                    resolved_flags: list[bool] = []
                                     if extra_args:
-                                        resolved_pos = [
-                                            _bounded_str_replace(
-                                                arg, "{}", sample_path, _char_budget
+                                        for arg_idx_f, arg in enumerate(extra_args):
+                                            is_unres_arg = (
+                                                arg_idx_f < len(extra_flags)
+                                                and extra_flags[arg_idx_f]
                                             )
-                                            for arg in extra_args
-                                        ]
+                                            resolved_flags.append(is_unres_arg)
+                                            resolved_pos.append(
+                                                _SHELL_AMBIGUOUS_VAR_SENTINEL
+                                                if is_unres_arg
+                                                else _bounded_str_replace(
+                                                    arg, "{}", sample_path, _char_budget
+                                                )
+                                            )
                                         sub_cmd = _replace_shell_positional_params(
-                                            sub_cmd, resolved_pos, _char_budget=_char_budget
+                                            sub_cmd,
+                                            resolved_pos,
+                                            pos_flags=resolved_flags,
+                                            _char_budget=_char_budget,
                                         )
                                         if len(resolved_pos) > 1:
                                             if "$" in sub_cmd and (
@@ -9377,14 +11722,33 @@ def _check_deobfuscated_commands_impl(
                                                         )
                                                     at_val = (
                                                         " ".join(
-                                                            shlex.quote(a)
-                                                            for a in resolved_pos[1:]
+                                                            (
+                                                                f'"{_SHELL_AMBIGUOUS_VAR_SENTINEL}"'
+                                                                if fl
+                                                                else shlex.quote(a)
+                                                            )
+                                                            for a, fl in zip(
+                                                                resolved_pos[1:],
+                                                                resolved_flags[1:],
+                                                                strict=True,
+                                                            )
                                                         )
                                                         if need_at
                                                         else None
                                                     )
                                                     star_val = (
-                                                        " ".join(resolved_pos[1:])
+                                                        " ".join(
+                                                            (
+                                                                _SHELL_AMBIGUOUS_VAR_SENTINEL
+                                                                if fl
+                                                                else a
+                                                            )
+                                                            for a, fl in zip(
+                                                                resolved_pos[1:],
+                                                                resolved_flags[1:],
+                                                                strict=True,
+                                                            )
+                                                        )
                                                         if need_star
                                                         else None
                                                     )
@@ -9430,6 +11794,7 @@ def _check_deobfuscated_commands_impl(
                                         _ast_depth=_ast_depth,
                                         _positional_sample=sample_path,
                                         _positional_samples=find_pos_samples,
+                                        _loop_multiplier=stage_loop_mult,
                                         _step_budget=_step_budget,
                                         _ast_step_budget=_ast_step_budget,
                                         _char_budget=_char_budget,
@@ -9439,6 +11804,14 @@ def _check_deobfuscated_commands_impl(
                                     if sub_violation is not None:
                                         return sub_violation
                                 else:
+                                    unres_viol = _check_unresolved_cmd_args(
+                                        inner_cmd,
+                                        inner,
+                                        inner_flags,
+                                        has_upstream_crit=has_critical_start,
+                                    )
+                                    if unres_viol is not None:
+                                        return unres_viol
                                     exec_tokens = [
                                         (
                                             _bounded_str_replace(
@@ -9480,10 +11853,28 @@ def _check_deobfuscated_commands_impl(
                         xargs_inner_raw, xargs_replace_str = _extract_xargs_inner_and_replace(
                             tokens[1:]
                         )
-                        xargs_inner = _unwrap_command_tokens(xargs_inner_raw)
+                        raw_inner_offset = 1 + len(tokens[1:]) - len(xargs_inner_raw)
+                        xargs_inner_raw_flags = unresolved_flags[raw_inner_offset:]
+                        xargs_inner_raw_unq = unquoted_flags[raw_inner_offset:]
+                        orig_xargs_for_unq = list(xargs_inner_raw)
+                        xargs_inner, xargs_inner_flags = _unwrap_command_tokens_with_flags(
+                            xargs_inner_raw, xargs_inner_raw_flags
+                        )
+                        _, xargs_inner_unq_flags = _unwrap_command_tokens_with_flags(
+                            orig_xargs_for_unq, xargs_inner_raw_unq
+                        )
                         if xargs_inner:
+                            if xargs_inner_flags and xargs_inner_flags[0]:
+                                return "safety_floor:shell_ambiguous_variable_expansion"
                             xargs_cmd = _shell_cmd_name(xargs_inner[0])
                             is_xargs_shell = xargs_cmd in {"sh", "bash", "dash", "zsh", "ksh"}
+                            xargs_sh_script_idx: int | None = None
+                            if is_xargs_shell:
+                                xargs_sh_script_idx, xargs_sh_ambig_opt = _inspect_sh_options(
+                                    xargs_inner, xargs_inner_flags
+                                )
+                                if xargs_sh_ambig_opt:
+                                    return "safety_floor:shell_ambiguous_variable_expansion"
                             is_xargs_danger_sink = (
                                 xargs_cmd
                                 in {
@@ -9510,6 +11901,7 @@ def _check_deobfuscated_commands_impl(
                             upstream_critical_path: str | None = None
                             echo_samples: list[tuple[str | None, list[str]]] = []
                             echo_unsupported = False
+                            echo_unresolved_var = False
                             if needs_upstream:
                                 if stage_idx > 0 and (
                                     _advance_upstream_critical_path(
@@ -9542,8 +11934,9 @@ def _check_deobfuscated_commands_impl(
                                     stage_idx > 0
                                     or inherited_echo_samples is not None
                                     or inherited_echo_unsupported
+                                    or inherited_echo_unresolved
                                 ):
-                                    echo_samples, echo_unsupported = (
+                                    echo_samples, echo_unsupported, echo_unresolved_var = (
                                         _collect_upstream_xargs_echo_samples(
                                             segment_source,
                                             stage_idx,
@@ -9557,12 +11950,22 @@ def _check_deobfuscated_commands_impl(
                                             has_for_keyword=has_for_keyword,
                                             inherited_echo_samples=inherited_echo_samples,
                                             inherited_unsupported=inherited_echo_unsupported,
+                                            inherited_unresolved_var=inherited_echo_unresolved,
                                             _step_budget=_step_budget,
                                             _char_budget=_char_budget,
+                                            group_echo_cache=group_echo_cache,
+                                            group_passthrough_cache=group_passthrough_cache,
+                                            group_may_passthrough_cache=(
+                                                group_may_passthrough_cache
+                                            ),
+                                            unwrap_cache=unwrap_cache,
+                                            split_cache=split_cache,
                                         )
                                     )
                                     if echo_unsupported:
                                         return "safety_floor:shell_complexity_budget_exceeded"
+                                    if echo_unresolved_var and not _is_embedded_fragment:
+                                        return "safety_floor:shell_ambiguous_variable_expansion"
                                     has_placeholder = xargs_replace_str is not None or any(
                                         "{}" in tok for tok in xargs_inner
                                     )
@@ -9600,11 +12003,27 @@ def _check_deobfuscated_commands_impl(
                                         )
                                         if comb_viol is not None:
                                             return comb_viol
-                            elif (
-                                is_xargs_shell
-                                and (script_idx := _find_sh_c_script_index(xargs_inner))
-                                is not None
-                            ):
+                                unres_viol = _check_unresolved_cmd_args(
+                                    "rm",
+                                    xargs_inner,
+                                    xargs_inner_flags,
+                                    has_upstream_crit=(upstream_critical_path is not None),
+                                    has_echo_samples=bool(echo_samples),
+                                    unquoted_flags=xargs_inner_unq_flags,
+                                )
+                                if unres_viol is not None:
+                                    return unres_viol
+                            elif is_xargs_shell and xargs_sh_script_idx is not None:
+                                script_idx = xargs_sh_script_idx
+                                if (
+                                    script_idx < len(xargs_inner_flags)
+                                    and xargs_inner_flags[script_idx]
+                                    and _SHELL_PURE_VAR_REF_RE.fullmatch(
+                                        xargs_inner[script_idx].strip()
+                                    )
+                                    is not None
+                                ):
+                                    return "safety_floor:shell_ambiguous_variable_expansion"
                                 if _cmd_depth >= 3:
                                     if _truncated_out is not None:
                                         _truncated_out[0] = True
@@ -9613,8 +12032,9 @@ def _check_deobfuscated_commands_impl(
                                     stage_idx > 0
                                     or inherited_echo_samples is not None
                                     or inherited_echo_unsupported
+                                    or inherited_echo_unresolved
                                 ):
-                                    echo_samples, echo_unsupported = (
+                                    echo_samples, echo_unsupported, echo_unresolved_var = (
                                         _collect_upstream_xargs_echo_samples(
                                             segment_source,
                                             stage_idx,
@@ -9628,12 +12048,22 @@ def _check_deobfuscated_commands_impl(
                                             has_for_keyword=has_for_keyword,
                                             inherited_echo_samples=inherited_echo_samples,
                                             inherited_unsupported=inherited_echo_unsupported,
+                                            inherited_unresolved_var=inherited_echo_unresolved,
                                             _step_budget=_step_budget,
                                             _char_budget=_char_budget,
+                                            group_echo_cache=group_echo_cache,
+                                            group_passthrough_cache=group_passthrough_cache,
+                                            group_may_passthrough_cache=(
+                                                group_may_passthrough_cache
+                                            ),
+                                            unwrap_cache=unwrap_cache,
+                                            split_cache=split_cache,
                                         )
                                     )
                                     if echo_unsupported:
                                         return "safety_floor:shell_complexity_budget_exceeded"
+                                    if echo_unresolved_var and not _is_embedded_fragment:
+                                        return "safety_floor:shell_ambiguous_variable_expansion"
                                 xargs_sample_candidates: list[str] = []
                                 seen_x_cand: set[str] = set()
                                 if upstream_critical_path is not None:
@@ -9646,8 +12076,9 @@ def _check_deobfuscated_commands_impl(
                                 if not xargs_sample_candidates:
                                     xargs_sample_candidates = ["/tmp/work"]
                                 extra_args = xargs_inner[script_idx + 1 :]
+                                extra_flags = xargs_inner_flags[script_idx + 1 :]
                                 if extra_args:
-                                    _step_budget[0] += len(extra_args)
+                                    _step_budget[0] += len(extra_args) * stage_loop_mult
                                     if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                         return "safety_floor:shell_complexity_budget_exceeded"
                                 for xargs_sample in xargs_sample_candidates:
@@ -9661,37 +12092,57 @@ def _check_deobfuscated_commands_impl(
                                         sub_cmd = _bounded_str_replace(
                                             sub_cmd, xargs_replace_str, xargs_sample, _char_budget
                                         )
+                                    resolved_flags = []
                                     if extra_args:
-                                        resolved_pos = [
-                                            (
-                                                _bounded_str_replace(
+                                        resolved_pos = []
+                                        for arg_idx_x, arg in enumerate(extra_args):
+                                            is_unres_x = (
+                                                arg_idx_x < len(extra_flags)
+                                                and extra_flags[arg_idx_x]
+                                            )
+                                            resolved_flags.append(is_unres_x)
+                                            if is_unres_x:
+                                                resolved_pos.append(_SHELL_AMBIGUOUS_VAR_SENTINEL)
+                                            elif xargs_replace_str and xargs_replace_str != "{}":
+                                                resolved_pos.append(
+                                                    _bounded_str_replace(
+                                                        _bounded_str_replace(
+                                                            arg, "{}", xargs_sample, _char_budget
+                                                        ),
+                                                        xargs_replace_str,
+                                                        xargs_sample,
+                                                        _char_budget,
+                                                    )
+                                                )
+                                            else:
+                                                resolved_pos.append(
                                                     _bounded_str_replace(
                                                         arg, "{}", xargs_sample, _char_budget
-                                                    ),
-                                                    xargs_replace_str,
-                                                    xargs_sample,
-                                                    _char_budget,
+                                                    )
                                                 )
-                                                if xargs_replace_str and xargs_replace_str != "{}"
-                                                else _bounded_str_replace(
-                                                    arg, "{}", xargs_sample, _char_budget
-                                                )
-                                            )
-                                            for arg in extra_args
-                                        ]
                                         if xargs_replace_str is None:
                                             resolved_pos = [
                                                 resolved_pos[0],
                                                 *resolved_pos[1:],
                                                 xargs_sample,
                                             ]
+                                            resolved_flags = [
+                                                resolved_flags[0],
+                                                *resolved_flags[1:],
+                                                False,
+                                            ]
                                     elif xargs_replace_str is None:
                                         resolved_pos = [xargs_sample, xargs_sample]
+                                        resolved_flags = [False, False]
                                     else:
                                         resolved_pos = []
+                                        resolved_flags = []
 
                                     sub_cmd = _replace_shell_positional_params(
-                                        sub_cmd, resolved_pos, _char_budget=_char_budget
+                                        sub_cmd,
+                                        resolved_pos,
+                                        pos_flags=resolved_flags,
+                                        _char_budget=_char_budget,
                                     )
                                     if (
                                         len(resolved_pos) > 1
@@ -9726,13 +12177,35 @@ def _check_deobfuscated_commands_impl(
                                                 )
                                             at_val = (
                                                 " ".join(
-                                                    shlex.quote(a) for a in resolved_pos[1:]
+                                                    (
+                                                        f'"{_SHELL_AMBIGUOUS_VAR_SENTINEL}"'
+                                                        if fl
+                                                        else shlex.quote(a)
+                                                    )
+                                                    for a, fl in zip(
+                                                        resolved_pos[1:],
+                                                        resolved_flags[1:],
+                                                        strict=True,
+                                                    )
                                                 )
                                                 if need_at
                                                 else None
                                             )
                                             star_val = (
-                                                " ".join(resolved_pos[1:]) if need_star else None
+                                                " ".join(
+                                                    (
+                                                        _SHELL_AMBIGUOUS_VAR_SENTINEL
+                                                        if fl
+                                                        else a
+                                                    )
+                                                    for a, fl in zip(
+                                                        resolved_pos[1:],
+                                                        resolved_flags[1:],
+                                                        strict=True,
+                                                    )
+                                                )
+                                                if need_star
+                                                else None
                                             )
                                             sub_cmd = _replace_shell_at_star_params(
                                                 sub_cmd,
@@ -9756,6 +12229,7 @@ def _check_deobfuscated_commands_impl(
                                         _ast_depth=_ast_depth,
                                         _positional_sample=pos_sample,
                                         _positional_samples=xargs_pos_samples,
+                                        _loop_multiplier=stage_loop_mult,
                                         _step_budget=_step_budget,
                                         _ast_step_budget=_ast_step_budget,
                                         _char_budget=_char_budget,
@@ -9765,12 +12239,21 @@ def _check_deobfuscated_commands_impl(
                                     if sub_violation is not None:
                                         return sub_violation
                             else:
+                                unres_viol = _check_unresolved_cmd_args(
+                                    xargs_cmd,
+                                    xargs_inner,
+                                    xargs_inner_flags,
+                                    has_upstream_crit=(upstream_critical_path is not None),
+                                )
+                                if unres_viol is not None:
+                                    return unres_viol
                                 if needs_upstream and (
                                     stage_idx > 0
                                     or inherited_echo_samples is not None
                                     or inherited_echo_unsupported
+                                    or inherited_echo_unresolved
                                 ):
-                                    echo_samples, echo_unsupported = (
+                                    echo_samples, echo_unsupported, echo_unresolved_var = (
                                         _collect_upstream_xargs_echo_samples(
                                             segment_source,
                                             stage_idx,
@@ -9784,12 +12267,26 @@ def _check_deobfuscated_commands_impl(
                                             has_for_keyword=has_for_keyword,
                                             inherited_echo_samples=inherited_echo_samples,
                                             inherited_unsupported=inherited_echo_unsupported,
+                                            inherited_unresolved_var=inherited_echo_unresolved,
                                             _step_budget=_step_budget,
                                             _char_budget=_char_budget,
+                                            group_echo_cache=group_echo_cache,
+                                            group_passthrough_cache=group_passthrough_cache,
+                                            group_may_passthrough_cache=(
+                                                group_may_passthrough_cache
+                                            ),
+                                            unwrap_cache=unwrap_cache,
+                                            split_cache=split_cache,
                                         )
                                     )
                                     if echo_unsupported and is_xargs_danger_sink:
                                         return "safety_floor:shell_complexity_budget_exceeded"
+                                    if (
+                                        echo_unresolved_var
+                                        and is_xargs_danger_sink
+                                        and not _is_embedded_fragment
+                                    ):
+                                        return "safety_floor:shell_ambiguous_variable_expansion"
                                 has_placeholder = xargs_replace_str is not None or any(
                                     "{}" in tok for tok in xargs_inner
                                 )
@@ -9870,27 +12367,49 @@ def _check_deobfuscated_commands_impl(
                         chmod_violation = _check_chmod_tokens(tokens)
                         if chmod_violation is not None:
                             return chmod_violation
+                        unres_viol = _check_unresolved_cmd_args(
+                            "chmod", tokens, unresolved_flags
+                        )
+                        if unres_viol is not None:
+                            return unres_viol
 
                     elif cmd in {"sh", "bash", "dash", "zsh", "ksh"}:
                         if stage_idx > 0:
                             return "safety_floor:shell_pipe_to_interpreter"
-                        if (script_idx := _find_sh_c_script_index(tokens)) is not None:
+                        top_sh_script_idx, sh_has_ambig_opt = _inspect_sh_options(
+                            tokens, unresolved_flags
+                        )
+                        if sh_has_ambig_opt:
+                            return "safety_floor:shell_ambiguous_variable_expansion"
+                        if top_sh_script_idx is not None:
+                            script_idx = top_sh_script_idx
+                            if (
+                                script_idx < len(unresolved_flags)
+                                and unresolved_flags[script_idx]
+                                and _SHELL_PURE_VAR_REF_RE.fullmatch(tokens[script_idx].strip())
+                                is not None
+                            ):
+                                return "safety_floor:shell_ambiguous_variable_expansion"
                             if _cmd_depth >= 3:
                                 if _truncated_out is not None:
                                     _truncated_out[0] = True
                                 return "safety_floor:shell_complexity_budget_exceeded"
                             sub_cmd = tokens[script_idx]
                             extra_args = tokens[script_idx + 1 :]
+                            extra_flags = unresolved_flags[script_idx + 1 :]
                             sh_pos_samples: list[str] = []
                             if extra_args:
-                                _step_budget[0] += len(extra_args)
+                                _step_budget[0] += len(extra_args) * stage_loop_mult
                                 if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
                                     return "safety_floor:shell_complexity_budget_exceeded"
                             _char_budget[0] += len(sub_cmd)
                             if _char_budget[0] > _MAX_SHELL_EXPANDED_CHARS:
                                 return "safety_floor:shell_complexity_budget_exceeded"
                             sub_cmd = _replace_shell_positional_params(
-                                sub_cmd, extra_args, _char_budget=_char_budget
+                                sub_cmd,
+                                extra_args,
+                                pos_flags=extra_flags,
+                                _char_budget=_char_budget,
                             )
                             if len(extra_args) > 1:
                                 if "$" in sub_cmd and ("@" in sub_cmd or "*" in sub_cmd):
@@ -9914,12 +12433,32 @@ def _check_deobfuscated_commands_impl(
                                         if _char_budget[0] + arg_chars > _MAX_SHELL_EXPANDED_CHARS:
                                             return "safety_floor:shell_complexity_budget_exceeded"
                                         at_val = (
-                                            " ".join(shlex.quote(a) for a in extra_args[1:])
+                                            " ".join(
+                                                (
+                                                    f'"{_SHELL_AMBIGUOUS_VAR_SENTINEL}"'
+                                                    if fl
+                                                    else shlex.quote(a)
+                                                )
+                                                for a, fl in zip(
+                                                    extra_args[1:],
+                                                    extra_flags[1:],
+                                                    strict=False,
+                                                )
+                                            )
                                             if need_at
                                             else None
                                         )
                                         star_val = (
-                                            " ".join(extra_args[1:]) if need_star else None
+                                            " ".join(
+                                                (_SHELL_AMBIGUOUS_VAR_SENTINEL if fl else a)
+                                                for a, fl in zip(
+                                                    extra_args[1:],
+                                                    extra_flags[1:],
+                                                    strict=False,
+                                                )
+                                            )
+                                            if need_star
+                                            else None
                                         )
                                         sub_cmd = _replace_shell_at_star_params(
                                             sub_cmd,
@@ -9928,13 +12467,19 @@ def _check_deobfuscated_commands_impl(
                                             quote_at=False,
                                             _char_budget=_char_budget,
                                         )
-                                sh_pos_samples = list(extra_args[1:])
+                                sh_pos_samples = [
+                                    (_SHELL_AMBIGUOUS_VAR_SENTINEL if fl else a)
+                                    for a, fl in zip(
+                                        extra_args[1:], extra_flags[1:], strict=False
+                                    )
+                                ]
                             sub_violation = _check_expanded_subcommand(
                                 sub_cmd,
                                 _cmd_depth=_cmd_depth,
                                 _ast_depth=_ast_depth,
                                 _positional_sample=sh_pos_samples[0] if sh_pos_samples else None,
                                 _positional_samples=sh_pos_samples or None,
+                                _loop_multiplier=stage_loop_mult,
                                 _step_budget=_step_budget,
                                 _ast_step_budget=_ast_step_budget,
                                 _char_budget=_char_budget,
@@ -9957,6 +12502,13 @@ def _check_deobfuscated_commands_impl(
                         )
                         if py_violation is not None:
                             return py_violation
+                        py_script_idx, _ = _find_python_c_script(tokens)
+                        if (
+                            py_script_idx is not None
+                            and py_script_idx < len(unresolved_flags)
+                            and unresolved_flags[py_script_idx]
+                        ):
+                            return "safety_floor:shell_ambiguous_variable_expansion"
 
             if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
                 expect_case_pattern = True
@@ -9973,6 +12525,7 @@ def _check_text_against_safety_patterns(
     _char_budget: list[int] | None = None,
     _seen_texts: set[str] | None = None,
     _truncated_out: list[bool] | None = None,
+    _is_embedded_fragment: bool = False,
 ) -> str | None:
     if _step_budget is None:
         _step_budget = [0]
@@ -10006,6 +12559,7 @@ def _check_text_against_safety_patterns(
         _char_budget=_char_budget,
         _seen_texts=_seen_texts,
         _truncated_out=_truncated_out,
+        _is_embedded_fragment=_is_embedded_fragment,
     )
 
 
@@ -10090,6 +12644,8 @@ def safety_floor(tool_id: str, arguments: Mapping[str, Any] | str | None) -> str
                     seen_emb.add(item)
                     embedded.append(item)
         for emb in embedded:
+            if _SHELL_PURE_VAR_REF_RE.fullmatch(emb.strip()) is not None:
+                continue
             deobf_emb = _deobfuscate_shell(emb)
             emb_candidates = (emb,) if deobf_emb == emb else (emb, deobf_emb)
             for candidate in emb_candidates:
@@ -10102,6 +12658,7 @@ def safety_floor(tool_id: str, arguments: Mapping[str, Any] | str | None) -> str
                     _ast_step_budget=ast_step_budget,
                     _char_budget=shell_char_budget,
                     _seen_texts=seen_texts,
+                    _is_embedded_fragment=True,
                 )
                 if violation is not None:
                     return violation

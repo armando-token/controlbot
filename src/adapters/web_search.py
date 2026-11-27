@@ -72,7 +72,7 @@ class EgressGuard:
         allow_loopback_for_tests: bool = False,
     ) -> None:
         self._allowed_domains = tuple(
-            d.strip().lower().lstrip(".") for d in allowed_domains if d.strip()
+            d.strip().lower().strip(".") for d in allowed_domains if d.strip(".")
         )
         self._allow_loopback_for_tests = allow_loopback_for_tests
 
@@ -82,7 +82,7 @@ class EgressGuard:
         scheme = parsed.scheme.lower()
         if scheme not in {"http", "https"}:
             raise EgressBlockedError(f"Blocked URL scheme {scheme!r}; only http/https allowed.")
-        host = (parsed.hostname or "").strip().lower()
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
         if not host:
             raise EgressBlockedError(f"Blocked URL without hostname: {url!r}")
 
@@ -98,19 +98,22 @@ class EgressGuard:
         return clean
 
     def _is_forbidden_host(self, host: str) -> bool:
+        normalized = host.strip().lower().rstrip(".")
+        if not normalized:
+            return True
         try:
-            ip = ipaddress.ip_address(host)
+            ip = ipaddress.ip_address(normalized)
             return self._is_forbidden_ip(ip)
         except ValueError:
             pass
 
-        if host in {"localhost", "localhost.localdomain"} or host.endswith(
-            (".local", ".lan", ".internal", ".intranet")
+        if normalized in {"localhost", "localhost.localdomain"} or normalized.endswith(
+            (".localhost", ".localhost.localdomain", ".local", ".lan", ".internal", ".intranet")
         ):
             return not self._allow_loopback_for_tests
 
         try:
-            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+            infos = socket.getaddrinfo(normalized, None, proto=socket.IPPROTO_TCP)
         except OSError:
             return False
         for info in infos:
@@ -224,10 +227,12 @@ class HttpWebFetcher:
         self._guard = egress_guard or EgressGuard()
         self._timeout_s = timeout_s
         self._transport = transport
-        self._oem_domains = tuple(d.strip().lower().lstrip(".") for d in oem_domains if d.strip())
+        self._oem_domains = tuple(
+            d.strip().lower().strip(".") for d in oem_domains if d.strip(".")
+        )
 
     def _is_oem_url(self, url: str) -> bool:
-        host = (urlparse(url).hostname or "").strip().lower()
+        host = (urlparse(url).hostname or "").strip().lower().rstrip(".")
         return any(host == d or host.endswith(f".{d}") for d in self._oem_domains)
 
     async def fetch(self, url: str, *, is_primary_oem: bool | None = None) -> WebPageExtract:

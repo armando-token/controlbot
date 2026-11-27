@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import ipaddress
+import math
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -70,6 +71,30 @@ _EXTRACT_JS = r"""(maxElements) => {
 def _scrub_browser_str(value: str) -> str:
     scrubbed = str(redact_payload_strict(value))
     return _INLINE_TOKEN_RE.sub("[REDACTED]", scrubbed)
+
+
+def _coerce_finite_float(value: Any, *, field: str) -> float:
+    """Coerce a JSON scalar to a finite float, rejecting None, bools, and non-finite values."""
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number.")
+    if isinstance(value, (int, float)):
+        try:
+            num = float(value)
+        except OverflowError as exc:
+            raise ValueError(f"{field} must be a finite number.") from exc
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{field} must be a finite number.")
+        try:
+            num = float(stripped)
+        except ValueError as exc:
+            raise ValueError(f"{field} must be a finite number.") from exc
+    else:
+        raise ValueError(f"{field} must be a finite number.")
+    if not math.isfinite(num):
+        raise ValueError(f"{field} must be a finite number.")
+    return num
 _WELCOME_HTML = (
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<style>body{font-family:-apple-system,system-ui,sans-serif;background:#f8fafc;color:#0f172a;"
@@ -450,8 +475,10 @@ class LiveBrowserController:
     async def _apply_input_unlocked(self, page: Page, event: dict[str, Any]) -> None:
         ev_type = str(event.get("type", "")).strip().lower()
         if ev_type == "click":
-            x = max(0.0, min(float(_VIEWPORT_WIDTH), float(event.get("x", 0.0))))
-            y = max(0.0, min(float(_VIEWPORT_HEIGHT), float(event.get("y", 0.0))))
+            x_val = _coerce_finite_float(event.get("x", 0.0), field="x")
+            y_val = _coerce_finite_float(event.get("y", 0.0), field="y")
+            x = max(0.0, min(float(_VIEWPORT_WIDTH), x_val))
+            y = max(0.0, min(float(_VIEWPORT_HEIGHT), y_val))
             raw_btn = str(event.get("button", "left")).lower()
             btn: Literal["left", "middle", "right"] = (
                 "right"
@@ -460,13 +487,39 @@ class LiveBrowserController:
             )
             await page.mouse.click(x, y, button=btn)
         elif ev_type == "dblclick":
-            x = max(0.0, min(float(_VIEWPORT_WIDTH), float(event.get("x", 0.0))))
-            y = max(0.0, min(float(_VIEWPORT_HEIGHT), float(event.get("y", 0.0))))
+            x_val = _coerce_finite_float(event.get("x", 0.0), field="x")
+            y_val = _coerce_finite_float(event.get("y", 0.0), field="y")
+            x = max(0.0, min(float(_VIEWPORT_WIDTH), x_val))
+            y = max(0.0, min(float(_VIEWPORT_HEIGHT), y_val))
             await page.mouse.dblclick(x, y)
+        elif ev_type == "move":
+            x_val = _coerce_finite_float(event.get("x", 0.0), field="x")
+            y_val = _coerce_finite_float(event.get("y", 0.0), field="y")
+            x = max(0.0, min(float(_VIEWPORT_WIDTH), x_val))
+            y = max(0.0, min(float(_VIEWPORT_HEIGHT), y_val))
+            await page.mouse.move(x, y)
         elif ev_type == "wheel":
-            dx = float(event.get("dx", 0.0))
-            dy = float(event.get("dy", 0.0))
+            if "x" in event:
+                _coerce_finite_float(event["x"], field="x")
+            if "y" in event:
+                _coerce_finite_float(event["y"], field="y")
+            dx = _coerce_finite_float(event.get("dx", 0.0), field="dx")
+            dy = _coerce_finite_float(event.get("dy", 0.0), field="dy")
             await page.mouse.wheel(dx, dy)
+        elif ev_type == "scroll":
+            if "x" in event:
+                _coerce_finite_float(event["x"], field="x")
+            if "y" in event:
+                _coerce_finite_float(event["y"], field="y")
+            delta_x = _coerce_finite_float(
+                event.get("delta_x", event.get("dx", 0.0)),
+                field="delta_x",
+            )
+            delta_y = _coerce_finite_float(
+                event.get("delta_y", event.get("dy", 0.0)),
+                field="delta_y",
+            )
+            await page.mouse.wheel(delta_x, delta_y)
         elif ev_type == "type":
             text = str(event.get("text", ""))
             if text:

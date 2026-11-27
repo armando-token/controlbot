@@ -1051,7 +1051,7 @@ async def test_t1_server_group_mentions_handoff_and_app_toggles(
 
 
 async def test_t1_server_draft_webhook_delivery_hmac_signature(
-    server: IsolatedServer,
+    server_factory: Callable[..., IsolatedServer],
 ) -> None:
     received: list[dict[str, Any]] = []
     wh_app = FastAPI()
@@ -1068,7 +1068,11 @@ async def test_t1_server_draft_webhook_delivery_hmac_signature(
         )
         return JSONResponse({"ok": True})
 
-    async with _run_loopback_app(wh_app) as wh_origin, server.async_client() as aclient:
+    srv = server_factory(
+        extra_env={"GROKBOT_ALLOW_LOOPBACK_WEBHOOKS": "1"},
+        name="t1_draft_wh",
+    )
+    async with _run_loopback_app(wh_app) as wh_origin, srv.async_client() as aclient:
         receiver_url = f"{wh_origin}/webhook-receiver"
         create_resp = await aclient.post(
             "/api/v1/drafts",

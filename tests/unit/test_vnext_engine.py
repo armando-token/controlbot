@@ -2711,6 +2711,15 @@ def test_safety_floor_apostrophe_prompts_and_all_challenger_bypasses() -> None:
             ),
             ("xargs_pipe_1500_safe", ("(" * 1500) + "echo ok" + (") | xargs rm -rf" * 1500), False),
             ("xargs_pipe_1500_crit", ("(" * 1500) + "echo /" + (") | xargs rm -rf" * 1500), True),
+            ("xargs_pipe_3000_safe", ("(" * 3000) + "echo ok" + (") | xargs rm -rf" * 3000), False),
+            ("xargs_pipe_3000_crit", ("(" * 3000) + "echo /" + (") | xargs rm -rf" * 3000), True),
+            ("pipe_cat_xargs_60_safe", "echo ok" + (" | cat" * 60) + " | xargs rm -rf", False),
+            ("pipe_cat_xargs_60_crit", "echo /" + (" | cat" * 60) + " | xargs rm -rf", True),
+            (
+                "unicode_i_dot_xargs_pipe_1500_safe",
+                "\u0130 >/dev/null && " + ("(" * 1500) + "echo ok" + (") | xargs rm -rf" * 1500),
+                False,
+            ),
         ):
             signal.alarm(2)
             t0 = time.monotonic()
@@ -4590,4 +4599,821 @@ async def test_lane_router_bare_number_revisa_el_34_needs_clarification() -> Non
     d_noun = await router.route("bomba 34", facility_config=cfg)
     assert d_noun.lane == Lane.INDUSTRIAL
     assert d_noun.needs_clarification is False
+
+
+@pytest.mark.n1
+def test_policy_gateway_unicode_and_p1_to_p4_regressions() -> None:
+    """Verify Unicode U+0130 offset mapping and P1-P4 shell bypass regressions (<0.8s)."""
+    gw = PolicyGateway(
+        PolicySet(
+            policy_version="2.0",
+            rules=(
+                PolicyRule(
+                    rule_id="allow-general-write",
+                    effect="allow",
+                    action_pattern=r"bash\.exec",
+                    lanes=(Lane.GENERAL,),
+                    max_risk="write",
+                ),
+            ),
+        )
+    )
+
+    blocked_cases: tuple[tuple[str, str, str], ...] = (
+        ("UNICODE_I_RM", "\u0130; rm -rf /", "safety_floor:destructive_rm_root_or_glob"),
+        (
+            "UNICODE_I_QUOTED_XARGS",
+            '\u0130 >/dev/null; echo / | "xargs" rm -rf',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "UNICODE_I_CHMOD",
+            "\u0130; chmod -R 777 /",
+            "safety_floor:destructive_chmod_777_root",
+        ),
+        (
+            "UNICODE_I_CAT_XARGS",
+            "\u0130; echo / | cat | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P1_SUBSHELL_COMMENT",
+            "(echo / | xargs rm -rf) # comment",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P1_BRACE_COMMENT",
+            "{ echo / | xargs rm -rf; } # comment",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P1_FOR_COMMENT",
+            "(for x in /; do rm -r -f $x; done) # comment",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P1_REDIR_COMMENT",
+            "(echo / | xargs rm -rf) 2>/dev/null # comment",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P1_TIGHT_COMMENT",
+            "(echo / | xargs rm -rf)#comment",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P1_MULTILINE_COMMENT_CMD",
+            "(echo ok) # comment\nrm -rf /",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P2_SPLIT_QUOTED_XARGS",
+            'echo "-rf" | ( x"a"r\'g\'s rm / )',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_FOR_XARGS",
+            "for x in /; do echo $x; done | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_FOR_SUBSHELL_XARGS",
+            "for x in /; do (echo $x); done | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_FOR_BRACE_XARGS",
+            "for x in /; do { echo $x; }; done | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_FOR_INNER_PIPE_XARGS",
+            "for x in /; do echo $x | cat; done | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_FOR_CAT_XARGS",
+            "for x in /; do echo $x; done | cat | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_FOR_SUBSHELL_SINK",
+            "for x in /; do echo $x; done | (xargs rm -rf)",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_IF_XARGS",
+            "if true; then echo /; fi | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_WHILE_XARGS",
+            "while true; do echo /; done | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P3_CASE_XARGS",
+            "case a in a) echo /;; esac | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "P4_VISITED_CAP_65",
+            ("(" * 65) + "echo ok" + (") | cat" * 64) + ") | xargs rm -rf",
+            "safety_floor:shell_complexity_budget_exceeded",
+        ),
+    )
+
+    benign_cases: tuple[tuple[str, str], ...] = (
+        ("P1_BENIGN_SAFE_COMMENT", "(echo /tmp/safe | xargs rm -rf) # comment"),
+        ("P1_BENIGN_HASH_FILENAME", "echo ok >/dev/null#notcomment"),
+        ("P2_BENIGN_SPLIT_QUOTED", "echo \"/tmp/safe\" | ( x\"a\"r'g's rm -rf )"),
+        (
+            "P3_BENIGN_FOR_SHADOW_SAFE",
+            "for x in /; do (for x in /tmp/safe; do echo $x; done); done | xargs rm -rf",
+        ),
+        ("P3_BENIGN_FOR_SAFE", "for x in /tmp/safe; do echo $x; done | xargs rm -rf"),
+        (
+            "UNICODE_I_STRESS_1500",
+            "\u0130 >/dev/null && " + ("(" * 1500) + "echo ok" + (") | xargs rm -rf" * 1500),
+        ),
+    )
+
+    def _timeout_handler(signum: int, frame: object) -> None:
+        raise TimeoutError("safety_floor timed out")
+
+    prev_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    try:
+        for label, cmd, expected_viol in blocked_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert not dec.allowed, (label, call_mode)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res == expected_viol, (label, call_mode, res)
+
+        for label, cmd in benign_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert dec.allowed, (label, call_mode, dec)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res is None, (label, call_mode, res)
+    finally:
+        signal.signal(signal.SIGALRM, prev_handler)
+
+
+@pytest.mark.n1
+def test_policy_gateway_piped_compounds_and_var_expansion_regressions() -> None:
+    """Block mid-pipeline/downstream compound blocks and variable-expansion obfuscations (<0.8s)."""
+    gw = PolicyGateway(
+        PolicySet(
+            policy_version="2.0",
+            rules=(
+                PolicyRule(
+                    rule_id="allow-general-write",
+                    effect="allow",
+                    action_pattern=r"bash\.exec",
+                    lanes=(Lane.GENERAL,),
+                    max_risk="write",
+                ),
+            ),
+        )
+    )
+
+    blocked_cases: tuple[tuple[str, str, str], ...] = (
+        (
+            "C1_WHILE_READ_CAT_XARGS_RM",
+            'echo / | while read p; do echo "$p"; done | xargs rm -rf',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_PIPE_IF_CAT_XARGS_RM",
+            "echo / | if true; then cat; fi | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_PIPE_IF_XARGS_RM",
+            "echo / | if true; then xargs rm -rf; fi",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_FOR_PIPE_IF_XARGS_RM",
+            "for x in /; do echo $x; done | if true; then xargs rm -rf; fi",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_PIPE_BRACE_IF_CAT_XARGS_RM",
+            "echo / | { if true; then cat; fi; } | xargs rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_PIPE_IF_CAT_IF_XARGS_RM",
+            "echo / | if true; then cat; fi | if true; then xargs rm -rf; fi",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_PIPE_TIME_IF_XARGS_RM",
+            "echo / | time if true; then xargs rm -rf; fi",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_PIPE_IF_CAT_GIT_FORCE",
+            "echo --force | if true; then cat; fi | xargs -I% git push % origin main",
+            "safety_floor:destructive_db_or_git_wipe",
+        ),
+        (
+            "C1_PIPE_CASE_XARGS_RM",
+            "echo / | case ok in ok) xargs rm -rf ;; esac",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C1_UNCLOSED_PIPE_IF_XARGS",
+            "echo / | if true; then xargs rm -rf",
+            "safety_floor:ambiguous_piped_compound_shell",
+        ),
+        (
+            "C2_CMD_VAR_XARGS",
+            "cmd=xargs; echo / | $cmd rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_SUBSHELL_CMD_VAR_XARGS",
+            "echo / | ( cmd=xargs; $cmd rm -rf )",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_CONCAT_CMD_VARS",
+            "echo / | ( a=xa; b=rgs; $a$b rm -rf )",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_SUBSHELL_RM_VAR",
+            "echo / | ( r=rm; xargs $r -rf )",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_PATH_VAR_ECHO",
+            "p=/; echo $p | ( xargs rm -rf )",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_BRACED_CMD_VAR",
+            "cmd=xargs; echo / | ${cmd} rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_APPEND_CMD_VAR",
+            "a=xa; a+=rgs; echo / | $a rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_CMD_RM_STRING",
+            'cmd="rm -rf /"; $cmd',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_CONDITIONAL_BRANCH_ASSIGN",
+            "if true; then cmd=xargs; else cmd=ls; fi; echo / | $cmd rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_EXPORT_VAR_XARGS",
+            "export cmd=xargs; echo / | $cmd rm -rf",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_DQUOTE_VAR_ECHO",
+            'a=/; echo "$a" | xargs rm -rf',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_ALL_VARS_SUBSHELL_COMBO",
+            "p=/; cmd=xargs; r=rm; echo $p | ( $cmd $r -rf )",
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "C2_UNSET_VAR_XARGS",
+            'p=/tmp/safe; unset p; echo "$p" | xargs rm -rf',
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "C2_UNRESOLVED_CMD_HEAD",
+            "echo / | $unknown rm -rf",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "C2_UNRESOLVED_RM_ARG",
+            "rm -rf $unknown",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "C2_UNRESOLVED_SH_SCRIPT",
+            "bash -c $unknown",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+    )
+
+    safe_cases: tuple[tuple[str, str], ...] = (
+        ("SAFE_ECHO_HOME", "echo $HOME"),
+        ("SAFE_ECHO_HOME_XARGS_LS", "echo $HOME | xargs ls"),
+        ("SAFE_VAR_TMP_XARGS_RM", "p=/tmp/work; echo $p | xargs rm -rf"),
+        ("SAFE_DQUOTE_VAR_TMP", 'a=/tmp/safe; echo "$a" | xargs rm -rf'),
+        ("SAFE_TMP_IF_CAT_XARGS", "echo /tmp/safe | if true; then cat; fi | xargs rm -rf"),
+        (
+            "SAFE_TMP_WHILE_READ_XARGS",
+            'echo /tmp/safe | while read p; do echo "$p"; done | xargs rm -rf',
+        ),
+        (
+            "SAFE_FOR_IF_TMP",
+            "for x in /tmp/safe; do echo $x; done | if true; then xargs rm -rf; fi",
+        ),
+        ("SAFE_CMD_LS_VAR", "cmd=ls; $cmd -la /tmp"),
+        ("SAFE_CONCAT_ECHO", "a=ec; b=ho; $a$b hello"),
+        ("SAFE_IF_COND_TMP", "if true; then p=/tmp/a; else p=/tmp/b; fi; echo $p | xargs rm -rf"),
+        ("SAFE_UNSET_ECHO", "p=/tmp/safe; unset p; echo $p"),
+        ("SAFE_UNICODE_I_1500", ("İ " * 1_500) + "echo ok | xargs ls"),
+        ("SAFE_XARGS_PIPE_3000", ("echo /tmp/safe | cat | " * 1_500) + "xargs rm -rf"),
+        (
+            "SAFE_FOR_400_VARS",
+            "; ".join(f"for v{i} in a; do echo $v{i}" for i in range(400)) + ("; done" * 400),
+        ),
+    )
+
+    def _timeout_handler(signum: int, frame: object) -> None:
+        raise TimeoutError("safety_floor timed out")
+
+    prev_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    try:
+        for label, cmd, expected_viol in blocked_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert not dec.allowed, (label, call_mode)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res == expected_viol, (label, call_mode, res)
+
+        for label, cmd in safe_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert dec.allowed, (label, call_mode, dec)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res is None, (label, call_mode, res)
+    finally:
+        signal.signal(signal.SIGALRM, prev_handler)
+
+
+@pytest.mark.n1
+def test_policy_gateway_class2_fail_closed_regressions() -> None:
+    """Enforce fail-closed Class 2 variable expansion and preserve benign controls (<0.8s)."""
+    gw = PolicyGateway(
+        PolicySet(
+            policy_version="2.0",
+            rules=(
+                PolicyRule(
+                    rule_id="allow-general-write",
+                    effect="allow",
+                    action_pattern=r"bash\.exec",
+                    lanes=(Lane.GENERAL,),
+                    max_risk="write",
+                ),
+            ),
+        )
+    )
+
+    blocked_cases: tuple[tuple[str, str, str], ...] = (
+        (
+            "bug_a_cmd_assign",
+            "r=$u; $r -r -f /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_pipe_cmd_assign",
+            "r=$u; echo / | $r rm -r -f",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_xargs_cmd_assign",
+            "r=$u\necho / | xargs $r -r -f",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_rm_arg_newline",
+            "p=$u\nrm -r -f $p",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_pipe_xargs",
+            "p=$u; echo $p | xargs rm -r -f",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_chmod_newline",
+            "p=$u\nchmod -R 777 $p",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_bash_c_dquote",
+            'bash -c "r=$u; $r -r -f /"',
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_bash_c_pos",
+            "bash -c 'c=$1; $c -r -f /' _ \"$unknown\"",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_bash_c_quoted_pos",
+            "bash -c 'c=\"$1\"; $c -r -f /' _ \"$unknown\"",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_bash_c_rm_pos",
+            'bash -c \'p=$1\nrm -r -f "$p"\' _ "$unknown"',
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_bash_c_at",
+            "bash -c 'rm -r -f \"$@\"' _ \"$unknown\"",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_for_unres",
+            "for x in $u; do rm -r -f $x; done",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_a_while_read_unres",
+            "echo $u | while read p; do rm -r -f $p; done",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_indirect_rf",
+            "a=rm; b=a; ${!b} -rf /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_indirect",
+            "a=rm; b=a; ${!b} -r -f /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_indirect_head_u",
+            "${!u} -r -f /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_indirect_unres",
+            "rm -r -f ${!u}",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_indirect_pipe",
+            "echo / | ${!u} rm -r -f",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_indirect_bash_c",
+            "bash -c 'a=rm; b=a; ${!b} -r -f /'",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_len_head",
+            "${#u} -r -f /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_pos1_head",
+            "$1 -r -f /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_pos1_brace_head",
+            "${1} -r -f /",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_at_head",
+            '"$@" -r -f /',
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_star_head",
+            '"$*" -r -f /',
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_b_dd_unres",
+            "dd if=/dev/zero $u",
+            "safety_floor:shell_ambiguous_variable_expansion",
+        ),
+        (
+            "bug_c_echo_var",
+            'a="echo /"; $a | xargs rm -r -f',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "bug_c_cat_var",
+            'a="echo /"; b="cat -n"; $a | $b | xargs rm -r -f',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "bug_c_group_echo_var",
+            'a="echo /"; { $a; } | xargs rm -r -f',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "bug_c_group_cat_var",
+            'a="echo /"; b="cat -n"; $a | { $b; } | xargs rm -r -f',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+        (
+            "bug_c_empty_quote_prefix",
+            'a="echo /"; ""$a | xargs rm -r -f',
+            "safety_floor:destructive_rm_root_or_glob",
+        ),
+    )
+
+    benign_controls: tuple[tuple[str, str], ...] = (
+        ("BENIGN_ECHO_HOME", "echo $HOME"),
+        ("BENIGN_PRICE_5", 'echo "price is $5"'),
+        ("BENIGN_LS_STATUS", "ls /tmp; echo $?"),
+        ("BENIGN_ECHO_PID", "echo $$"),
+        ("BENIGN_INDIRECT_ECHO", 'a=hello; b=a; echo "${!b}"'),
+        ("BENIGN_FOR_SAFE_XARGS", "for x in /tmp/safe; do echo $x; done | xargs rm -rf"),
+        (
+            "BENIGN_LOOP_ALIAS_SHADOW_SAFE",
+            "for x in /; do (for x in /tmp/safe; do echo $x; done); done | xargs rm -rf",
+        ),
+        (
+            "BENIGN_MULTIWORD_SAFE_XARGS",
+            'a="echo /tmp/safe"; b="cat -n"; $a | $b | xargs rm -r -f',
+        ),
+        ("BENIGN_BASH_C_ECHO_HOME", "bash -c 'echo \"$1\"' _ \"$HOME\""),
+        (
+            "BENIGN_FOR_400_VARS_400_STAGES",
+            "; ".join(f"for v{i} in a; do echo $v{i}" for i in range(400)) + ("; done" * 400),
+        ),
+    )
+
+    def _timeout_handler(signum: int, frame: object) -> None:
+        raise TimeoutError("safety_floor timed out")
+
+    prev_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    try:
+        for label, cmd, expected_viol in blocked_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert not dec.allowed, (label, call_mode)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res == expected_viol, (label, call_mode, res)
+
+        for label, cmd in benign_controls:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert dec.allowed, (label, call_mode, dec)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res is None, (label, call_mode, res)
+    finally:
+        signal.signal(signal.SIGALRM, prev_handler)
+
+
+@pytest.mark.n1
+def test_policy_gateway_class2_star_shopt_rm_regressions() -> None:
+    """Enforce fail-closed Class 2 '$*', sh/bash option-position, and bare 'rm $u' probes."""
+    gw = PolicyGateway(
+        PolicySet(
+            policy_version="2.0",
+            rules=(
+                PolicyRule(
+                    rule_id="allow-general-write",
+                    effect="allow",
+                    action_pattern=r"bash\.exec",
+                    lanes=(Lane.GENERAL,),
+                    max_risk="write",
+                ),
+            ),
+        )
+    )
+
+    blocked_cases: tuple[tuple[str, str], ...] = (
+        ("star_bash_c_u", 'bash -c \'rm -rf "$*"\' _ "$u"'),
+        ("star_bash_c_safe_u", 'bash -c \'rm -rf "$*"\' _ /tmp/safe "$u"'),
+        ("star_find_exec_u", r'''find /tmp -exec sh -c 'rm -rf "$*"' _ "$u" \;'''),
+        ("star_find_exec_brace_u", r'''find /tmp -exec sh -c 'rm -rf "$*"' _ {} "$u" \;'''),
+        ("star_xargs_replace_u", 'echo /tmp/safe | xargs -I{} sh -c \'rm -rf "$*"\' _ "$u"'),
+        ("star_xargs_u", 'echo /tmp/safe | xargs sh -c \'rm -rf "$*"\' _ "$u"'),
+        (
+            "star_xargs_replace_brace_u",
+            'echo /tmp/safe | xargs -I{} sh -c \'rm -rf "$*"\' _ {} "$u"',
+        ),
+        ("star_brace_bash_c_u", 'bash -c \'rm -rf "${*}"\' _ "$u"'),
+        ("shopt_bash_assign_u", "bash $u 'r=$x; $r -r -f /'"),
+        ("shopt_bash_rm_u", "bash $u 'rm -r -f $x'"),
+        ("shopt_sh_assign_u", "sh $u 'r=$x; $r -r -f /'"),
+        ("shopt_dash_rm_u", "dash $u 'rm -r -f $x'"),
+        ("shopt_bash_e_rm_u", "bash -e $u 'rm -r -f $x'"),
+        ("shopt_find_exec_sh_u", r"find /tmp/safe -exec sh $u 'rm -r -f $x' \;"),
+        ("shopt_xargs_sh_u", "echo /tmp/safe | xargs sh $u 'rm -r -f $x'"),
+        ("shopt_bash_o_u_c", "bash -o $u -c 'rm -r -f $x'"),
+        ("shopt_bash_rcfile_u", "bash --rcfile $u -c 'rm -r -f $x'"),
+        ("shopt_bash_dd_u", "bash -- $u"),
+        ("rm_bare_u", "rm $u"),
+        ("rm_bare_u_v", "rm $u $v"),
+        ("rm_quoted_u_v", 'rm "$u" "$v"'),
+        ("rm_unquoted_tmp_u", "rm /tmp/$u"),
+        ("rm_find_exec_u", r"find /tmp/safe -exec rm $u \;"),
+        ("rm_xargs_u", "echo /tmp/safe | xargs rm $u"),
+    )
+
+    benign_controls: tuple[tuple[str, str], ...] = (
+        ("BENIGN_STAR_ECHO_HOME", 'bash -c \'echo "$*"\' _ "$HOME"'),
+        ("BENIGN_STAR_RM_TMP_SAFE", 'bash -c \'rm -rf "$*"\' _ /tmp/safe'),
+        ("BENIGN_BASH_SAFE_SCRIPT_HOME", 'bash /tmp/safe.sh "$HOME"'),
+        ("BENIGN_BASH_C_ECHO_1_HOME", 'bash -c \'echo "$1"\' _ "$HOME"'),
+        ("BENIGN_RM_TMP_SAFE", "rm -rf /tmp/safe"),
+        ("BENIGN_RM_QUOTED_TMP_NAME", 'rm /tmp/"$name"'),
+        ("BENIGN_RM_QUOTED_TMPDIR_FOO", 'rm "$TMPDIR/foo"'),
+    )
+
+    def _timeout_handler(signum: int, frame: object) -> None:
+        raise TimeoutError("safety_floor timed out")
+
+    prev_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    try:
+        for label, cmd in blocked_cases:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert not dec.allowed, (label, call_mode)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res == "safety_floor:shell_ambiguous_variable_expansion", (
+                    label,
+                    call_mode,
+                    res,
+                )
+
+        for label, cmd in benign_controls:
+            for call_mode in ("bash.exec", "turn.prompt", "decide"):
+                signal.alarm(2)
+                t0 = time.monotonic()
+                try:
+                    if call_mode == "bash.exec":
+                        res = safety_floor("bash.exec", {"command": cmd})
+                    elif call_mode == "turn.prompt":
+                        res = safety_floor("turn.prompt", {"prompt": cmd})
+                    else:
+                        dec = gw.decide(
+                            PolicyRequest(
+                                actor_id="u1",
+                                actor_role="operator",
+                                lane=Lane.GENERAL,
+                                tool_id="bash.exec",
+                                action_kind="write",
+                                arguments={"command": cmd},
+                            )
+                        )
+                        assert dec.allowed, (label, call_mode, dec)
+                        res = dec.safety_violation
+                finally:
+                    signal.alarm(0)
+                assert time.monotonic() - t0 < 0.8, (label, call_mode)
+                assert res is None, (label, call_mode, res)
+    finally:
+        signal.signal(signal.SIGALRM, prev_handler)
 

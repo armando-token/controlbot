@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import os
 import struct
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 # Standard VNC ~/.vnc/passwd obfuscation key (already in FIPS 46-3 MSB-first bit order,
 # matching TigerVNC/RealVNC d3des fixedkey {23, 82, 107, 6, 35, 78, 88, 7} bit-reversed).
@@ -148,11 +149,11 @@ class RfbHandshakeError(RuntimeError):
 
 
 class RfbWebSocketProtocol(Protocol):
-    """Minimal async binary WebSocket surface for RFB client handshake."""
+    """Minimal async WebSocket surface for RFB client handshake."""
 
     async def send_bytes(self, data: bytes) -> None: ...
 
-    async def receive_bytes(self) -> bytes: ...
+    async def receive(self) -> Mapping[str, Any]: ...
 
 
 def _reverse_bits(byte: int) -> int:
@@ -534,9 +535,12 @@ async def _ws_read_exact(
 ) -> bytes:
     """Read `count` bytes from binary WebSocket frames, keeping trailing bytes in `buf`."""
     while len(buf) < count:
-        chunk = await ws.receive_bytes()
-        if not chunk:
+        raw = await ws.receive()
+        if raw.get("type") == "websocket.disconnect":
             raise RfbHandshakeError("Client WebSocket closed during RFB handshake.")
+        chunk = raw.get("bytes")
+        if not isinstance(chunk, (bytes, bytearray)) or not chunk:
+            continue
         buf.extend(chunk)
     out = bytes(buf[:count])
     del buf[:count]

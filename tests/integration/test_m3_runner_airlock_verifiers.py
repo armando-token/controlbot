@@ -368,6 +368,7 @@ async def test_runner_runtime_hitl_resume_receipt_outcome_and_routine_await(
         # Resolve approval -> resumes Coordinator, awaits wait_for_run, posts final answer
         resolved = store.resolve_approval(appr["id"], "allow_once")
         await runner.on_approval_resolved(resolved, decision="allow_once")
+        await runner.wait_for_active_turn(thread_id)
 
         msgs, _ = store.list_thread_messages(thread_id)
         assert any("ALM-3401 verified" in str(m["content"]) for m in msgs)
@@ -422,6 +423,7 @@ async def test_runner_hitl_resume_error_not_swallowed_and_deny_cancels(tmp_path:
         appr = store.list_thread_approvals(thread_id)[0]
         resolved = store.resolve_approval(appr["id"], "allow_once")
         await runner.on_approval_resolved(resolved, decision="allow_once")
+        await runner.wait_for_active_turn(thread_id)
 
         msgs, _ = store.list_thread_messages(thread_id)
         err_msgs = [m for m in msgs if m["status"] == "error"]
@@ -817,6 +819,7 @@ async def test_runner_draft_delivery_real_webhook_and_smtp_server(
             "use_ssl": False,
             "from_addr": "bot@controlbot.local",
         },
+        allow_loopback_webhooks=True,
     )
 
     try:
@@ -1212,6 +1215,7 @@ async def test_runner_webhook_vault_secret_ref_and_redacted_fail_closed(
         live_browser=LiveBrowserController(profile_root=tmp_path / "browser"),
         coordinator=adapter,
         uploads_dir=tmp_path / "uploads",
+        allow_loopback_webhooks=True,
     )
     runner_injected = AgentTurnRunner(
         store=store,
@@ -1220,6 +1224,7 @@ async def test_runner_webhook_vault_secret_ref_and_redacted_fail_closed(
         coordinator=adapter,
         uploads_dir=tmp_path / "uploads",
         webhook_secrets={"app_webhooks": "injected_hmac_42"},
+        allow_loopback_webhooks=True,
     )
     try:
         async with smtp_server, run_asgi_server(wh_app) as wh_origin:

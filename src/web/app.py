@@ -83,6 +83,7 @@ from src.web.v1 import (
     create_computer_router,
     create_v1_router,
 )
+from src.web.v1.computer import coerce_finite_int
 from src.web.v1.memory_routes import create_memory_router
 from src.web.workspace import (
     default_agy_brain_root,
@@ -705,6 +706,7 @@ def create_app(
     web_token: str | None = None,
     allowed_cors_origins: Sequence[str] | None = None,
     rate_limits: Mapping[str, tuple[int, float]] | None = None,
+    allow_loopback_webhooks: bool = False,
 ) -> FastAPI:
     """Create the FastAPI local operator API & HTML observability UI."""
     resolved_db = Path(db_path) if db_path is not None else None
@@ -888,6 +890,10 @@ def create_app(
         store=workspace_store,
         state_dir=workspace_store.db_path.parent,
     )
+    effective_allow_loopback_webhooks = bool(allow_loopback_webhooks) or (
+        os.environ.get("GROKBOT_ALLOW_LOOPBACK_WEBHOOKS", "").strip().lower()
+        in {"1", "true", "yes"}
+    )
     v1_runner = AgentTurnRunner(
         store=workspace_store,
         event_bus=event_bus,
@@ -897,6 +903,7 @@ def create_app(
         memory_store=memory_store,
         computer_gateway=computer_gateway,
         facility_config=(active_runtime.facility_config if active_runtime is not None else None),
+        allow_loopback_webhooks=effective_allow_loopback_webhooks,
     )
 
     jinja_env = Environment(
@@ -1426,7 +1433,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="Action JSON object is required.")
         try:
             parsed = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid JSON body.") from exc
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=400, detail="Action payload must be a JSON object.")
@@ -1459,7 +1466,7 @@ def create_app(
                 parsed = json.loads(raw_body.decode("utf-8"))
                 if isinstance(parsed, dict) and isinstance(parsed.get("url"), str):
                     initial_url = parsed["url"]
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid JSON body.") from exc
         try:
             st = await live_browser.start(initial_url=initial_url)
@@ -1518,7 +1525,16 @@ def create_app(
 
         async def _reader() -> None:
             while True:
-                msg = await websocket.receive_json()
+                raw = await websocket.receive()
+                if raw.get("type") == "websocket.disconnect":
+                    break
+                raw_text = raw.get("text")
+                if not isinstance(raw_text, str):
+                    continue
+                try:
+                    msg = json.loads(raw_text)
+                except (json.JSONDecodeError, ValueError):
+                    continue
                 if not isinstance(msg, dict):
                     continue
                 ev_type = str(msg.get("type", "")).strip().lower()
@@ -1619,15 +1635,27 @@ def create_app(
 
         async def _ws_to_pty() -> None:
             while True:
-                msg = await websocket.receive_json()
+                raw = await websocket.receive()
+                if raw.get("type") == "websocket.disconnect":
+                    break
+                raw_text = raw.get("text")
+                if not isinstance(raw_text, str):
+                    continue
+                try:
+                    msg = json.loads(raw_text)
+                except (json.JSONDecodeError, ValueError):
+                    continue
                 if not isinstance(msg, dict):
                     continue
                 msg_type = str(msg.get("type", "")).strip().lower()
                 if msg_type == "input":
                     term.write(str(msg.get("data", "")))
                 elif msg_type == "resize":
-                    cols = int(msg.get("cols", 100))
-                    rows = int(msg.get("rows", 28))
+                    try:
+                        cols = coerce_finite_int(msg.get("cols", 100))
+                        rows = coerce_finite_int(msg.get("rows", 28))
+                    except (TypeError, ValueError, OverflowError):
+                        cols, rows = 100, 28
                     term.resize(cols=cols, rows=rows)
 
         out_task = asyncio.create_task(_pty_to_ws())

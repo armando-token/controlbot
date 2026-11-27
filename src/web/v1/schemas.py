@@ -109,6 +109,35 @@ class BotPatchRequest(V1Schema):
             return None
         return _strip_non_empty(value, "name")
 
+    @model_validator(mode="after")
+    def _reject_explicit_nulls(self) -> BotPatchRequest:
+        non_nullable = (
+            "name",
+            "role_prompt",
+            "about",
+            "avatar_shape",
+            "avatar_color",
+            "avatar_eyes_large",
+            "engine_id",
+            "model_id",
+            "thinking_level",
+            "pinned",
+            "hidden",
+            "is_primary",
+            "is_team_bot",
+            "unread_count",
+            "needs_attention",
+            "status_state",
+            "status_subtext",
+            "computer_active",
+            "timezone",
+            "drafts_enabled",
+        )
+        for field_name in non_nullable:
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(f"Field '{field_name}' must not be null.")
+        return self
+
 
 class SectionCreateRequest(V1Schema):
     name: str = Field(min_length=1, max_length=80)
@@ -438,6 +467,17 @@ class AutoReviewPutRequest(V1Schema):
             raise ValueError(
                 f"At most {MAX_AUTO_REVIEW_RULES_PER_BUCKET} ask_first rules are allowed."
             )
+        seen_ids: set[str] = set()
+        for r in self.rules:
+            if r.id is not None:
+                cleaned_id = r.id.strip()
+                if cleaned_id:
+                    if cleaned_id in seen_ids:
+                        raise ValueError(f"Duplicate auto-review rule id: {cleaned_id}")
+                    seen_ids.add(cleaned_id)
+                    r.id = cleaned_id
+                else:
+                    r.id = None
         return self
 
 
@@ -472,6 +512,22 @@ class RoutinePatchRequest(V1Schema):
         if value is None:
             return None
         return _strip_non_empty(value, "field")
+
+    @model_validator(mode="after")
+    def _reject_explicit_nulls(self) -> RoutinePatchRequest:
+        non_nullable = (
+            "name",
+            "instruction",
+            "schedule_type",
+            "timezone",
+            "enabled",
+            "visibility",
+            "regenerate_webhook_key",
+        )
+        for field_name in non_nullable:
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(f"Field '{field_name}' must not be null.")
+        return self
 
 
 class SkillCreateRequest(V1Schema):
