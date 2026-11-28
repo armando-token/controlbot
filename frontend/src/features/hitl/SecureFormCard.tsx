@@ -166,6 +166,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
 
   const anyPending =
     submitMutation.isPending || vaultFillMutation.isPending || cancelMutation.isPending;
+  const submitLabel = card.kind === 'secret' ? 'Save securely' : 'Fill directly';
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -276,6 +277,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
                   {selectedSecretId && (
                     <button
                       type="button"
+                      aria-label="Fill from Vault"
                       disabled={anyPending}
                       onClick={() => vaultFillMutation.mutate(selectedSecretId)}
                       className="px-3 py-1.5 rounded-lg text-[12.5px] font-medium text-white disabled:opacity-50"
@@ -299,6 +301,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
                   ? 'text'
                   : 'password'
                 : field.type || 'text';
+              const revealLabel = show ? 'Hide value' : 'Show value';
 
               return (
                 <div key={field.name}>
@@ -316,6 +319,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
                   <div className="relative">
                     <input
                       type={inputType}
+                      aria-label={`${field.label}`}
                       required={isRequired}
                       disabled={Boolean(selectedSecretId) || anyPending}
                       autoComplete="off"
@@ -337,7 +341,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
                         onClick={() =>
                           setRevealed((prev) => ({ ...prev, [field.name]: !prev[field.name] }))
                         }
-                        aria-label={show ? 'Hide value' : 'Show value'}
+                        aria-label={`${revealLabel}`}
                         className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-[var(--bg-subtle)] disabled:opacity-50"
                         style={{ color: 'var(--text-muted)' }}
                       >
@@ -354,6 +358,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
             <label className="inline-flex items-center gap-2 text-[12.5px] cursor-pointer select-none">
               <input
                 type="checkbox"
+                aria-label="Securely save to Bot's vault"
                 checked={saveToVault}
                 disabled={anyPending}
                 onChange={(e) => setSaveToVault(e.target.checked)}
@@ -368,6 +373,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
             {!selectedSecretId && (
               <button
                 type="submit"
+                aria-label={`${submitLabel}`}
                 disabled={anyPending}
                 className="px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium text-white disabled:opacity-50"
                 style={{ backgroundColor: 'var(--accent-computer)' }}
@@ -381,6 +387,7 @@ export const SecureFormCard: React.FC<SecureFormCardProps> = ({ card }) => {
             )}
             <button
               type="button"
+              aria-label="Cancel"
               disabled={anyPending}
               onClick={() => cancelMutation.mutate()}
               className="px-3 py-1.5 rounded-lg text-[12.5px] hover:bg-[var(--bg-subtle)] disabled:opacity-50"

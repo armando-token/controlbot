@@ -2,7 +2,27 @@ import React, { memo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Check, Copy } from 'lucide-react';
+import { computerApi } from '../lib/api';
 import { copyToClipboard, splitMarkdownBlocks } from '../lib/markdown';
+import { useComputerStore } from '../stores/computerStore';
+import { useUiStore } from '../stores/uiStore';
+
+function openUrlInLiveBrowser(href: string): void {
+  useComputerStore.getState().setPreferredSource('screencast');
+  useUiStore.getState().openInspectorTab('computer');
+  void computerApi
+    .action('default', { type: 'navigate', url: href })
+    .then((res) => {
+      useComputerStore.getState().setStatus(res.status);
+    })
+    .catch((err: unknown) => {
+      useUiStore.getState().pushToast({
+        tone: 'warn',
+        title: 'Could not open link in Live Browser',
+        description: err instanceof Error ? err.message : 'Navigation failed',
+      });
+    });
+}
 
 interface CodeBlockProps {
   className?: string;
@@ -23,6 +43,8 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ className, children }) => {
     }
   };
 
+  const copyLabel = copied ? 'Copied' : 'Copy';
+
   return (
     <div
       className="my-2.5 overflow-hidden rounded-xl"
@@ -42,6 +64,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ className, children }) => {
         <span className="font-mono uppercase tracking-wider text-[10.5px]">{lang}</span>
         <button
           type="button"
+          aria-label={`${copyLabel}`}
           onClick={() => void handleCopy()}
           className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md transition-colors hover:bg-white/10"
           style={{ color: copied ? '#4ADE80' : '#D1D5DB' }}
@@ -83,9 +106,36 @@ const MarkdownBlock = memo(function MarkdownBlock({ content }: { content: string
             </div>
           );
         },
-        a({ href, children, ...props }) {
+        a({ href, children, onClick, title, ...props }) {
+          const isHttpUrl = typeof href === 'string' && /^https?:\/\//i.test(href);
           return (
-            <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={
+                isHttpUrl
+                  ? 'Open in Live Browser (Ctrl/Cmd+Click for new tab)'
+                  : title
+              }
+              onClick={(e) => {
+                onClick?.(e);
+                if (
+                  !isHttpUrl ||
+                  e.defaultPrevented ||
+                  e.metaKey ||
+                  e.ctrlKey ||
+                  e.shiftKey ||
+                  e.altKey ||
+                  e.button !== 0
+                ) {
+                  return;
+                }
+                e.preventDefault();
+                openUrlInLiveBrowser(href);
+              }}
+              {...props}
+            >
               {children}
             </a>
           );

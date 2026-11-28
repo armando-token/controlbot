@@ -154,6 +154,11 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
     );
 
   const argEntries = Object.entries(card.arguments || {});
+  const allowLabel =
+    card.kind === 'terminal' || card.kind === 'ask_first' ? 'Allow' : 'Allow once';
+  const denyLabel =
+    card.kind === 'terminal' ? 'Skip' : card.kind === 'ask_first' ? 'Not now' : 'Deny';
+  const ruleLabel = card.kind === 'ask_first' ? 'Edit rule' : 'Manage rules';
 
   return (
     <div
@@ -260,6 +265,7 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
                 <>
                   <button
                     type="button"
+                    aria-label="Take over"
                     disabled={takeoverMutation.isPending}
                     onClick={() => takeoverMutation.mutate()}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium text-white transition-opacity disabled:opacity-50"
@@ -294,6 +300,7 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
                 <>
                   <button
                     type="button"
+                    aria-label="Connect"
                     disabled={resolveMutation.isPending}
                     onClick={() => resolveMutation.mutate('allow_once')}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium transition-opacity disabled:opacity-50"
@@ -319,6 +326,7 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
                 <>
                   <button
                     type="button"
+                    aria-label={`${allowLabel}`}
                     disabled={resolveMutation.isPending}
                     onClick={() => resolveMutation.mutate('allow_once')}
                     className="px-3 py-1.5 rounded-lg text-[12.5px] font-medium transition-opacity disabled:opacity-50"
@@ -337,6 +345,7 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
                   {showAlwaysAllow && (
                     <button
                       type="button"
+                      aria-label="Always allow"
                       disabled={resolveMutation.isPending}
                       onClick={() => resolveMutation.mutate('always_allow')}
                       className="px-3 py-1.5 rounded-lg text-[12.5px] font-medium transition-colors hover:bg-[var(--bg-subtle)] disabled:opacity-50"
@@ -351,6 +360,7 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
 
                   <button
                     type="button"
+                    aria-label={`${denyLabel}`}
                     disabled={resolveMutation.isPending}
                     onClick={() =>
                       resolveMutation.mutate(card.kind === 'terminal' ? 'skip' : 'deny')
@@ -370,6 +380,7 @@ export const ApprovalCard: React.FC<ApprovalCardProps> = ({ card, isGroupChannel
 
             <button
               type="button"
+              aria-label={`${ruleLabel}`}
               onClick={() => openSettings('general')}
               className="text-[12px] hover:underline"
               style={{ color: 'var(--text-muted)' }}

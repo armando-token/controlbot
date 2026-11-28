@@ -1494,7 +1494,7 @@ def create_computer_router(
         except DuplicateIdempotencyKeyError as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=str(exc),
+                detail=_scrub_str(str(exc)),
             ) from exc
         st = await _publish_computer_state(vm_id)
         return JSONResponse(status_code=status.HTTP_200_OK, content=st)
@@ -1703,7 +1703,7 @@ def create_computer_router(
         except OSError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot prepare upload directory: {exc}",
+                detail=_scrub_str(f"Cannot prepare upload directory: {exc}"),
             ) from exc
         if target.exists() and target.is_dir():
             raise HTTPException(
@@ -1732,7 +1732,7 @@ def create_computer_router(
                 target.unlink()
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to write uploaded file: {exc}",
+                detail=_scrub_str(f"Failed to write uploaded file: {exc}"),
             ) from exc
 
         rel_posix = target.resolve().relative_to(resolved_root).as_posix()
@@ -1758,7 +1758,7 @@ def create_computer_router(
         except OSError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot create directory: {exc}",
+                detail=_scrub_str(f"Cannot create directory: {exc}"),
             ) from exc
         rel_posix = target.resolve().relative_to(resolved_root).as_posix()
         return JSONResponse(
@@ -1797,7 +1797,7 @@ def create_computer_router(
         except OSError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot write file: {exc}",
+                detail=_scrub_str(f"Cannot write file: {exc}"),
             ) from exc
         rel_posix = target.resolve().relative_to(resolved_root).as_posix()
         return JSONResponse(
@@ -1833,7 +1833,7 @@ def create_computer_router(
         except OSError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot inspect path: {exc}",
+                detail=_scrub_str(f"Cannot inspect path: {exc}"),
             ) from exc
 
         try:
@@ -1858,7 +1858,7 @@ def create_computer_router(
         except OSError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot delete path: {exc}",
+                detail=_scrub_str(f"Cannot delete path: {exc}"),
             ) from exc
         return JSONResponse(status_code=status.HTTP_200_OK, content={"deleted": True})
 
@@ -2072,19 +2072,29 @@ def create_computer_router(
             return
         await websocket.accept()
 
+        def _scrub_screencast_payload(payload: dict[str, Any]) -> dict[str, Any]:
+            cleaned = dict(payload)
+            if isinstance(cleaned.get("url"), str):
+                cleaned["url"] = _scrub_str(cleaned["url"])
+            if isinstance(cleaned.get("title"), str):
+                cleaned["title"] = _scrub_str(cleaned["title"])
+            return cleaned
+
         async def _send_state_and_frame() -> None:
             b_st = await live_browser.status()
             await websocket.send_json(
-                {
-                    "type": "status",
-                    **b_st,
-                    "control_owner": gateway.get_control_owner(vm_id),
-                }
+                _scrub_screencast_payload(
+                    {
+                        "type": "status",
+                        **b_st,
+                        "control_owner": gateway.get_control_owner(vm_id),
+                    }
+                )
             )
             if b_st.get("running"):
                 frame = await live_browser.capture_frame()
                 if frame is not None:
-                    await websocket.send_json(frame)
+                    await websocket.send_json(_scrub_screencast_payload(frame))
 
         await _send_state_and_frame()
 
@@ -2190,7 +2200,7 @@ def create_computer_router(
                 if live_browser.running:
                     frame = await live_browser.capture_frame()
                     if frame is not None:
-                        await websocket.send_json(frame)
+                        await websocket.send_json(_scrub_screencast_payload(frame))
 
         reader_task: asyncio.Task[None] = asyncio.create_task(_reader())
         ticker_task: asyncio.Task[None] = asyncio.create_task(_ticker())

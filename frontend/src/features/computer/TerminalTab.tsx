@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { Ban, Eraser, RefreshCw, TerminalSquare } from 'lucide-react';
-import { computerApi, toWsUrl } from '../../lib/api';
+import { computerApi, legacyApi, toWsUrl } from '../../lib/api';
 import type { Bot } from '../../lib/types';
 
 const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000] as const;
@@ -23,11 +24,29 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
 }) => {
   const activeProject = (bot?.project_name ?? projectName ?? '').trim();
 
+  const systemInfoQuery = useQuery({
+    queryKey: ['system-info'],
+    queryFn: () => legacyApi.systemInfo(),
+    staleTime: 30_000,
+  });
+
+  const sysInfo = systemInfoQuery.data;
+  const backendMode = String(sysInfo?.backend_mode || 'local_http');
+  const llmOrigin = sysInfo?.llm_origin ? String(sysInfo.llm_origin) : '';
+  const isLocalHostOrigin =
+    !llmOrigin ||
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?$/i.test(llmOrigin);
+  const isLocalPty =
+    vmId === 'default' && (backendMode === 'local_http' || isLocalHostOrigin);
+  const terminalHostLabel = isLocalPty ? 'bot@local' : `bot@${vmId}`;
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const attemptRef = useRef(0);
+  const terminalHostLabelRef = useRef(terminalHostLabel);
+  terminalHostLabelRef.current = terminalHostLabel;
 
   const [status, setStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
@@ -147,7 +166,9 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
       setStatus('connecting');
       if (attemptRef.current === 0) {
         const label = activeProject ? ` (${activeProject})` : '';
-        termRef.current?.writeln(`\x1b[90mConnecting to bot@cloud:~${label} PTY...\x1b[0m`);
+        termRef.current?.writeln(
+          `\x1b[90mConnecting to ${terminalHostLabelRef.current}:~${label} PTY...\x1b[0m`,
+        );
       }
       try {
         const tokenRes = await computerApi.vncToken(vmId);
@@ -293,7 +314,7 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
           <div className="flex items-center gap-2 min-w-0">
             <TerminalSquare size={14} className="text-[#A78BFA] shrink-0" />
             <span className="font-mono truncate">
-              bot@cloud: ~{activeProject ? `/${activeProject}` : ''}
+              {terminalHostLabel}: ~{activeProject ? `/${activeProject}` : ''}
             </span>
             <span
               role="status"

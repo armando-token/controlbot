@@ -76,6 +76,9 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
   const [newSectionName, setNewSectionName] = useState('');
 
   const plusRef = useRef<HTMLDivElement | null>(null);
+  const plusTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const plusMenuOpenRef = useRef(plusMenuOpen);
+  plusMenuOpenRef.current = plusMenuOpen;
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -97,7 +100,11 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
     };
     const closeOnKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setPlusMenuOpen(false);
+        if (plusMenuOpenRef.current) {
+          e.preventDefault();
+          setPlusMenuOpen(false);
+          plusTriggerRef.current?.focus();
+        }
         setContextMenu(null);
       }
     };
@@ -246,6 +253,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
     const computerActive = live?.computerActive ?? bot.computer_active;
     const tooltip = live?.stepLabel || `${bot.name} · ${subtext}`;
     const isRenaming = renamingId === bot.id;
+    const botRowLabel = `${bot.name} — ${subtext}`;
 
     if (compact) {
       return (
@@ -342,6 +350,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
         ) : (
           <button
             type="button"
+            aria-label={`${botRowLabel}`}
             onClick={() =>
               setActiveTarget({ kind: 'bot', id: bot.id, threadId: bot.thread_id })
             }
@@ -416,6 +425,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
             type="button"
             onClick={(e) => openContext(e, 'bot', bot.id)}
             aria-label={`More options for ${bot.name}`}
+            aria-haspopup="menu"
             className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 p-1 rounded-md hover:bg-[var(--bg-canvas)] transition-opacity"
             style={{ color: 'var(--text-muted)' }}
           >
@@ -432,6 +442,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
     const memberBots = channel.bot_ids
       .map((id) => bots.find((b) => b.id === id))
       .filter((b): b is Bot => Boolean(b));
+    const channelRowLabel = `Group chat ${channel.name}`;
 
     if (compact) {
       return (
@@ -505,6 +516,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
         ) : (
           <button
             type="button"
+            aria-label={`${channelRowLabel}`}
             onClick={() =>
               setActiveTarget({ kind: 'channel', id: channel.id, threadId: channel.thread_id })
             }
@@ -539,6 +551,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
           type="button"
           onClick={(e) => openContext(e, 'channel', channel.id)}
           aria-label={`More options for ${channel.name}`}
+          aria-haspopup="menu"
           className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 p-1 mr-1 rounded-md hover:bg-[var(--bg-canvas)] transition-opacity"
           style={{ color: 'var(--text-muted)' }}
         >
@@ -554,6 +567,19 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
     contextMenu?.kind === 'channel'
       ? channels.find((c) => c.id === contextMenu.id)
       : null;
+  const unreadTitle = unreadOnly ? 'Showing unread only (click to show all)' : 'Filter unread';
+  const unreadLabel = unreadOnly ? 'Show all conversations' : 'Filter unread conversations';
+  const sidebarTitle = compact
+    ? 'Expand sidebar (Cmd/Ctrl+B)'
+    : 'Collapse sidebar (Cmd/Ctrl+B)';
+  const sidebarLabel = compact ? 'Expand sidebar' : 'Collapse sidebar';
+  const botPinLabel = contextBot?.pinned ? 'Unpin' : 'Pin to top';
+  const chanPinLabel = contextChannel?.pinned ? 'Unpin' : 'Pin to top';
+  const contextMenuLabel = contextBot
+    ? `Actions for ${contextBot.name}`
+    : contextChannel
+      ? `Actions for ${contextChannel.name}`
+      : 'Context menu';
 
   return (
     <aside
@@ -568,24 +594,26 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
         className={`flex items-center ${compact ? 'flex-col gap-2 py-3 px-2' : 'justify-between px-3 py-2.5'}`}
         style={{ borderBottom: '1px solid var(--border-subtle)' }}
       >
-        {!compact && (
+        {!compact ? (
           <div className="flex items-center gap-2 min-w-0">
             <BotAvatar shape="sparkle" color="#111318" size={22} />
-            <span
-              className="text-[14px] font-semibold tracking-tight truncate"
+            <h2
+              className="m-0 text-[14px] font-semibold tracking-tight truncate"
               style={{ color: 'var(--text-primary)' }}
             >
               Grok Bot
-            </span>
+            </h2>
           </div>
+        ) : (
+          <h2 className="sr-only">Grok Bot</h2>
         )}
 
         <div className={`flex items-center ${compact ? 'flex-col gap-1.5' : 'gap-1'}`}>
           <button
             type="button"
             onClick={toggleUnreadOnly}
-            title={unreadOnly ? 'Showing unread only (click to show all)' : 'Filter unread'}
-            aria-label={unreadOnly ? 'Show all conversations' : 'Filter unread conversations'}
+            title={`${unreadTitle}`}
+            aria-label={`${unreadLabel}`}
             aria-pressed={unreadOnly}
             className="p-1.5 rounded-lg transition-colors"
             style={{
@@ -598,6 +626,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
 
           <div className="relative" ref={plusRef}>
             <button
+              ref={plusTriggerRef}
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
@@ -605,6 +634,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
               }}
               title="New bot, group chat, or section (Cmd/Ctrl+N)"
               aria-label="New bot, group chat, or section"
+              aria-haspopup="menu"
               aria-expanded={plusMenuOpen}
               className="p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-subtle)]"
               style={{ color: 'var(--text-primary)' }}
@@ -614,6 +644,8 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
 
             {plusMenuOpen && (
               <div
+                role="menu"
+                aria-label="New item menu"
                 className="absolute left-0 sm:right-0 sm:left-auto top-full mt-1 w-48 py-1 rounded-xl z-40"
                 style={{
                   backgroundColor: 'var(--bg-elevated)',
@@ -672,8 +704,8 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
           <button
             type="button"
             onClick={toggleSidebar}
-            title={compact ? 'Expand sidebar (Cmd/Ctrl+B)' : 'Collapse sidebar (Cmd/Ctrl+B)'}
-            aria-label={compact ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={`${sidebarTitle}`}
+            aria-label={`${sidebarLabel}`}
             className="p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-subtle)]"
             style={{ color: 'var(--text-secondary)' }}
           >
@@ -769,12 +801,12 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
         {(pinnedBots.length > 0 || pinnedChannels.length > 0) && (
           <div>
             {!compact && (
-              <div
-                className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider"
+              <h3
+                className="m-0 px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider"
                 style={{ color: 'var(--text-muted)' }}
               >
                 Pinned
-              </div>
+              </h3>
             )}
             <div className="space-y-0.5">
               {pinnedBots.map(renderBotRow)}
@@ -819,6 +851,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
                   <>
                     <button
                       type="button"
+                      aria-label={`Toggle section ${section.name}`}
                       onClick={() =>
                         setCollapsedSections((prev) => ({
                           ...prev,
@@ -881,12 +914,12 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
         {directBotsNoSection.length > 0 && (
           <div>
             {!compact && (
-              <div
-                className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider"
+              <h3
+                className="m-0 px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider"
                 style={{ color: 'var(--text-muted)' }}
               >
                 Bots
-              </div>
+              </h3>
             )}
             <div className="space-y-0.5">{directBotsNoSection.map(renderBotRow)}</div>
           </div>
@@ -896,12 +929,12 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
         {channelsNoSection.length > 0 && (
           <div>
             {!compact && (
-              <div
-                className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider"
+              <h3
+                className="m-0 px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider"
                 style={{ color: 'var(--text-muted)' }}
               >
                 Group chats
-              </div>
+              </h3>
             )}
             <div className="space-y-0.5">{channelsNoSection.map(renderChannelRow)}</div>
           </div>
@@ -1019,6 +1052,8 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
       {contextMenu && (contextBot || contextChannel) && (
         <div
           ref={contextMenuRef}
+          role="menu"
+          aria-label={`${contextMenuLabel}`}
           className="fixed z-50 w-52 py-1 rounded-xl text-[13px]"
           style={{
             left: contextMenu.x,
@@ -1034,6 +1069,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
             <>
               <button
                 type="button"
+                aria-label={`${botPinLabel}`}
                 onClick={() => {
                   updateBotMutation.mutate({
                     id: contextBot.id,
@@ -1108,6 +1144,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
                     <button
                       key={sec.id}
                       type="button"
+                      aria-label={`Move bot to section ${sec.name}`}
                       onClick={() => {
                         updateBotMutation.mutate({
                           id: contextBot.id,
@@ -1157,6 +1194,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
             <>
               <button
                 type="button"
+                aria-label={`${chanPinLabel}`}
                 onClick={() => {
                   updateChannelMutation.mutate({
                     id: contextChannel.id,
@@ -1214,6 +1252,7 @@ export const BotRosterSidebar: React.FC<BotRosterSidebarProps> = ({
                     <button
                       key={sec.id}
                       type="button"
+                      aria-label={`Move group chat to section ${sec.name}`}
                       onClick={() => {
                         updateChannelMutation.mutate({
                           id: contextChannel.id,

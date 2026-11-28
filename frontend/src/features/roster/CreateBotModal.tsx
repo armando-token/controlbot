@@ -138,7 +138,8 @@ export const CreateBotModal: React.FC = () => {
                   key={s.id}
                   type="button"
                   onClick={() => setShape(s.id)}
-                  title={s.label}
+                  title={`${s.label}`}
+                  aria-label={`${s.label}`}
                   className="flex flex-col items-center justify-center p-2 rounded-xl transition-all"
                   style={{
                     backgroundColor: selected ? 'var(--bg-active)' : 'var(--bg-sidebar)',
@@ -188,6 +189,7 @@ export const CreateBotModal: React.FC = () => {
           <label className="inline-flex items-center gap-2 text-[13px] cursor-pointer select-none mt-4">
             <input
               type="checkbox"
+              aria-label="Larger eyes"
               checked={eyesLarge}
               onChange={(e) => setEyesLarge(e.target.checked)}
               className="rounded"
@@ -203,12 +205,15 @@ export const CreateBotModal: React.FC = () => {
         >
           <div>
             <label
+              htmlFor="create-bot-engine"
               className="block text-[12px] font-medium mb-1"
               style={{ color: 'var(--text-secondary)' }}
             >
               Engine
             </label>
             <select
+              id="create-bot-engine"
+              aria-label="Engine"
               value={engineId}
               onChange={(e) => setEngineId(e.target.value as EngineId)}
               className="w-full px-2.5 py-2 text-[13px] rounded-lg outline-none"
@@ -224,12 +229,15 @@ export const CreateBotModal: React.FC = () => {
 
           <div>
             <label
+              htmlFor="create-bot-model"
               className="block text-[12px] font-medium mb-1"
               style={{ color: 'var(--text-secondary)' }}
             >
               Model
             </label>
             <select
+              id="create-bot-model"
+              aria-label="Model"
               value={modelId}
               onChange={(e) => setModelId(e.target.value)}
               className="w-full px-2.5 py-2 text-[13px] rounded-lg outline-none"
@@ -252,12 +260,15 @@ export const CreateBotModal: React.FC = () => {
 
           <div>
             <label
+              htmlFor="create-bot-thinking"
               className="block text-[12px] font-medium mb-1"
               style={{ color: 'var(--text-secondary)' }}
             >
               Thinking effort
             </label>
             <select
+              id="create-bot-thinking"
+              aria-label="Thinking effort"
               value={thinkingLevel}
               onChange={(e) => setThinkingLevel(e.target.value as ThinkingLevel)}
               className="w-full px-2.5 py-2 text-[13px] rounded-lg outline-none"
@@ -276,12 +287,15 @@ export const CreateBotModal: React.FC = () => {
 
           <div>
             <label
+              htmlFor="create-bot-project"
               className="block text-[12px] font-medium mb-1"
               style={{ color: 'var(--text-secondary)' }}
             >
               Workspace project
             </label>
             <select
+              id="create-bot-project"
+              aria-label="Workspace project"
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
               className="w-full px-2.5 py-2 text-[13px] rounded-lg outline-none"
@@ -315,6 +329,7 @@ export const CreateBotModal: React.FC = () => {
           </button>
           <button
             type="submit"
+            aria-label="Create bot"
             disabled={!name.trim() || createMutation.isPending}
             className="px-4 py-2 text-[13px] font-medium rounded-lg text-white transition-opacity disabled:opacity-45"
             style={{ backgroundColor: color }}

@@ -54,6 +54,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
   const [refreshingModels, setRefreshingModels] = useState(false);
   const [optimisticHydrogen, setOptimisticHydrogen] = useState<boolean | null>(null);
   const pillRef = useRef<HTMLDivElement | null>(null);
+  const pillTriggerRef = useRef<HTMLButtonElement | null>(null);
   const pendingHydrogenCountRef = useRef(0);
   const hydrogenSeqRef = useRef(0);
 
@@ -66,6 +67,26 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
     window.addEventListener('click', close);
     return () => window.removeEventListener('click', close);
   }, []);
+
+  useEffect(() => {
+    if (!pillOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.isComposing) {
+        e.preventDefault();
+        e.stopPropagation();
+        setPillOpen(false);
+        pillTriggerRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [pillOpen]);
+
+  const systemInfoQuery = useQuery({
+    queryKey: ['system-info'],
+    queryFn: () => legacyApi.systemInfo(),
+    staleTime: 30_000,
+  });
 
   const modelsQuery = useQuery({
     queryKey: ['agy-models'],
@@ -214,6 +235,28 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
         .filter((b): b is Bot => Boolean(b))
     : [];
 
+  const headerTitle = bot ? bot.name : channel?.name || 'Conversation';
+  const pillAriaLabel = bot
+    ? `Model and thinking settings: ${bot.model_id}, ${bot.thinking_level}`
+    : 'Model and thinking settings';
+
+  const sysInfo = systemInfoQuery.data;
+  const runtimeMode = String(sysInfo?.runtime_mode || 'live_runtime');
+  const backendMode = String(sysInfo?.backend_mode || 'local_http');
+  const llmOrigin = sysInfo?.llm_origin ? String(sysInfo.llm_origin) : '';
+  const isEmulated =
+    backendMode === 'emulated' || backendMode === 'stub' || runtimeMode === 'stub';
+  const isLocalHostOrigin =
+    !llmOrigin ||
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?$/i.test(llmOrigin);
+  const originKind = isEmulated ? 'Emulated' : isLocalHostOrigin ? 'Local' : 'Remote';
+  const originHost = llmOrigin ? llmOrigin.replace(/^https?:\/\//i, '') : '';
+  const badgeText =
+    originKind === 'Remote' && originHost
+      ? `Remote · ${originHost}`
+      : `${originKind} · ${backendMode}`;
+  const badgeAriaLabel = `Execution runtime: ${originKind}, backend mode ${backendMode}, runtime mode ${runtimeMode}${llmOrigin ? `, origin ${llmOrigin}` : ''}`;
+
   return (
     <header
       className="h-13 px-4 flex items-center justify-between gap-3 shrink-0"
@@ -224,36 +267,47 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
     >
       {/* Left: Bot/Channel identity + Model Pill */}
       <div className="flex items-center gap-2.5 min-w-0">
-        <button
-          type="button"
-          onClick={toggleInspector}
-          title="Toggle details panel (Cmd+Shift+I)"
-          className="flex items-center gap-2.5 min-w-0 py-1 px-1.5 -ml-1.5 rounded-xl hover:bg-[var(--bg-subtle)] transition-colors"
-        >
-          {bot ? (
-            <BotAvatar
-              shape={bot.avatar_shape}
-              color={bot.avatar_color}
-              eyesLarge={bot.avatar_eyes_large}
-              state={presence?.state ?? bot.status_state}
-              size={28}
-              computerActive={presence?.computerActive ?? bot.computer_active}
-            />
-          ) : (
-            <span
-              className="w-7 h-7 rounded-lg flex items-center justify-center"
-              style={{ backgroundColor: 'var(--bg-subtle)', color: 'var(--text-secondary)' }}
-            >
-              <Hash size={15} strokeWidth={1.85} />
-            </span>
-          )}
+        <div className="flex items-center gap-2.5 min-w-0">
+          <button
+            type="button"
+            onClick={toggleInspector}
+            title="Toggle details panel (Cmd+Shift+I)"
+            aria-label="Toggle details panel"
+            className="py-1 px-1 -ml-1 rounded-xl hover:bg-[var(--bg-subtle)] transition-colors shrink-0"
+          >
+            {bot ? (
+              <BotAvatar
+                shape={bot.avatar_shape}
+                color={bot.avatar_color}
+                eyesLarge={bot.avatar_eyes_large}
+                state={presence?.state ?? bot.status_state}
+                size={28}
+                computerActive={presence?.computerActive ?? bot.computer_active}
+              />
+            ) : (
+              <span
+                className="w-7 h-7 rounded-lg flex items-center justify-center"
+                style={{ backgroundColor: 'var(--bg-subtle)', color: 'var(--text-secondary)' }}
+              >
+                <Hash size={15} strokeWidth={1.85} />
+              </span>
+            )}
+          </button>
           <div className="min-w-0 text-left">
-            <div
-              className="text-[14px] font-semibold tracking-tight truncate leading-tight"
+            <h1
+              className="m-0 text-[14px] font-semibold tracking-tight truncate leading-tight"
               style={{ color: 'var(--text-primary)' }}
             >
-              {bot ? bot.name : channel?.name || 'Conversation'}
-            </div>
+              <button
+                type="button"
+                onClick={toggleInspector}
+                title="Toggle details panel (Cmd+Shift+I)"
+                aria-label={`${headerTitle}`}
+                className="text-left truncate max-w-full hover:underline"
+              >
+                {headerTitle}
+              </button>
+            </h1>
             {!compact && (
               <div
                 className="text-[11.5px] truncate leading-tight mt-0.5"
@@ -265,13 +319,17 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
               </div>
             )}
           </div>
-        </button>
+        </div>
 
         {/* Discrete Model & Thinking Pill (1:1 bot) */}
         {bot && !compact && (
           <div className="relative" ref={pillRef}>
             <button
+              ref={pillTriggerRef}
               type="button"
+              aria-expanded={pillOpen}
+              aria-haspopup="true"
+              aria-label={`${pillAriaLabel}`}
               onClick={(e) => {
                 e.stopPropagation();
                 setPillOpen((v) => !v);
@@ -339,6 +397,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
                         <button
                           key={eng.id}
                           type="button"
+                          aria-label={`${eng.label}`}
                           onClick={() => updateBotMutation.mutate({ engine_id: eng.id })}
                           className="px-2.5 py-1.5 rounded-lg text-[12px] font-medium transition-colors"
                           style={{
@@ -365,6 +424,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
                     <label className="inline-flex items-center gap-1.5 text-[11px] cursor-pointer">
                       <input
                         type="checkbox"
+                        aria-label="Hydrogen opt-in"
                         checked={allowHydrogen}
                         onChange={(e) => {
                           const next = e.target.checked;
@@ -413,6 +473,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
                         <button
                           key={t.id}
                           type="button"
+                          aria-label={`${t.label}`}
                           onClick={() => updateBotMutation.mutate({ thinking_level: t.id })}
                           className="py-1 rounded-lg text-[11.5px] font-medium transition-colors"
                           style={{
@@ -466,8 +527,46 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
         )}
       </div>
 
-      {/* Right controls: New Page, Purple Computer Status Button, Inspector Toggle */}
+      {/* Right controls: Runtime Origin Badge, New Page, Purple Computer Status Button, Inspector Toggle */}
       <div className="flex items-center gap-1.5 shrink-0">
+        {!compact && (
+          <div
+            role="status"
+            data-testid="runtime-origin-badge"
+            data-runtime-mode={runtimeMode}
+            data-llm-origin={llmOrigin}
+            data-backend-mode={backendMode}
+            aria-label={`${badgeAriaLabel}`}
+            title={`${badgeAriaLabel}`}
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[11px] font-medium shrink-0"
+            style={{
+              backgroundColor: isEmulated
+                ? 'var(--status-warn-bg)'
+                : originKind === 'Remote'
+                  ? 'var(--accent-computer-tint)'
+                  : 'var(--bg-subtle)',
+              color: isEmulated
+                ? 'var(--status-warn)'
+                : originKind === 'Remote'
+                  ? 'var(--accent-computer)'
+                  : 'var(--text-secondary)',
+              border: '1px solid var(--border-subtle)',
+            }}
+          >
+            <span
+              className="w-1.5 h-1.5 rounded-full shrink-0"
+              style={{
+                backgroundColor: isEmulated
+                  ? 'var(--status-warn)'
+                  : originKind === 'Remote'
+                    ? 'var(--accent-computer)'
+                    : 'var(--status-ok)',
+              }}
+            />
+            <span className="truncate max-w-[140px]">{badgeText}</span>
+          </div>
+        )}
+
         <button
           type="button"
           onClick={() => createPageMutation.mutate()}
@@ -484,14 +583,24 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
         <button
           type="button"
           onClick={() => {
-            if (computerTabActive) {
-              toggleInspector();
-            } else {
-              openInspectorTab('computer');
+            const wasActive = computerTabActive;
+            openInspectorTab('computer');
+            if (wasActive) {
+              window.requestAnimationFrame(() => {
+                const target =
+                  document.querySelector<HTMLElement>(
+                    '[role="tablist"][aria-label="Computer view"] button',
+                  ) ??
+                  document.querySelector<HTMLElement>(
+                    '[role="tablist"][aria-label="Inspector tabs"] [role="tab"][aria-selected="true"]',
+                  );
+                target?.focus();
+              });
             }
           }}
           title="Open Bot Computer"
           aria-label="Open Bot Computer"
+          aria-pressed={computerTabActive}
           className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium transition-all"
           style={{
             backgroundColor:

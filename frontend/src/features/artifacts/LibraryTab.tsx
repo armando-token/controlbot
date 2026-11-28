@@ -281,6 +281,7 @@ export const LibraryTab: React.FC<LibraryTabProps> = ({ bot, channel, allBots })
               <button
                 key={f.id}
                 type="button"
+                aria-label={`${f.label}`}
                 onClick={() => setFilter(f.id)}
                 className="px-2.5 py-1 rounded-full text-[11.5px] font-medium transition-colors"
                 style={{
@@ -361,7 +362,10 @@ export const LibraryTab: React.FC<LibraryTabProps> = ({ bot, channel, allBots })
                   {sec.label} ({sec.items.length})
                 </div>
 
-                {visible.map((art) => (
+                {visible.map((art) => {
+                  const pinTitle = art.pinned ? 'Unpin' : 'Pin';
+                  const pinAria = art.pinned ? `Unpin ${art.title}` : `Pin ${art.title}`;
+                  return (
                   <div
                     key={art.id}
                     className="group flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl transition-colors hover:bg-[var(--bg-subtle)]"
@@ -403,8 +407,8 @@ export const LibraryTab: React.FC<LibraryTabProps> = ({ bot, channel, allBots })
                       <button
                         type="button"
                         onClick={() => pinMutation.mutate({ id: art.id, pinned: !art.pinned })}
-                        title={art.pinned ? 'Unpin' : 'Pin'}
-                        aria-label={art.pinned ? `Unpin ${art.title}` : `Pin ${art.title}`}
+                        title={`${pinTitle}`}
+                        aria-label={`${pinAria}`}
                         className="p-1 rounded hover:bg-[var(--bg-active)]"
                         style={{
                           color: art.pinned ? 'var(--accent-computer)' : 'var(--text-muted)',
@@ -424,7 +428,8 @@ export const LibraryTab: React.FC<LibraryTabProps> = ({ bot, channel, allBots })
                       </button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
 
                 {hasMore && (
                   <button

@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from src.storage.redaction import contains_unredacted_secret_strict
+
+_BARE_SK_SECRET_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}\b")
+
+
+def contains_sensitive_scope_secret(value: str) -> bool:
+    """Return True if *value* contains strict credentials or a bare `sk-...` token."""
+    return contains_unredacted_secret_strict(value) or bool(_BARE_SK_SECRET_RE.search(value))
 
 AvatarShape = Literal["square", "sparkle", "clover", "flower", "heart", "house", "star"]
 StatusState = Literal["idle", "acknowledging", "working", "waiting_human", "error"]
@@ -213,11 +223,39 @@ class MessageCreateRequest(V1Schema):
     thinking_level: ThinkingLevel | None = None
     override_thinking_level: ThinkingLevel | None = None
     skill_ids: list[str] = Field(default_factory=list, max_length=10)
+    facility_id: str | None = Field(default=None, min_length=1, max_length=120)
+    allowed_areas: list[str] = Field(default_factory=list, max_length=20)
 
     @field_validator("content")
     @classmethod
     def _validate_content(cls, value: str) -> str:
         return _strip_non_empty(value, "content")
+
+    @field_validator("facility_id")
+    @classmethod
+    def _validate_facility_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _strip_non_empty(value, "facility_id")
+        if contains_sensitive_scope_secret(cleaned):
+            raise ValueError("facility_id must not contain sensitive credentials.")
+        return cleaned
+
+    @field_validator("allowed_areas")
+    @classmethod
+    def _validate_allowed_areas(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            item = raw.strip()
+            if not item:
+                raise ValueError("allowed_areas must not contain empty values.")
+            if contains_sensitive_scope_secret(item):
+                raise ValueError("allowed_areas must not contain sensitive credentials.")
+            if item not in seen:
+                seen.add(item)
+                cleaned.append(item)
+        return cleaned
 
     @model_validator(mode="after")
     def _normalize_overrides(self) -> MessageCreateRequest:

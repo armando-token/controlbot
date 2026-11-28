@@ -357,6 +357,7 @@ export const VerdictCard: React.FC<VerdictCardProps> = ({ threadId, message }) =
         border: '1px solid var(--border-subtle)',
       }}
       data-testid="verdict-card"
+      aria-label="Verification verdict"
     >
       {/* Header row: Verdict badge + lane + domain_profile */}
       {(verdictStyle || lane || domainProfile) && (
@@ -510,6 +511,7 @@ export const VerdictCard: React.FC<VerdictCardProps> = ({ threadId, message }) =
                   <button
                     key={cand.id ?? cand.asset_id ?? `${label}-${idx}`}
                     type="button"
+                    aria-label={`Use asset ${label}`}
                     disabled={busy}
                     onClick={() => {
                       const idSuffix = cand.asset_id ? ` (${cand.asset_id})` : '';
@@ -594,6 +596,7 @@ export const VerdictCard: React.FC<VerdictCardProps> = ({ threadId, message }) =
                   <button
                     key={asset.id ?? (assetId || undefined) ?? asset.tag ?? `${name}-${idx}`}
                     type="button"
+                    aria-label={`Query nearest asset ${name}`}
                     disabled={busy}
                     onClick={() =>
                       followUpMutation.mutate(`Query nearest asset: ${name}`)

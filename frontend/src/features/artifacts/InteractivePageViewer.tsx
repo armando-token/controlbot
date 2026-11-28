@@ -361,6 +361,13 @@ export const InteractivePageViewer: React.FC<InteractivePageViewerProps> = ({ pa
     );
   }
 
+  const editToggleLabel = editMode
+    ? updateMutation.isPending
+      ? 'Saving'
+      : 'Preview'
+    : 'Edit';
+  const pinLabel = page.pinned ? 'Unpin page' : 'Pin page';
+
   return (
     <div
       className="h-full flex flex-col gb-printable-page"
@@ -379,6 +386,7 @@ export const InteractivePageViewer: React.FC<InteractivePageViewerProps> = ({ pa
             <input
               type="text"
               autoFocus
+              aria-label="Page title"
               value={titleDraft}
               onChange={(e) => setTitleDraft(e.target.value)}
               onBlur={commitTitle}
@@ -436,6 +444,7 @@ export const InteractivePageViewer: React.FC<InteractivePageViewerProps> = ({ pa
           <button
             type="button"
             disabled={updateMutation.isPending}
+            aria-label={`${editToggleLabel}`}
             onClick={() => void handleToggleEditMode()}
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium hover:bg-[var(--bg-subtle)] disabled:opacity-50"
             style={{
@@ -460,8 +469,8 @@ export const InteractivePageViewer: React.FC<InteractivePageViewerProps> = ({ pa
             type="button"
             onClick={() => pinMutation.mutate(!page.pinned)}
             disabled={pinMutation.isPending}
-            title={page.pinned ? 'Unpin page' : 'Pin page'}
-            aria-label={page.pinned ? 'Unpin page' : 'Pin page'}
+            title={`${pinLabel}`}
+            aria-label={`${pinLabel}`}
             className="p-1.5 rounded-lg hover:bg-[var(--bg-subtle)] disabled:opacity-50"
             style={{
               color: page.pinned ? 'var(--accent-computer)' : 'var(--text-secondary)',
@@ -794,6 +803,7 @@ export const InteractivePageViewer: React.FC<InteractivePageViewerProps> = ({ pa
                 </button>
                 <button
                   type="button"
+                  aria-label="Save changes"
                   disabled={updateMutation.isPending}
                   onClick={() => void handleSaveDraft()}
                   className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium disabled:opacity-50"

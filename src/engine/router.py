@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from typing import Any, Literal, Protocol
 
 from pydantic import Field
@@ -16,6 +17,10 @@ _TAG_RE = re.compile(
     r"\b(?:PT|TT|FT|LT|VFD|FIC|TIC|PIC|LIC|WO|CN|ALM|P)-[A-Z0-9_-]+\b",
     re.IGNORECASE,
 )
+_COMMERCIAL_SKU_RE = re.compile(
+    r"\b(?:SKU\s*[:=]\s*[A-Z0-9_-]+|CB-[A-Z0-9_-]+)\b",
+    re.IGNORECASE,
+)
 _PLANT_UNIT_PHRASE_RE = re.compile(
     r"\b(?:pump|v[aá]lvula|valve|motor|compresor|compressor|sensor|transmisor|transmitter|tanque|tank)\s+([a-z0-9_-]+)\b",
     re.IGNORECASE,
@@ -25,7 +30,7 @@ _BARE_ASSET_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 
-_INDUSTRIAL_KEYWORDS: tuple[str, ...] = (
+_STRONG_INDUSTRIAL_KEYWORDS: tuple[str, ...] = (
     "scada",
     "cmms",
     "erp",
@@ -34,10 +39,6 @@ _INDUSTRIAL_KEYWORDS: tuple[str, ...] = (
     "historian",
     "horner",
     "cscape",
-    "pump",
-    "valvula",
-    "válvula",
-    "valve",
     "alarma",
     "alarm",
     "lectura",
@@ -53,11 +54,44 @@ _INDUSTRIAL_KEYWORDS: tuple[str, ...] = (
     "vibracion",
     "vibración",
     "caudal",
+    "telemetria",
+    "telemetría",
+    "telemetry",
     "planta",
     "plant",
     "area-",
     "área",
 )
+
+_GENERIC_EQUIPMENT_NOUNS: tuple[str, ...] = (
+    "pump",
+    "valvula",
+    "válvula",
+    "valve",
+    "motor",
+    "compresor",
+    "compressor",
+    "sensor",
+    "transmisor",
+    "transmitter",
+    "tanque",
+    "tank",
+)
+
+_INDUSTRIAL_KEYWORDS: tuple[str, ...] = (
+    _STRONG_INDUSTRIAL_KEYWORDS + _GENERIC_EQUIPMENT_NOUNS
+)
+
+
+def _has_keyword_match(text_low: str, keywords: tuple[str, ...]) -> bool:
+    for kw in keywords:
+        if kw.endswith("-"):
+            pattern = rf"(?<![a-z0-9]){re.escape(kw)}"
+        else:
+            pattern = rf"(?<![a-z0-9]){re.escape(kw)}(?:s|es)?(?![a-z0-9])"
+        if re.search(pattern, text_low):
+            return True
+    return False
 
 _WEB_GENERAL_KEYWORDS: tuple[str, ...] = (
     "reemplazo",
@@ -74,6 +108,12 @@ _WEB_GENERAL_KEYWORDS: tuple[str, ...] = (
     "supplier",
     "precio",
     "price",
+    "cost",
+    "cuesta",
+    "cuánto cuesta",
+    "cuanto cuesta",
+    "cuánto vale",
+    "cuanto vale",
     "oem",
     "fabricante",
     "manufacturer",
@@ -98,7 +138,7 @@ _EXCEL_KEYWORDS: tuple[str, ...] = (
 )
 
 _GENERAL_GREETING_OR_TASK_RE = re.compile(
-    r"^\s*(?:hi|hello|hey|hola|buenos\s+d[ií]as|buenas|thanks|gracias|help|ayuda|resume|summarize|write|draft|create|explain|translate|what\s+is|who\s+is|how\s+to)\b",
+    r"^\s*(?:[¿¡]\s*)?(?:hi|hello|hey|hola|buenos\s+d[ií]as|buenas|thanks|gracias|help|ayuda|resume|summarize|write|draft|create|explain|explica|expl[ií]came|define|translate|what\s+is|who\s+is|how\s+to|qu[eé]\s+es|cu[aá]l\s+es|c[oó]mo\s+funciona|dime\s+qu[eé]\s+es)\b",
     re.IGNORECASE,
 )
 
@@ -143,6 +183,8 @@ def _collect_asset_candidates(
     query: str,
     facility_config: FacilityConfig | None,
     area: str | None,
+    *,
+    allowed_areas: set[str] | None = None,
 ) -> list[AssetCandidate]:
     if facility_config is None:
         return []
@@ -151,6 +193,8 @@ def _collect_asset_candidates(
     q_low = query.lower()
 
     def _add(asset: AssetMapping, score: float) -> None:
+        if allowed_areas is not None and asset.area not in allowed_areas:
+            return
         key = (asset.asset_id, asset.area)
         if key not in found or score > found[key].score:
             found[key] = AssetCandidate(
@@ -175,6 +219,8 @@ def _collect_asset_candidates(
         for asset in facility_config.assets:
             if area is not None and asset.area != area:
                 continue
+            if allowed_areas is not None and asset.area not in allowed_areas:
+                continue
             tokens = {
                 asset.asset_id.lower(),
                 asset.canonical_label.lower(),
@@ -186,6 +232,8 @@ def _collect_asset_candidates(
     # Check direct canonical label / alias / asset_id substring containment
     for asset in facility_config.assets:
         if area is not None and asset.area != area:
+            continue
+        if allowed_areas is not None and asset.area not in allowed_areas:
             continue
         names = [asset.asset_id, asset.canonical_label, *asset.aliases, *asset.source_ids.values()]
         for name in names:
@@ -204,6 +252,8 @@ def _collect_asset_candidates(
             for asset in facility_config.assets:
                 if area is not None and asset.area != area:
                     continue
+                if allowed_areas is not None and asset.area not in allowed_areas:
+                    continue
                 asset_text = " ".join(
                     [asset.asset_id, asset.canonical_label, *asset.aliases]
                 ).lower()
@@ -216,13 +266,18 @@ def _collect_asset_candidates(
 
 
 def _extract_areas_from_query(
-    query: str, facility_config: FacilityConfig | None
+    query: str,
+    facility_config: FacilityConfig | None,
+    *,
+    allowed_areas: set[str] | None = None,
 ) -> list[str]:
     if facility_config is None:
         return []
     q_low = query.lower()
     matched: list[str] = []
     for area_id, area_cfg in facility_config.areas.items():
+        if allowed_areas is not None and area_id not in allowed_areas:
+            continue
         if re.search(rf"(?<![a-z0-9]){re.escape(area_id.lower())}(?![a-z0-9])", q_low):
             matched.append(area_id)
             continue
@@ -253,6 +308,7 @@ class LaneRouter:
         ui_lane: Lane | None = None,
         facility_config: FacilityConfig | None = None,
         area: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> RouteDecision:
         """Route query into general | industrial | mixed or pause with needs_clarification."""
         clean_query = query.strip()
@@ -268,11 +324,36 @@ class LaneRouter:
                 rationale="Explicit UI lane selected: general.",
             )
 
-        matched_areas = (
-            [area] if area is not None else _extract_areas_from_query(clean_query, facility_config)
+        scoped_areas = list(
+            dict.fromkeys(
+                item.strip()
+                for item in (allowed_areas or ())
+                if isinstance(item, str) and item.strip()
+            )
         )
-        effective_area: str | None = matched_areas[0] if len(matched_areas) == 1 else None
-        candidates = _collect_asset_candidates(clean_query, facility_config, effective_area)
+        allowed_area_set: set[str] | None = set(scoped_areas) if scoped_areas else None
+        matched_areas = (
+            [area]
+            if area is not None
+            else _extract_areas_from_query(
+                clean_query,
+                facility_config,
+                allowed_areas=allowed_area_set,
+            )
+        )
+        if area is not None and allowed_area_set is not None:
+            allowed_area_set = allowed_area_set & {area} if area in allowed_area_set else {area}
+        effective_area: str | None = (
+            matched_areas[0]
+            if len(matched_areas) == 1
+            else (scoped_areas[0] if area is None and len(scoped_areas) == 1 else None)
+        )
+        candidates = _collect_asset_candidates(
+            clean_query,
+            facility_config,
+            effective_area,
+            allowed_areas=allowed_area_set,
+        )
         if len(matched_areas) >= 2:
             area_set = set(matched_areas)
             scoped_cands = [c for c in candidates if c.area in area_set]
@@ -322,23 +403,31 @@ class LaneRouter:
             )
 
         q_low = clean_query.lower()
-        has_tag = (
-            _TAG_RE.search(clean_query) is not None
-            or _PLANT_UNIT_PHRASE_RE.search(clean_query) is not None
-        )
-        has_ind_kw = any(kw in q_low for kw in _INDUSTRIAL_KEYWORDS)
-        has_web_kw = any(kw in q_low for kw in _WEB_GENERAL_KEYWORDS)
-        has_excel_kw = any(kw in q_low for kw in _EXCEL_KEYWORDS)
+        lexical_query = _COMMERCIAL_SKU_RE.sub(" ", clean_query)
+        lex_low = lexical_query.lower()
+        has_ot_tag = _TAG_RE.search(lexical_query) is not None
+        has_unit_phrase = _PLANT_UNIT_PHRASE_RE.search(lexical_query) is not None
+        has_strong_ind_kw = _has_keyword_match(lex_low, _STRONG_INDUSTRIAL_KEYWORDS)
+        has_generic_equip_kw = _has_keyword_match(lex_low, _GENERIC_EQUIPMENT_NOUNS)
+        has_web_kw = _has_keyword_match(q_low, _WEB_GENERAL_KEYWORDS)
+        has_excel_kw = _has_keyword_match(q_low, _EXCEL_KEYWORDS)
         has_ambiguous_bare_num = _BARE_ASSET_NUMBER_RE.search(clean_query) is not None
 
         has_strong_candidate = any(c.score > 0.75 for c in candidates)
-        has_industrial = (
-            has_tag
-            or has_ind_kw
-            or has_strong_candidate
-            or (effective_area is not None and bool(candidates))
-        )
         has_external_general = has_web_kw or has_excel_kw
+        has_strong_industrial = (
+            has_ot_tag
+            or has_strong_ind_kw
+            or has_strong_candidate
+            or ((effective_area is not None or bool(allowed_area_set)) and bool(candidates))
+        )
+        is_general_question = _GENERAL_GREETING_OR_TASK_RE.search(clean_query) is not None
+        has_industrial = has_strong_industrial or (
+            (has_unit_phrase or has_generic_equip_kw)
+            and not has_external_general
+            and not is_general_question
+        )
+        has_tag = has_ot_tag or has_unit_phrase
 
         # Stage 1: Mixed (Industrial + Web/Replacement/Excel)
         if has_industrial and has_external_general:
@@ -420,7 +509,11 @@ class LaneRouter:
                 lane, profile, conf, verifiers_seq = await asyncio.wait_for(
                     self._classifier.classify(
                         clean_query,
-                        {"area": effective_area, "has_facility": facility_config is not None},
+                        {
+                            "area": effective_area,
+                            "allowed_areas": tuple(scoped_areas),
+                            "has_facility": facility_config is not None,
+                        },
                     ),
                     timeout=self._stage2_timeout_s,
                 )

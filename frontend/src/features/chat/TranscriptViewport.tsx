@@ -358,6 +358,7 @@ export const TranscriptViewport: React.FC<TranscriptViewportProps> = ({
                             href={attachmentsApi.downloadUrl(att.id)}
                             target="_blank"
                             rel="noopener noreferrer"
+                            aria-label={`Download ${att.filename}`}
                             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[12px] hover:underline"
                             style={{
                               backgroundColor: 'var(--bg-canvas)',
@@ -479,6 +480,7 @@ export const TranscriptViewport: React.FC<TranscriptViewportProps> = ({
                           href={attachmentsApi.downloadUrl(att.id)}
                           target="_blank"
                           rel="noopener noreferrer"
+                          aria-label={`Download ${att.filename}`}
                           className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[12px] hover:underline"
                           style={{
                             backgroundColor: 'var(--bg-sidebar)',
@@ -509,6 +511,7 @@ export const TranscriptViewport: React.FC<TranscriptViewportProps> = ({
                       <button
                         key={emoji}
                         type="button"
+                        aria-label={`React ${emoji} (${count})`}
                         onClick={() => reactMutation.mutate({ messageId: msg.id, emoji })}
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11.5px] tabular-nums transition-colors hover:bg-[var(--bg-active)]"
                         style={{

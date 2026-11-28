@@ -13,6 +13,7 @@ export const PageChatCard: React.FC<PageChatCardProps> = ({ artifact }) => {
 
   const isSuperseded = Boolean(artifact.superseded_by_id);
   const isOpen = activePageId === artifact.id;
+  const openPageLabel = isOpen ? `Viewing ${artifact.title}` : `Open ${artifact.title}`;
 
   return (
     <div
@@ -56,6 +57,7 @@ export const PageChatCard: React.FC<PageChatCardProps> = ({ artifact }) => {
 
       <button
         type="button"
+        aria-label={`${openPageLabel}`}
         onClick={() => setActivePageId(artifact.id)}
         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium shrink-0 transition-colors hover:opacity-90"
         style={{

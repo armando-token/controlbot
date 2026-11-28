@@ -18,6 +18,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { computerApi, toWsUrl } from '../../lib/api';
+import { reportClientError } from '../../lib/diagnostics';
 import RFB from '@novnc/novnc';
 import { useComputerStore } from '../../stores/computerStore';
 import { useUiStore } from '../../stores/uiStore';
@@ -125,23 +126,47 @@ interface LiveVncCanvasProps {
   vmId?: string;
   source: 'vnc' | 'screencast';
   interactive: boolean;
+  allowDirectBrowserInput?: boolean;
   className?: string;
 }
 
 type ConnState = 'starting' | 'ready' | 'reconnecting' | 'unavailable';
 
+function isDisplayableBrowserUrl(url: unknown): url is string {
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  return (
+    Boolean(trimmed) &&
+    trimmed !== 'about:blank' &&
+    !trimmed.startsWith('chrome-error://')
+  );
+}
+
 export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
-  function LiveVncCanvas({ vmId = 'default', source, interactive, className = '' }, ref) {
+  function LiveVncCanvas(
+    { vmId = 'default', source, interactive, allowDirectBrowserInput = false, className = '' },
+    ref,
+  ) {
     const pushToast = useUiStore((s) => s.pushToast);
     const setComputerStatus = useComputerStore((s) => s.setStatus);
 
     const vncHostRef = useRef<HTMLDivElement | null>(null);
     const viewportRef = useRef<HTMLDivElement | null>(null);
+    const urlInputRef = useRef<HTMLInputElement | null>(null);
+    const urlFocusedRef = useRef(false);
+    const lastServerUrlRef = useRef('');
     const rfbRef = useRef<RFB | null>(null);
     const screencastWsRef = useRef<WebSocket | null>(null);
     const imgRef = useRef<HTMLImageElement | null>(null);
+    const interactiveRef = useRef(interactive);
+    interactiveRef.current = interactive;
     const vncAttemptRef = useRef(0);
     const screencastAttemptRef = useRef(0);
+    const directQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const typeBufferRef = useRef('');
+    const typeTimerRef = useRef<number | null>(null);
+    const wheelAccumRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+    const wheelTimerRef = useRef<number | null>(null);
 
     const [connState, setConnState] = useState<ConnState>('starting');
     const [statusMessage, setStatusMessage] = useState<string>('Connecting to display…');
@@ -150,9 +175,36 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
     // Screencast (Playwright) state
     const [frameDataUrl, setFrameDataUrl] = useState<string | null>(null);
     const [frameDims, setFrameDims] = useState({ width: 1280, height: 800 });
-    const [browserRunning, setBrowserRunning] = useState(false);
-    const [urlInput, setUrlInput] = useState('https://example.com');
+    const [browserRunning, setBrowserRunning] = useState(() =>
+      Boolean(useComputerStore.getState().byVmId[vmId]?.browser_running),
+    );
+    const [urlInput, setUrlInput] = useState(() => {
+      const storedUrl = useComputerStore.getState().byVmId[vmId]?.active_url;
+      if (isDisplayableBrowserUrl(storedUrl)) {
+        lastServerUrlRef.current = storedUrl.trim();
+        return storedUrl.trim();
+      }
+      return 'https://example.com';
+    });
+    const [navigating, setNavigating] = useState(false);
     const [activeTitle, setActiveTitle] = useState('');
+
+    const syncServerUrl = useCallback((rawUrl: unknown) => {
+      if (!isDisplayableBrowserUrl(rawUrl)) return;
+      const trimmed = rawUrl.trim();
+      if (trimmed === lastServerUrlRef.current) return;
+      lastServerUrlRef.current = trimmed;
+      if (!urlFocusedRef.current) {
+        setUrlInput(trimmed);
+      }
+    }, []);
+
+    useEffect(() => {
+      return () => {
+        if (typeTimerRef.current !== null) window.clearTimeout(typeTimerRef.current);
+        if (wheelTimerRef.current !== null) window.clearTimeout(wheelTimerRef.current);
+      };
+    }, []);
 
     const reconnect = useCallback(() => {
       vncAttemptRef.current = 0;
@@ -253,7 +305,7 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
           vncHostRef.current.innerHTML = '';
           const wsUrl = toWsUrl(tokenRes.ws_vnc_url);
           const rfb = new RFB(vncHostRef.current, wsUrl);
-          rfb.viewOnly = !interactive;
+          rfb.viewOnly = !interactiveRef.current;
           rfb.focusOnClick = true;
           rfb.showDotCursor = true;
           rfb.scaleViewport = true;
@@ -264,20 +316,37 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
           rfb.addEventListener('connect', () => {
             if (!cancelled) {
               vncAttemptRef.current = 0;
+              rfb.viewOnly = !interactiveRef.current;
+              if (interactiveRef.current) {
+                rfb.focus();
+              }
               setConnState('ready');
               setStatusMessage('Connected to VM Desktop');
             }
           });
 
-          rfb.addEventListener('disconnect', () => {
+          rfb.addEventListener('disconnect', (ev: Event) => {
             rfbRef.current = null;
             if (cancelled || authFailed) return;
+            const clean = Boolean((ev as CustomEvent<{ clean?: boolean }>)?.detail?.clean);
+            if (!clean) {
+              reportClientError({
+                kind: 'vnc_disconnect',
+                message: `VNC disconnected unexpectedly (attempt ${vncAttemptRef.current + 1})`,
+                url: tokenRes.ws_vnc_url,
+              });
+            }
             scheduleVncReconnect('VM Desktop disconnected. Click Retry to reconnect.');
           });
 
           rfb.addEventListener('securityfailure', () => {
             authFailed = true;
             rfbRef.current = null;
+            reportClientError({
+              kind: 'vnc_security_failure',
+              message: 'VNC authentication failed',
+              url: tokenRes.ws_vnc_url,
+            });
             if (reconnectTimer !== null) {
               window.clearTimeout(reconnectTimer);
               reconnectTimer = null;
@@ -379,11 +448,11 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
                 if (typeof msg.width === 'number' && typeof msg.height === 'number') {
                   setFrameDims({ width: msg.width, height: msg.height });
                 }
-                if (typeof msg.url === 'string' && msg.url) setUrlInput(msg.url);
+                syncServerUrl(msg.url);
                 if (typeof msg.title === 'string') setActiveTitle(msg.title);
               } else if (msg.type === 'status') {
                 setBrowserRunning(Boolean(msg.running));
-                if (typeof msg.url === 'string' && msg.url) setUrlInput(msg.url);
+                syncServerUrl(msg.url);
                 if (typeof msg.title === 'string') setActiveTitle(msg.title);
               } else if (msg.type === 'error' && typeof msg.message === 'string') {
                 pushToast({ tone: 'warn', title: 'Browser notice', description: msg.message });
@@ -429,39 +498,164 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
           screencastWsRef.current = null;
         }
       };
-    }, [source, vmId, connectNonce, pushToast]);
+    }, [source, vmId, connectNonce, pushToast, syncServerUrl]);
 
-    const sendScreencast = (payload: Record<string, unknown>) => {
+    const sendScreencast = useCallback((payload: Record<string, unknown>) => {
       const ws = screencastWsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(payload));
+        return true;
+      }
+      return false;
+    }, []);
+
+    const canDirectInteract =
+      source === 'screencast' && allowDirectBrowserInput && browserRunning;
+    const canInteract = interactive || canDirectInteract;
+
+    const enqueueDirectAction = useCallback(
+      (payload: Record<string, unknown>) => {
+        directQueueRef.current = directQueueRef.current
+          .then(async () => {
+            const res = await computerApi.action(vmId, { ...payload, actor: 'human' });
+            setComputerStatus(res.status);
+            setBrowserRunning(Boolean(res.status.browser_running));
+            syncServerUrl(res.status.active_url);
+            sendScreencast({ type: 'status' });
+          })
+          .catch((err: unknown) => {
+            pushToast({
+              tone: 'warn',
+              title: 'Browser action failed',
+              description: err instanceof Error ? err.message : 'Error',
+            });
+          });
+      },
+      [vmId, setComputerStatus, syncServerUrl, sendScreencast, pushToast],
+    );
+
+    const flushDirectTypeBuffer = useCallback(() => {
+      if (typeTimerRef.current !== null) {
+        window.clearTimeout(typeTimerRef.current);
+        typeTimerRef.current = null;
+      }
+      const buffered = typeBufferRef.current;
+      if (buffered) {
+        typeBufferRef.current = '';
+        enqueueDirectAction({ type: 'type', text: buffered });
+      }
+    }, [enqueueDirectAction]);
+
+    const dispatchBrowserInput = useCallback(
+      (payload: Record<string, unknown>) => {
+        if (interactive) {
+          sendScreencast(payload);
+          return;
+        }
+        if (!canDirectInteract) return;
+        const evType = payload.type;
+        if (evType === 'type' && typeof payload.text === 'string') {
+          typeBufferRef.current += payload.text;
+          if (typeTimerRef.current !== null) {
+            window.clearTimeout(typeTimerRef.current);
+          }
+          typeTimerRef.current = window.setTimeout(() => {
+            flushDirectTypeBuffer();
+          }, 60);
+          return;
+        }
+        if (evType === 'wheel') {
+          const dx = typeof payload.dx === 'number' ? payload.dx : 0;
+          const dy = typeof payload.dy === 'number' ? payload.dy : 0;
+          wheelAccumRef.current.dx += dx;
+          wheelAccumRef.current.dy += dy;
+          if (wheelTimerRef.current === null) {
+            wheelTimerRef.current = window.setTimeout(() => {
+              wheelTimerRef.current = null;
+              const acc = wheelAccumRef.current;
+              wheelAccumRef.current = { dx: 0, dy: 0 };
+              if (acc.dx !== 0 || acc.dy !== 0) {
+                enqueueDirectAction({ type: 'wheel', dx: acc.dx, dy: acc.dy });
+              }
+            }, 120);
+          }
+          return;
+        }
+        flushDirectTypeBuffer();
+        enqueueDirectAction(payload);
+      },
+      [interactive, canDirectInteract, sendScreencast, flushDirectTypeBuffer, enqueueDirectAction],
+    );
+
+    const handleNavigateUrl = async (rawUrl: string) => {
+      const trimmedUrl = rawUrl.trim();
+      if (!trimmedUrl) return;
+      urlFocusedRef.current = false;
+      urlInputRef.current?.blur();
+      setNavigating(true);
+      try {
+        const res = await computerApi.action(vmId, {
+          type: browserRunning ? 'navigate' : 'start',
+          url: trimmedUrl,
+          actor: 'human',
+        });
+        setComputerStatus(res.status);
+        setBrowserRunning(Boolean(res.status.browser_running));
+        if (isDisplayableBrowserUrl(res.status.active_url)) {
+          lastServerUrlRef.current = res.status.active_url.trim();
+          setUrlInput(res.status.active_url.trim());
+        }
+        sendScreencast({ type: 'status' });
+      } catch (err) {
+        sendScreencast({ type: 'status' });
+        pushToast({
+          tone: 'error',
+          title: 'Could not open page',
+          description: err instanceof Error ? err.message : 'Error',
+        });
+      } finally {
+        setNavigating(false);
+      }
+    };
+
+    const handleNavControl = (actionType: 'back' | 'forward' | 'reload') => {
+      if (!sendScreencast({ type: actionType })) {
+        enqueueDirectAction({ type: actionType });
       }
     };
 
     const handleStartBrowser = async () => {
+      urlFocusedRef.current = false;
+      setNavigating(true);
       try {
         const trimmedUrl = urlInput.trim();
         const res = await computerApi.action(vmId, {
           type: 'start',
+          actor: 'human',
           ...(trimmedUrl ? { url: trimmedUrl } : {}),
         });
         setComputerStatus(res.status);
         setBrowserRunning(Boolean(res.status.browser_running));
-        if (typeof res.status.active_url === 'string' && res.status.active_url) {
-          setUrlInput(res.status.active_url);
+        if (isDisplayableBrowserUrl(res.status.active_url)) {
+          lastServerUrlRef.current = res.status.active_url.trim();
+          setUrlInput(res.status.active_url.trim());
         }
+        sendScreencast({ type: 'status' });
       } catch (err) {
+        sendScreencast({ type: 'status' });
         pushToast({
           tone: 'error',
           title: 'Could not start browser',
           description: err instanceof Error ? err.message : 'Error',
         });
+      } finally {
+        setNavigating(false);
       }
     };
 
     const handleStopBrowser = async () => {
       try {
-        const res = await computerApi.action(vmId, { type: 'stop' });
+        const res = await computerApi.action(vmId, { type: 'stop', actor: 'human' });
         setFrameDataUrl(null);
         setBrowserRunning(false);
         setComputerStatus(res.status);
@@ -479,28 +673,35 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
       evType: 'click' | 'dblclick',
       buttonOverride?: 'left' | 'middle' | 'right',
     ) => {
-      if (!interactive || !imgRef.current) return;
+      if (!canInteract || !imgRef.current) return;
       viewportRef.current?.focus();
       const rect = imgRef.current.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
       const x = Math.round(((e.clientX - rect.left) / rect.width) * frameDims.width);
       const y = Math.round(((e.clientY - rect.top) / rect.height) * frameDims.height);
       if (evType === 'dblclick') {
-        sendScreencast({ type: 'dblclick', x, y });
+        dispatchBrowserInput({ type: 'dblclick', x, y });
         return;
       }
       const button: 'left' | 'middle' | 'right' =
         buttonOverride ?? (e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left');
-      sendScreencast({ type: 'click', x, y, button });
+      dispatchBrowserInput({ type: 'click', x, y, button });
     };
 
     const handleImageWheel = (e: React.WheelEvent<HTMLImageElement>) => {
-      if (!interactive) return;
-      sendScreencast({ type: 'wheel', dx: e.deltaX, dy: e.deltaY });
+      if (!canInteract) return;
+      dispatchBrowserInput({ type: 'wheel', dx: e.deltaX, dy: e.deltaY });
     };
 
     const handleImageKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-      if (!interactive) return;
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
+      if (!canInteract) return;
       if (e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta') {
         return;
       }
@@ -520,11 +721,11 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
             : e.key.length === 1 && e.shiftKey
               ? e.key.toLowerCase()
               : e.key;
-        sendScreencast({ type: 'key', key: [...mods, keyPart].join('+') });
+        dispatchBrowserInput({ type: 'key', key: [...mods, keyPart].join('+') });
       } else if (e.key.length === 1) {
-        sendScreencast({ type: 'type', text: e.key });
+        dispatchBrowserInput({ type: 'type', text: e.key });
       } else {
-        sendScreencast({ type: 'key', key: e.key });
+        dispatchBrowserInput({ type: 'key', key: e.key });
       }
     };
 
@@ -541,7 +742,7 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
           >
             <button
               type="button"
-              onClick={() => sendScreencast({ type: 'back' })}
+              onClick={() => handleNavControl('back')}
               disabled={!browserRunning}
               title="Back"
               aria-label="Back"
@@ -551,7 +752,7 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
             </button>
             <button
               type="button"
-              onClick={() => sendScreencast({ type: 'forward' })}
+              onClick={() => handleNavControl('forward')}
               disabled={!browserRunning}
               title="Forward"
               aria-label="Forward"
@@ -561,7 +762,7 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
             </button>
             <button
               type="button"
-              onClick={() => sendScreencast({ type: 'reload' })}
+              onClick={() => handleNavControl('reload')}
               disabled={!browserRunning}
               title="Reload"
               aria-label="Reload"
@@ -573,11 +774,7 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                if (!browserRunning) {
-                  void handleStartBrowser();
-                } else {
-                  sendScreencast({ type: 'navigate', url: urlInput.trim() });
-                }
+                void handleNavigateUrl(urlInput);
               }}
               className="flex-1 flex items-center gap-1.5 px-2.5 py-1 rounded-lg"
               style={{
@@ -585,14 +782,37 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
                 border: '1px solid var(--border-subtle)',
               }}
             >
-              <Globe size={13} style={{ color: 'var(--text-muted)' }} />
+              {navigating ? (
+                <Loader2 size={13} className="animate-spin shrink-0" style={{ color: 'var(--accent-computer)' }} />
+              ) : (
+                <Globe size={13} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
+              )}
               <input
+                ref={urlInputRef}
                 type="text"
+                aria-label="Live browser URL"
                 value={urlInput}
                 onChange={(e) => setUrlInput(e.target.value)}
+                onFocus={() => {
+                  urlFocusedRef.current = true;
+                }}
+                onBlur={() => {
+                  urlFocusedRef.current = false;
+                }}
+                onKeyDown={(e) => e.stopPropagation()}
                 placeholder="https://…"
                 className="w-full text-[12px] bg-transparent outline-none"
               />
+              <button
+                type="submit"
+                disabled={navigating || !urlInput.trim()}
+                title="Go"
+                aria-label="Go to URL"
+                className="px-1.5 py-0.5 rounded text-[11px] font-medium hover:bg-[var(--bg-active)] disabled:opacity-40 shrink-0"
+                style={{ color: 'var(--text-secondary)' }}
+              >
+                Go
+              </button>
             </form>
 
             {browserRunning ? (
@@ -632,7 +852,7 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
           ref={viewportRef}
           className="relative flex-1 min-h-[220px] flex items-center justify-center overflow-hidden"
           style={{ backgroundColor: '#18191C' }}
-          tabIndex={interactive && source === 'screencast' ? 0 : -1}
+          tabIndex={canInteract && source === 'screencast' ? 0 : -1}
           onKeyDown={handleImageKeyDown}
         >
           {source === 'vnc' ? (
@@ -643,25 +863,25 @@ export const LiveVncCanvas = forwardRef<LiveVncHandle, LiveVncCanvasProps>(
               src={frameDataUrl}
               alt={activeTitle || 'Live Browser'}
               onMouseDown={() => {
-                if (interactive) viewportRef.current?.focus();
+                if (canInteract) viewportRef.current?.focus();
               }}
               onClick={(e) => handleImagePointer(e, 'click')}
               onDoubleClick={(e) => handleImagePointer(e, 'dblclick')}
               onAuxClick={(e) => {
-                if (e.button === 1 && interactive) {
+                if (e.button === 1 && canInteract) {
                   e.preventDefault();
                   handleImagePointer(e, 'click', 'middle');
                 }
               }}
               onContextMenu={(e) => {
-                if (interactive) {
+                if (canInteract) {
                   e.preventDefault();
                   handleImagePointer(e, 'click', 'right');
                 }
               }}
               onWheel={handleImageWheel}
               className={`max-w-full max-h-full object-contain select-none ${
-                interactive ? 'cursor-pointer' : 'cursor-default'
+                canInteract ? 'cursor-pointer' : 'cursor-default'
               }`}
               draggable={false}
             />

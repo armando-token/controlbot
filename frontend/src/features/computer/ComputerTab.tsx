@@ -142,6 +142,8 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
         style={{ borderBottom: '1px solid var(--border-subtle)' }}
       >
         <div
+          role="tablist"
+          aria-label="Computer view"
           className="inline-flex rounded-lg p-0.5"
           style={{ backgroundColor: 'var(--bg-subtle)' }}
         >
@@ -155,20 +157,29 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
             const Icon = t.icon;
             const active = subTab === t.id;
             return (
-              <button
+              <div
                 key={t.id}
-                type="button"
-                onClick={() => setSubTab(t.id)}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors"
-                style={{
-                  backgroundColor: active ? 'var(--bg-canvas)' : 'transparent',
-                  color: active ? 'var(--text-primary)' : 'var(--text-secondary)',
-                  boxShadow: active ? 'var(--shadow-sm)' : 'none',
-                }}
+                role="tab"
+                aria-selected={active}
+                aria-label={`${t.label}`}
+                className="inline-flex"
               >
-                <Icon size={13} strokeWidth={1.75} />
-                <span>{t.label}</span>
-              </button>
+                <button
+                  type="button"
+                  aria-label={`${t.label}`}
+                  aria-pressed={active}
+                  onClick={() => setSubTab(t.id)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors"
+                  style={{
+                    backgroundColor: active ? 'var(--bg-canvas)' : 'transparent',
+                    color: active ? 'var(--text-primary)' : 'var(--text-secondary)',
+                    boxShadow: active ? 'var(--shadow-sm)' : 'none',
+                  }}
+                >
+                  <Icon size={13} strokeWidth={1.75} />
+                  <span>{t.label}</span>
+                </button>
+              </div>
             );
           })}
         </div>
@@ -362,6 +373,7 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
                 vmId={vmId}
                 source={effectiveSource}
                 interactive={isTakeover}
+                allowDirectBrowserInput={effectiveSource === 'screencast'}
               />
             )}
           </div>
@@ -390,13 +402,19 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
           className="p-4 space-y-3"
         >
           <div>
-            <label className="block text-[12px] font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+            <label
+              htmlFor="teach-task-name"
+              className="block text-[12px] font-medium mb-1"
+              style={{ color: 'var(--text-secondary)' }}
+            >
               Task name
             </label>
             <input
+              id="teach-task-name"
               type="text"
               autoFocus
               required
+              aria-label="Task name"
               value={teachName}
               onChange={(e) => setTeachName(e.target.value)}
               placeholder="e.g. Export weekly metrics CSV"
@@ -414,6 +432,7 @@ export const ComputerTab: React.FC<ComputerTabProps> = ({ bot, vmId = 'default' 
             </button>
             <button
               type="submit"
+              aria-label="Start watching"
               disabled={!teachName.trim() || teachStartMutation.isPending}
               className="px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium text-white"
               style={{ backgroundColor: 'var(--accent-computer)' }}

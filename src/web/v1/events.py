@@ -22,7 +22,9 @@ _COLON_EPOCH_RE = re.compile(r"^([A-Za-z0-9_-]+):(\d+)$")
 _EVT_LEGACY_RE = re.compile(r"^evt_(\d+)$")
 _DIGITS_RE = re.compile(r"^(\d+)$")
 
-_INLINE_TOKEN_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pou]_[A-Za-z0-9_]{8,})\b")
+_INLINE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b"
+)
 _FORM_FIELD_KEYS: frozenset[str] = frozenset(
     {"name", "label", "secret", "placeholder", "required", "type"}
 )
@@ -141,6 +143,7 @@ class EventBus:
         self._store: Any | None = None
         self._own_conn: sqlite3.Connection | None = None
         self._observers: list[Callable[[dict[str, Any]], None]] = []
+        self._closed: bool = False
 
         if store is not None:
             self.attach_store(store)
@@ -166,9 +169,25 @@ class EventBus:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
+            subscribers = list(self._subscribers)
             if self._own_conn is not None:
                 self._own_conn.close()
                 self._own_conn = None
+
+        running_loop: asyncio.AbstractEventLoop | None = None
+        with contextlib.suppress(RuntimeError):
+            running_loop = asyncio.get_running_loop()
+
+        sentinel: tuple[int, dict[str, Any]] = (-1, {"type": "_bus.closed"})
+        for sub in subscribers:
+            if sub.loop.is_closed():
+                continue
+            if running_loop is sub.loop:
+                self._enqueue_nowait(sub, sentinel)
+            else:
+                with contextlib.suppress(RuntimeError):
+                    sub.loop.call_soon_threadsafe(self._enqueue_nowait, sub, sentinel)
 
     @staticmethod
     def _ensure_sse_tables(conn: sqlite3.Connection) -> None:
@@ -408,14 +427,40 @@ class EventBus:
         ts = utc_iso_now()
         store_lock = self._store._lock if self._store is not None else contextlib.nullcontext()
         with store_lock, self._lock:
-            seq = self._persist_event(
-                event_type,
-                scrubbed_payload,
-                bot_id=bot_id,
-                thread_id=thread_id,
-                turn_id=turn_id,
-                created_at=ts,
-            )
+            if self._closed:
+                return {
+                    "id": f"evt_{self._seq:06d}_{self._epoch}",
+                    "ts": ts,
+                    "bot_id": bot_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "type": event_type,
+                    "payload": scrubbed_payload,
+                    "dropped_closed": True,
+                }
+            try:
+                seq = self._persist_event(
+                    event_type,
+                    scrubbed_payload,
+                    bot_id=bot_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    created_at=ts,
+                )
+            except sqlite3.ProgrammingError as exc:
+                if "closed database" in str(exc).lower():
+                    self._closed = True
+                    return {
+                        "id": f"evt_{self._seq:06d}_{self._epoch}",
+                        "ts": ts,
+                        "bot_id": bot_id,
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "type": event_type,
+                        "payload": scrubbed_payload,
+                        "dropped_closed": True,
+                    }
+                raise
             self._seq = max(self._seq, seq)
             event: dict[str, Any] = {
                 "id": f"evt_{seq:06d}_{self._epoch}",
@@ -458,7 +503,7 @@ class EventBus:
         latest_seq: int,
     ) -> dict[str, Any]:
         return {
-            "id": self.last_event_id or f"evt_{latest_seq:06d}_{self._epoch}",
+            "id": None,
             "ts": utc_iso_now(),
             "bot_id": None,
             "thread_id": None,
@@ -555,6 +600,51 @@ class EventBus:
 
         return None, _fetch_after(after_seq), after_seq
 
+    def _handle_overflow(
+        self,
+        subscriber: _Subscriber,
+        queue: asyncio.Queue[tuple[int, dict[str, Any]]],
+        pending: deque[tuple[int, dict[str, Any]]],
+        last_sent_seq: int,
+        client_last_event_id: str | None,
+        *,
+        current_item: tuple[int, dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], int, bool]:
+        """Drain stale queued events on overflow; avoid yielding seq < latest_seq after resync."""
+        subscriber.overflowed = False
+        drained: list[tuple[int, dict[str, Any]]] = list(pending)
+        pending.clear()
+        while True:
+            try:
+                drained.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        max_drained_seq = max((s for s, _ in drained if s > 0), default=0)
+        cur_seq = current_item[0] if current_item is not None and current_item[0] > 0 else 0
+        latest_seq = max(last_sent_seq, self._seq, max_drained_seq, cur_seq)
+        for s, item_ev in drained:
+            if (s == -1 and item_ev.get("type") == "_bus.closed") or (
+                s >= latest_seq and s > last_sent_seq
+            ):
+                pending.append((s, item_ev))
+        keep_current = (
+            current_item is not None
+            and current_item[0] >= latest_seq
+            and current_item[0] > last_sent_seq
+        )
+        resync = self._build_resync_event(
+            reason="slow_consumer_overflow",
+            client_last_event_id=client_last_event_id,
+            latest_seq=latest_seq,
+        )
+        has_latest_queued = keep_current or any(s >= latest_seq for s, _ in pending if s > 0)
+        new_last_sent = (
+            max(last_sent_seq, latest_seq - 1)
+            if has_latest_queued and latest_seq > 0
+            else max(last_sent_seq, latest_seq)
+        )
+        return resync, new_last_sent, keep_current
+
     async def subscribe(
         self,
         last_event_id: str | None = None,
@@ -568,9 +658,12 @@ class EventBus:
 
         store_lock = self._store._lock if self._store is not None else contextlib.nullcontext()
         with store_lock, self._lock:
+            if self._closed:
+                return
             self._subscribers.add(subscriber)
             resync_ev, replay_items, last_sent_seq = self._prepare_replay(last_event_id)
 
+        pending: deque[tuple[int, dict[str, Any]]] = deque()
         try:
             if resync_ev is not None:
                 yield resync_ev
@@ -581,25 +674,34 @@ class EventBus:
                     yield ev
 
             while True:
+                if self._closed:
+                    break
                 if subscriber.overflowed:
-                    subscriber.overflowed = False
-                    yield self._build_resync_event(
-                        reason="slow_consumer_overflow",
-                        client_last_event_id=last_event_id,
-                        latest_seq=max(last_sent_seq, self._seq),
+                    resync, last_sent_seq, _ = self._handle_overflow(
+                        subscriber, queue, pending, last_sent_seq, last_event_id
                     )
-                seq, ev = await queue.get()
+                    yield resync
+                seq, ev = pending.popleft() if pending else await queue.get()
+                if seq == -1 and ev.get("type") == "_bus.closed":
+                    break
                 if subscriber.overflowed:
-                    subscriber.overflowed = False
-                    yield self._build_resync_event(
-                        reason="slow_consumer_overflow",
-                        client_last_event_id=last_event_id,
-                        latest_seq=max(last_sent_seq, self._seq),
+                    resync, last_sent_seq, keep_cur = self._handle_overflow(
+                        subscriber,
+                        queue,
+                        pending,
+                        last_sent_seq,
+                        last_event_id,
+                        current_item=(seq, ev),
                     )
+                    yield resync
+                    if not keep_cur:
+                        continue
                 if seq <= last_sent_seq:
                     continue
                 last_sent_seq = seq
                 yield ev
+        except asyncio.CancelledError:
+            return
         finally:
             with self._lock:
                 self._subscribers.discard(subscriber)
@@ -619,9 +721,12 @@ class EventBus:
 
         store_lock = self._store._lock if self._store is not None else contextlib.nullcontext()
         with store_lock, self._lock:
+            if self._closed:
+                return
             self._subscribers.add(subscriber)
             resync_ev, replay_items, last_sent_seq = self._prepare_replay(last_event_id)
 
+        pending: deque[tuple[int, dict[str, Any]]] = deque()
         try:
             yield ": connected\n\n"
             yield "retry: 2000\n\n"
@@ -635,33 +740,43 @@ class EventBus:
                     yield self.format_sse(ev)
 
             while True:
+                if self._closed:
+                    break
                 if subscriber.overflowed:
-                    subscriber.overflowed = False
-                    yield self.format_sse(
-                        self._build_resync_event(
-                            reason="slow_consumer_overflow",
-                            client_last_event_id=last_event_id,
-                            latest_seq=max(last_sent_seq, self._seq),
-                        )
+                    resync, last_sent_seq, _ = self._handle_overflow(
+                        subscriber, queue, pending, last_sent_seq, last_event_id
                     )
-                try:
-                    seq, ev = await asyncio.wait_for(queue.get(), timeout=keepalive_seconds)
-                except TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
+                    yield self.format_sse(resync)
+                if pending:
+                    seq, ev = pending.popleft()
+                else:
+                    try:
+                        seq, ev = await asyncio.wait_for(queue.get(), timeout=keepalive_seconds)
+                    except TimeoutError:
+                        if self._closed:
+                            break
+                        yield ": keepalive\n\n"
+                        continue
+                if seq == -1 and ev.get("type") == "_bus.closed":
+                    break
                 if subscriber.overflowed:
-                    subscriber.overflowed = False
-                    yield self.format_sse(
-                        self._build_resync_event(
-                            reason="slow_consumer_overflow",
-                            client_last_event_id=last_event_id,
-                            latest_seq=max(last_sent_seq, self._seq),
-                        )
+                    resync, last_sent_seq, keep_cur = self._handle_overflow(
+                        subscriber,
+                        queue,
+                        pending,
+                        last_sent_seq,
+                        last_event_id,
+                        current_item=(seq, ev),
                     )
+                    yield self.format_sse(resync)
+                    if not keep_cur:
+                        continue
                 if seq <= last_sent_seq:
                     continue
                 last_sent_seq = seq
                 yield self.format_sse(ev)
+        except asyncio.CancelledError:
+            return
         finally:
             with self._lock:
                 self._subscribers.discard(subscriber)
@@ -670,4 +785,7 @@ class EventBus:
     def format_sse(event: dict[str, Any]) -> str:
         """Format a single event envelope as an SSE frame."""
         encoded = json.dumps(event, ensure_ascii=False)
-        return f"id: {event['id']}\ndata: {encoded}\n\n"
+        ev_id = event.get("id")
+        if event.get("type") == "stream.resync" or not ev_id:
+            return f"data: {encoded}\n\n"
+        return f"id: {ev_id}\ndata: {encoded}\n\n"

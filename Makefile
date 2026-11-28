@@ -1,6 +1,8 @@
 UV ?= uv
+QA_TARGET_URL ?= http://127.0.0.1:8000
+QA_CAMPAIGN_DIR ?=
 
-.PHONY: doctor test test-n1 test-n2 test-n3 test-acceptance demo test-offline bench lint typecheck check ui server
+.PHONY: doctor test test-n1 test-n2 test-n3 test-acceptance demo test-offline bench lint typecheck check ui server qa-baseline
 
 doctor:
 	$(UV) run python -m src.doctor
@@ -47,3 +49,9 @@ ui:
 
 server:
 	$(UV) run python -m src.local_server --no-lab
+
+qa-baseline:
+	$(MAKE) doctor
+	flock "$$(git rev-parse --git-common-dir)/qa_frontend_build.lock" npm --prefix frontend run build
+	$(UV) run python -m src.qa baseline --target-url "$(QA_TARGET_URL)" $(if $(QA_CAMPAIGN_DIR),--output-dir "$(QA_CAMPAIGN_DIR)",) --no-build-frontend --json
+	$(UV) run pytest tests/integration/test_qa_baseline_surface.py -v

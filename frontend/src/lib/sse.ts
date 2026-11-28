@@ -46,6 +46,21 @@ export function parseSseEventId(raw: string): {
   return { epoch: null, seq: null };
 }
 
+export function shouldAdvanceEventId(currentId: string | null, nextId: string): boolean {
+  const trimmedNext = nextId.trim();
+  if (!trimmedNext) return false;
+  if (!currentId) return true;
+  const cur = parseSseEventId(currentId);
+  const nxt = parseSseEventId(trimmedNext);
+  if (cur.seq !== null && nxt.seq !== null) {
+    if (cur.epoch === nxt.epoch || cur.epoch === null || nxt.epoch === null) {
+      return nxt.seq > cur.seq;
+    }
+    return true;
+  }
+  return true;
+}
+
 export function startSseBridge(queryClient: QueryClient): () => void {
   let es: EventSource | null = null;
   let closed = false;
@@ -59,7 +74,7 @@ export function startSseBridge(queryClient: QueryClient): () => void {
     const computerStore = useComputerStore.getState();
     const uiStore = useUiStore.getState();
 
-    if (env.id) {
+    if (env.id && shouldAdvanceEventId(streamStore.lastEventId, env.id)) {
       streamStore.setLastEventId(env.id);
     }
 
@@ -205,8 +220,31 @@ export function startSseBridge(queryClient: QueryClient): () => void {
       case 'computer.state': {
         const st = payload as unknown as ComputerStatus;
         if (st && st.vm_id) {
+          const prev = computerStore.byVmId[st.vm_id];
+          const prevUrl = typeof prev?.active_url === 'string' ? prev.active_url.trim() : '';
+          const nextUrl = typeof st.active_url === 'string' ? st.active_url.trim() : '';
+          const hasRealUrl =
+            Boolean(nextUrl) &&
+            nextUrl !== 'about:blank' &&
+            !nextUrl.startsWith('chrome-error://');
+          const prevStep = prev?.active_step_summary ?? '';
+          const nextStep = st.active_step_summary ?? '';
+          const isNavStep =
+            Boolean(nextStep) &&
+            nextStep !== prevStep &&
+            /^(Navigat|Start|Open|Click|Scroll|Type|Reload)/i.test(nextStep);
+          const browserNavigated =
+            Boolean(st.browser_running) &&
+            hasRealUrl &&
+            (!prev?.browser_running || nextUrl !== prevUrl || isNavStep);
+
           computerStore.setStatus(st);
           queryClient.setQueryData(['computer-status', st.vm_id], st);
+
+          if (browserNavigated) {
+            computerStore.setPreferredSource('screencast');
+            uiStore.openInspectorTab('computer');
+          }
         }
         break;
       }
@@ -251,7 +289,16 @@ export function startSseBridge(queryClient: QueryClient): () => void {
 
       case 'stream.resync': {
         if (!env.id && typeof payload.last_event_id === 'string' && payload.last_event_id) {
-          streamStore.setLastEventId(payload.last_event_id);
+          const isAuthoritativeReset =
+            payload.reason === 'epoch_mismatch' ||
+            payload.reason === 'sequence_ahead' ||
+            payload.reason === 'invalid_cursor';
+          if (
+            isAuthoritativeReset ||
+            shouldAdvanceEventId(streamStore.lastEventId, payload.last_event_id)
+          ) {
+            streamStore.setLastEventId(payload.last_event_id);
+          }
         }
         streamStore.clearTurns();
         hitlStore.markResync();
@@ -353,8 +400,13 @@ export function startSseBridge(queryClient: QueryClient): () => void {
       try {
         const parsed = JSON.parse(ev.data) as ServerSseEnvelope;
         if (parsed && typeof parsed.type === 'string') {
-          if (!parsed.id && ev.lastEventId) {
-            useChatStreamStore.getState().setLastEventId(ev.lastEventId);
+          const store = useChatStreamStore.getState();
+          if (
+            !parsed.id &&
+            ev.lastEventId &&
+            shouldAdvanceEventId(store.lastEventId, ev.lastEventId)
+          ) {
+            store.setLastEventId(ev.lastEventId);
           }
           dispatchEnvelope(parsed);
         }
@@ -393,7 +445,9 @@ export function startSseBridge(queryClient: QueryClient): () => void {
     }
 
     es.onerror = () => {
-      if (!closed) {
+      const isHidden =
+        typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      if (!closed && !isHidden && attempt > 0) {
         reportClientError({
           kind: 'sse_error',
           message: `SSE stream disconnected or errored (attempt ${attempt + 1})`,
@@ -423,9 +477,7 @@ export function startSseBridge(queryClient: QueryClient): () => void {
     }, delayMs);
   };
 
-  connect();
-
-  return () => {
+  const handleUnload = () => {
     closed = true;
     useChatStreamStore.getState().setSseConnected(false);
     if (reconnectTimer !== null) {
@@ -436,5 +488,16 @@ export function startSseBridge(queryClient: QueryClient): () => void {
       es.close();
       es = null;
     }
+  };
+
+  window.addEventListener('pagehide', handleUnload);
+  window.addEventListener('beforeunload', handleUnload);
+
+  connect();
+
+  return () => {
+    window.removeEventListener('pagehide', handleUnload);
+    window.removeEventListener('beforeunload', handleUnload);
+    handleUnload();
   };
 }

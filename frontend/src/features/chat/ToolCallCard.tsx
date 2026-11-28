@@ -64,6 +64,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ call }) => {
     >
       <button
         type="button"
+        aria-label={`Tool call ${call.tool_name}`}
         onClick={() => hasPreview && setExpanded((v) => !v)}
         disabled={!hasPreview}
         className="w-full flex items-center justify-between gap-2 px-3 py-1.5 text-left text-[12.5px] disabled:cursor-default hover:bg-[var(--bg-subtle)] transition-colors"

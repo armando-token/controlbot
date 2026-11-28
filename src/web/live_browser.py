@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import html
 import ipaddress
 import math
 import re
@@ -19,8 +20,29 @@ from src.storage.redaction import redact_payload_strict
 
 _VIEWPORT_WIDTH = 1280
 _VIEWPORT_HEIGHT = 800
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_BLOCKED_OR_DOWNLOAD_HTML = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<title>Page unavailable in Live Browser</title>"
+    "<style>body{font-family:-apple-system,system-ui,sans-serif;background:#f8fafc;color:#0f172a;"
+    "margin:0;padding:48px;}h1{font-size:22px;margin:0 0 10px;}p{color:#475569;max-width:640px;"
+    "line-height:1.55;}code{background:#e2e8f0;padding:2px 6px;border-radius:4px;"
+    "word-break:break-all;}"
+    "</style></head><body>"
+    "<h1>Website blocked or returned a download</h1>"
+    "<p>The site <code>{url}</code> refused access from this server&apos;s region/IP or returned a "
+    "file download instead of a webpage.</p>"
+    "<p>You can enter another URL in the address bar above, or ask your bot to open an accessible "
+    "product/search page here.</p>"
+    "</body></html>"
+)
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]", "10.", "192.168.")
-_INLINE_TOKEN_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pou]_[A-Za-z0-9_]{8,})\b")
+_INLINE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b"
+)
 _SELECTOR_SAFE_RE = re.compile(r'["\\\x00-\x1f\x7f]')
 _EXTRACT_JS = r"""(maxElements) => {
   const collectText = (doc) => {
@@ -392,8 +414,8 @@ class LiveBrowserController:
             title = await page.title()
         return {
             "running": True,
-            "url": page.url,
-            "title": title,
+            "url": _scrub_browser_str(page.url),
+            "title": _scrub_browser_str(title),
             "viewport": {"width": _VIEWPORT_WIDTH, "height": _VIEWPORT_HEIGHT},
         }
 
@@ -407,12 +429,30 @@ class LiveBrowserController:
             user_data_dir=str(self._profile_root),
             headless=True,
             viewport={"width": _VIEWPORT_WIDTH, "height": _VIEWPORT_HEIGHT},
+            user_agent=_DEFAULT_USER_AGENT,
         )
         self._context.set_default_timeout(12000)
         self._context.on("page", self._on_new_page)
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
         return self._page
+
+    async def _goto_unlocked(self, page: Page, target: str) -> None:
+        try:
+            await page.goto(target, wait_until="domcontentloaded")
+        except Exception as exc:
+            if "Download is starting" in str(exc):
+                safe_url = _scrub_browser_str(target)
+                with contextlib.suppress(Exception):
+                    await page.set_content(
+                        _BLOCKED_OR_DOWNLOAD_HTML.format(url=html.escape(safe_url)),
+                        wait_until="domcontentloaded",
+                    )
+                raise RuntimeError(
+                    f"Website blocked access from this server region or returned a "
+                    f"download instead of a webpage ({safe_url})."
+                ) from exc
+            raise
 
     async def start(self, initial_url: str | None = None) -> dict[str, Any]:
         """Lazily start persistent Chromium browser if not already running."""
@@ -421,7 +461,7 @@ class LiveBrowserController:
             page = await self._ensure_context_unlocked()
             if initial_url and initial_url.strip():
                 target = normalize_browser_url(initial_url)
-                await page.goto(target, wait_until="domcontentloaded")
+                await self._goto_unlocked(page, target)
             elif not was_running:
                 await page.set_content(_WELCOME_HTML, wait_until="domcontentloaded")
             return await self._unlocked_status()
@@ -445,7 +485,7 @@ class LiveBrowserController:
         target = normalize_browser_url(raw_url)
         async with self._lock:
             page = await self._ensure_context_unlocked()
-            await page.goto(target, wait_until="domcontentloaded")
+            await self._goto_unlocked(page, target)
             return await self._unlocked_status()
 
     async def go_back(self) -> dict[str, Any]:
@@ -551,8 +591,8 @@ class LiveBrowserController:
                 return {
                     "type": "frame",
                     "data": base64.b64encode(raw_bytes).decode("ascii"),
-                    "url": page.url,
-                    "title": title,
+                    "url": _scrub_browser_str(page.url),
+                    "title": _scrub_browser_str(title),
                     "width": _VIEWPORT_WIDTH,
                     "height": _VIEWPORT_HEIGHT,
                 }

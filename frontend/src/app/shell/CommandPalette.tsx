@@ -57,9 +57,11 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const wasOpenRef = useRef(false);
+  const focusRestoredRef = useRef(false);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   if (open && !wasOpenRef.current) {
+    focusRestoredRef.current = false;
     const active = document.activeElement;
     if (
       active instanceof HTMLElement &&
@@ -70,10 +72,21 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
   }
 
   const restoreFocusBeforeClose = useCallback(() => {
+    focusRestoredRef.current = true;
     const restoreTarget = previousFocusRef.current;
     previousFocusRef.current = null;
-    if (restoreTarget && restoreTarget.isConnected) {
+    if (
+      restoreTarget &&
+      restoreTarget.isConnected &&
+      restoreTarget !== document.body &&
+      restoreTarget !== document.documentElement
+    ) {
       restoreTarget.focus();
+    } else {
+      const fallback = document.querySelector<HTMLElement>(
+        'textarea[aria-label="Message composer"], button[aria-label="Search and commands"]',
+      );
+      fallback?.focus();
     }
   }, []);
 
@@ -144,17 +157,27 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
         }
       }
     };
-    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', onKeyDown, true);
     return () => {
-      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keydown', onKeyDown, true);
       const restoreTarget = previousFocusRef.current;
       previousFocusRef.current = null;
-      if (
-        restoreTarget &&
-        restoreTarget.isConnected &&
-        !document.querySelector('[role="dialog"][aria-modal="true"]')
-      ) {
-        restoreTarget.focus();
+      const alreadyRestored = focusRestoredRef.current;
+      focusRestoredRef.current = false;
+      if (!alreadyRestored && !document.querySelector('[role="dialog"][aria-modal="true"]')) {
+        if (
+          restoreTarget &&
+          restoreTarget.isConnected &&
+          restoreTarget !== document.body &&
+          restoreTarget !== document.documentElement
+        ) {
+          restoreTarget.focus();
+        } else {
+          const fallback = document.querySelector<HTMLElement>(
+            'textarea[aria-label="Message composer"], button[aria-label="Search and commands"]',
+          );
+          fallback?.focus();
+        }
       }
     };
   }, [open]);
@@ -418,6 +441,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
 
   if (!open) return null;
 
+  const dialogLabel = mode === 'bots' ? 'Jump to a bot' : 'Global search and command palette';
+  const searchLabel =
+    mode === 'bots' ? 'Jump to a bot' : 'Search bots, messages, Pages, routines, or commands';
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] px-4"
@@ -434,7 +461,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
         tabIndex={-1}
         role="dialog"
         aria-modal="true"
-        aria-label={mode === 'bots' ? 'Jump to a bot' : 'Global search and command palette'}
+        aria-label={`${dialogLabel}`}
         className="w-full max-w-xl rounded-2xl overflow-hidden outline-none"
         style={{
           backgroundColor: 'var(--bg-elevated)',
@@ -450,7 +477,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
           <input
             type="text"
             autoFocus
-            aria-label={mode === 'bots' ? 'Jump to a bot' : 'Search bots, messages, Pages, routines, or commands'}
+            aria-label={`${searchLabel}`}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -515,6 +542,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ bots, channels }
                       itemRefs.current[idx] = el;
                     }}
                     type="button"
+                    aria-label={`${item.label}`}
                     onMouseEnter={() => setActiveIdx(idx)}
                     onClick={item.onSelect}
                     className="w-full flex items-center justify-between gap-3 px-2.5 py-2 rounded-xl text-left transition-colors"

@@ -26,16 +26,30 @@ _REDACTED_AUTH_PUNCT_RE = re.compile(
 _QUERY_SECRET_RE = re.compile(
     r"(?i)\b("
     r"[A-Za-z0-9_.-]*[_-](?:password|passwd|secret(?:[_-]?key)?|private[_-]?key|"
-    r"api[_-]?key|apikey|token|cookies?|credentials?)"
+    r"api[_-]?key|apikey|token|cookies?|credentials?|auth|webhook[_-]?key)"
     r"|(?-i:[a-z0-9][A-Za-z0-9]*(?:Password|Passwd|Secret(?:Key)?|PrivateKey|"
-    r"ApiKey|Token|Cookies?|Credentials?))"
+    r"ApiKey|Token|Cookies?|Credentials?|Auth|WebhookKey))"
     r"|password|passwd|secret|secret_key|secretKey|secret-key|"
     r"api_key|api-key|apikey|x_api_key|x-api-key|xApiKey|token|"
     r"access_token|accessToken|refresh_token|refreshToken|auth_token|authToken|"
+    r"cap_token|capToken|cap-token|webhook_key|webhookKey|webhook-key|auth|"
     r"session_token|sessionToken|csrf_token|csrfToken|id_token|idToken|"
     r"client_secret|clientSecret|private_key|privateKey|credential|credentials|"
     r"authorization|cookie|cookies|set_cookie|set-cookie|setCookie|bearer)"
     r"=(?!\[REDACTED\](?:[\s&;,'\"]|$))([^\s&;,'\"]+)"
+)
+_RAW_SECRET_TOKEN_RE = re.compile(
+    r"(?:"
+    r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{8,}\b"
+    r"|(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{12,}\b"
+    r"|(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{8,}\b"
+    r"|(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{8,}\b"
+    r"|(?<![A-Za-z0-9])sk-(?:proj-|live-|test-|svcacct-)?[A-Za-z0-9_-]{8,}\b"
+    r"|(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{16,}\b"
+    r"|(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b"
+    r"|-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+    r")"
 )
 
 
@@ -72,9 +86,10 @@ def is_sensitive_key_strict(key: str) -> bool:
 
 
 def redact_string_strict(value: str) -> str:
-    """Scrub Bearer/Basic headers, URL userinfo, and inline secret=value pairs."""
+    """Scrub Bearer/Basic headers, URL userinfo, inline secret=value pairs, and raw tokens."""
     scrubbed = redact_string(value)
-    return _QUERY_SECRET_RE.sub(rf"\1={REDACTED_PLACEHOLDER}", scrubbed)
+    scrubbed = _QUERY_SECRET_RE.sub(rf"\1={REDACTED_PLACEHOLDER}", scrubbed)
+    return _RAW_SECRET_TOKEN_RE.sub(REDACTED_PLACEHOLDER, scrubbed)
 
 
 def redact_payload_strict(value: Any) -> Any:
@@ -146,5 +161,7 @@ def contains_unredacted_secret_strict(value: Any) -> bool:
         normalized = _REDACTED_AUTH_PUNCT_RE.sub(r"\1 [REDACTED] ", value)
         if contains_unredacted_secret(normalized):
             return True
-        return bool(_QUERY_SECRET_RE.search(normalized))
+        if _QUERY_SECRET_RE.search(normalized):
+            return True
+        return bool(_RAW_SECRET_TOKEN_RE.search(normalized))
     return bool(contains_unredacted_secret(value))
