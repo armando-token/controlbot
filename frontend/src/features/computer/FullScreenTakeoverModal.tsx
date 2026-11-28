@@ -25,6 +25,17 @@ const XK_v = 0x0076;
 
 const CONTROL_RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000] as const;
 const MAX_CONTROL_RECONNECT_ATTEMPTS = 6;
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) =>
+      !el.hasAttribute('disabled') &&
+      el.getAttribute('aria-hidden') !== 'true' &&
+      el.getClientRects().length > 0,
+  );
+}
 
 export const FullScreenTakeoverModal: React.FC = () => {
   const queryClient = useQueryClient();
@@ -52,6 +63,9 @@ export const FullScreenTakeoverModal: React.FC = () => {
     }
   }, [statusQuery.data, setStatus]);
 
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
   const canvasRef = useRef<LiveVncHandle | null>(null);
   const controlWsRef = useRef<WebSocket | null>(null);
   const viewportContainerRef = useRef<HTMLDivElement | null>(null);
@@ -59,6 +73,17 @@ export const FullScreenTakeoverModal: React.FC = () => {
 
   const [clipboardText, setClipboardText] = useState('');
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
+  const isOpen = Boolean(vmId);
+
+  if (isOpen && !wasOpenRef.current) {
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      (!dialogRef.current || !dialogRef.current.contains(active))
+    ) {
+      previousFocusRef.current = active;
+    }
+  }
 
   const currentStatus = status ?? statusQuery.data;
   const isTakeover = currentStatus?.control_owner === 'human_takeover';
@@ -82,19 +107,83 @@ export const FullScreenTakeoverModal: React.FC = () => {
     ws.send(JSON.stringify({ op: 'viewport.resize', width, height }));
   }, []);
 
-  // Capture-phase Escape handler so Escape closes the modal even when focus is inside <canvas> (noVNC) or <input>
+  // Capture-phase Escape and Tab focus-trap handler so keyboard navigation stays inside canvas (noVNC) or input
   useEffect(() => {
-    if (!vmId) return;
+    wasOpenRef.current = isOpen;
+    if (!isOpen) return;
+    if (!previousFocusRef.current) {
+      const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      if (prev && (!dialogRef.current || !dialogRef.current.contains(prev))) {
+        previousFocusRef.current = prev;
+      }
+    }
+
+    const raf = window.requestAnimationFrame(() => {
+      const root = dialogRef.current;
+      if (!root) return;
+      if (!root.contains(document.activeElement)) {
+        const focusables = getFocusableElements(root);
+        const preferred =
+          root.querySelector<HTMLElement>('[autofocus], [data-autofocus]') ??
+          focusables.find((el) => el.getAttribute('aria-label') !== 'Exit full screen') ??
+          focusables[0];
+        (preferred ?? root).focus();
+      }
+    });
+
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !e.isComposing) {
+      if (e.isComposing) return;
+      if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
         useUiStore.getState().setFullscreenComputerVmId(null);
+        return;
+      }
+      if (e.key === 'Tab') {
+        const root = dialogRef.current;
+        if (!root) return;
+        const focusables = getFocusableElements(root);
+        if (focusables.length === 0) {
+          e.preventDefault();
+          root.focus();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        if (!first || !last) return;
+        const active = document.activeElement;
+        if (e.shiftKey) {
+          if (active === first || active === root || !root.contains(active)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else if (active === last || !root.contains(active)) {
+          e.preventDefault();
+          first.focus();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [vmId]);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.removeEventListener('keydown', onKeyDown, true);
+      const restoreTarget = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (
+        restoreTarget &&
+        restoreTarget.isConnected &&
+        restoreTarget !== document.body &&
+        restoreTarget !== document.documentElement
+      ) {
+        restoreTarget.focus();
+      } else {
+        const fallback = document.querySelector<HTMLElement>(
+          'textarea[aria-label="Message composer"], button[aria-label="Search and commands"]',
+        );
+        fallback?.focus();
+      }
+    };
+  }, [isOpen]);
 
   // Control plane WebSocket for lease heartbeat (15s), viewport resize, clipboard push, teach steps, lease revoke
   useEffect(() => {
@@ -329,7 +418,9 @@ export const FullScreenTakeoverModal: React.FC = () => {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex flex-col p-3"
+      ref={dialogRef}
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex flex-col p-3 outline-none"
       style={{ backgroundColor: 'rgba(15, 23, 42, 0.55)', backdropFilter: 'blur(4px)' }}
       role="dialog"
       aria-modal="true"
@@ -426,6 +517,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
             {isTakeover ? (
               <button
                 type="button"
+                aria-label="I'm done"
                 onClick={() => handbackMutation.mutate()}
                 disabled={handbackMutation.isPending}
                 className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[13px] font-semibold text-white transition-opacity disabled:opacity-50"
@@ -437,6 +529,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
             ) : (
               <button
                 type="button"
+                aria-label="Take control"
                 onClick={() => takeoverMutation.mutate()}
                 disabled={takeoverMutation.isPending}
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-[13px] font-medium text-white"
@@ -501,6 +594,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
                 <button
                   key={btn.label}
                   type="button"
+                  aria-label={`${btn.label}`}
                   onClick={() => canvasRef.current?.sendKeyCombo(btn.keys)}
                   className="px-2 py-1 rounded-md font-mono text-[11.5px] hover:bg-[var(--bg-active)]"
                   style={{
@@ -516,6 +610,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
             <form onSubmit={pushClipboard} className="flex items-center gap-1.5">
               <input
                 type="text"
+                aria-label="Push text to VM clipboard"
                 value={clipboardText}
                 onChange={(e) => setClipboardText(e.target.value)}
                 placeholder="Push text to VM clipboard…"
@@ -557,6 +652,7 @@ export const FullScreenTakeoverModal: React.FC = () => {
               vmId={vmId}
               source={effectiveSource}
               interactive={isTakeover}
+              allowDirectBrowserInput={effectiveSource === 'screencast'}
             />
           )}
         </div>

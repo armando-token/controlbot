@@ -17,11 +17,15 @@ from src.storage.memory import (
     MemoryValidationError,
     normalize_scope,
 )
+from src.storage.redaction import contains_unredacted_secret_strict, redact_string_strict
 from src.web.v1.schemas import MemoryCreateRequest, MemoryPatchRequest
 
 
 def _raise_memory_http(status_code: int, detail: str | Exception, *, exc: Exception) -> None:
-    raise HTTPException(status_code=status_code, detail=str(detail)) from exc
+    scrubbed = redact_string_strict(str(detail))
+    if contains_unredacted_secret_strict(scrubbed):
+        scrubbed = "[REDACTED]"
+    raise HTTPException(status_code=status_code, detail=scrubbed) from exc
 
 
 def _clean_identity(value: str | None) -> str | None:

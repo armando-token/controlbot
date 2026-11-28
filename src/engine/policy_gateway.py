@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import contextlib
 import hashlib
 import inspect
+import os
 import posixpath
 import re
 import shlex
@@ -76,6 +79,49 @@ _DESTRUCTIVE_SAFETY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"\bdd\b[^;\n]*\bof=/dev/(?:sd|nvme|hd|vd|mmcblk|loop)\w*", re.IGNORECASE),
     ),
     (
+        "destructive_dd_critical_target",
+        re.compile(
+            r"(?:^|[\s;|&(])(?:(?:/[^\s]+/)?dd)\b[^;\n]*\bof=[\"']?"
+            r"(?:~(?:/[^\s;|&\"')]*)?|\$HOME(?:/[^\s;|&\"')]*)?|\$\{HOME\}(?:/[^\s;|&\"')]*)?|"
+            r"(?:/etc|/usr|/var|/home|/bin|/sbin|/lib|/lib64|/boot|/root|/opt|/sys|/proc)"
+            r"(?:/[^\s;|&\"')]*)?|/(?:\s|$|;|&|\||\"|'|\)|\})|\.git\b|\.sqlite3?\b|\.db\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_redirect_truncate",
+        re.compile(
+            r"(?:^|[\s;|&(:])(?:\{[A-Za-z_][A-Za-z0-9_]*\}|\d+|&)?>(?:\|(?!\|)|&(?!\s*(?:\d+|-)(?:\s|$|;|&|\|))|(?!>|&))\s*[\"']?"
+            r"(?:~(?:/[^\s;|&\"')]*)?|\$HOME(?:/[^\s;|&\"')]*)?|\$\{HOME\}(?:/[^\s;|&\"')]*)?|"
+            r"(?:/etc|/usr|/var|/home|/bin|/sbin|/lib|/lib64|/boot|/root|/opt|/sys|/proc)"
+            r"(?:/[^\s;|&\"')]*)?|/dev/(?:sd|nvme|hd|vd|mmcblk|loop|disk|mapper|mem|kmem)\w*|"
+            r"/(?=\s|$|;|&|\||\"|'|\)|\})|\.git\b|\.sqlite3?\b|\.db\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_cp_dev_null",
+        re.compile(
+            r"(?:^|[\s;|&(])(?:(?:/[^\s]+/)?cp)\b[^\n;|&]*\s[\"']?/dev/(?:null|zero)[\"']?\s+[^\n;|&]*?"
+            r"(?:~(?:/[^\s;|&\"')]*)?|\$HOME(?:/[^\s;|&\"')]*)?|\$\{HOME\}(?:/[^\s;|&\"')]*)?|"
+            r"(?:/etc|/usr|/var|/home|/bin|/sbin|/lib|/lib64|/boot|/root|/opt|/sys|/proc)"
+            r"(?:/[^\s;|&\"')]*)?|/dev/(?:sd|nvme|hd|vd|mmcblk|loop|disk|mapper)\w*|"
+            r"/(?=\s|$|;|&|\||\"|'|\)|\})|\.git\b|\.sqlite3?\b|\.db\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_mv_critical",
+        re.compile(
+            r"(?:^|[\s;|&(])(?:(?:/[^\s]+/)?mv)\s+(?:-[a-zA-Z0-9_-]+\s+|\"-[^\"]+\"\s+)*[\"']?"
+            r"(?:~(?:/[^\s;|&\"')]*)?|\$HOME(?:/[^\s;|&\"')]*)?|\$\{HOME\}(?:/[^\s;|&\"')]*)?|"
+            r"(?:/etc|/usr|/var|/home|/bin|/sbin|/lib|/lib64|/boot|/root|/opt|/sys|/proc)"
+            r"(?:/[^\s;|&\"')]*)?|/dev/(?:sd|nvme|hd|vd|mmcblk|loop|disk|mapper)\w*|"
+            r"/(?=\s|$|;|&|\||\"|'|\)|\})|\.git\b|\.sqlite3?\b|\.db\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "destructive_sql_drop_truncate",
         re.compile(r"\b(?:drop\s+(?:database|schema|table)|truncate\s+table)\b", re.IGNORECASE),
     ),
@@ -91,6 +137,33 @@ _DESTRUCTIVE_SAFETY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\bchmod\s+(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)\s+(?:777|a\+rwx)\s+"
             r"(?:/[^\s;|&\"']*|~[^\s;|&\"']*|\$HOME[^\s;|&\"']*)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_chmod_000_root",
+        re.compile(
+            r"\bchmod\s+(?:(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)\s+)*"
+            r"(?:0+|(?:a|ugo)-r(?:w?x?)?|u-rwx,g-rwx,o-rwx|(?:a|ugo)=)\s+"
+            r"(?:/[^\s;|&\"']*|~[^\s;|&\"']*|\$HOME[^\s;|&\"']*|\$\{HOME\}[^\s;|&\"']*)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_shred",
+        re.compile(
+            r"(?:^|[\s;|&(])(?:(?:/[^\s]+/)?shred)\s+(?!--help\b|--version\b)"
+            r"(?:[^\s;|&]+)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_truncate_file",
+        re.compile(
+            r"(?:^|\s|;|&&|\|\||\()(?:(?:/[^\s]+/)?truncate)\b[^\n;|&]*"
+            r"(?:(?:-s\s*0|--size(?:=|\s+)0)\b|"
+            r"(?:/etc|/usr|/var|/home|/bin|/sbin|/lib|/lib64|/boot|/root|/opt|/sys|/proc|/dev)"
+            r"(?:/[^\s;|&\"')]*)?|\.sqlite3?\b|\.db\b|\.git\b)",
             re.IGNORECASE,
         ),
     ),
@@ -121,11 +194,26 @@ def _match_safety_patterns(text: str) -> str | None:
             )
             or (reason == "destructive_dd_device" and not ("dd" in low and "of=/dev/" in low))
             or (
+                reason == "destructive_dd_critical_target"
+                and not ("dd" in low and "of=" in low)
+            )
+            or (reason == "destructive_redirect_truncate" and ">" not in text)
+            or (
+                reason == "destructive_cp_dev_null"
+                and not ("cp" in low and "/dev/" in low)
+            )
+            or (reason == "destructive_mv_critical" and "mv" not in low)
+            or (
                 reason == "destructive_sql_drop_truncate"
                 and not ("drop" in low or "truncate" in low)
             )
             or (reason == "destructive_db_or_git_wipe" and not (has_rm or "git" in low))
-            or (reason == "destructive_chmod_777_root" and "chmod" not in low)
+            or (
+                reason in {"destructive_chmod_777_root", "destructive_chmod_000_root"}
+                and "chmod" not in low
+            )
+            or (reason == "destructive_shred" and "shred" not in low)
+            or (reason == "destructive_truncate_file" and "truncate" not in low)
         ):
             continue
         if pattern.search(text) is not None:
@@ -713,11 +801,226 @@ def _is_critical_rm_target(target: str) -> bool:
     )
 
 
+_SAFE_OVERWRITE_DEV_PATHS: frozenset[str] = frozenset(
+    {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"}
+)
+_CRITICAL_DEV_PREFIXES: tuple[str, ...] = (
+    "/dev/sd",
+    "/dev/nvme",
+    "/dev/hd",
+    "/dev/vd",
+    "/dev/mmcblk",
+    "/dev/loop",
+    "/dev/disk",
+    "/dev/mapper",
+    "/dev/mem",
+    "/dev/kmem",
+)
+
+
+def _is_critical_overwrite_target(target: str) -> bool:
+    t = target.strip().strip("\"'")
+    if not t:
+        return False
+    low = t.lower()
+    if (
+        low == ".git"
+        or "/.git" in low
+        or ".git/" in low
+        or low.endswith((".sqlite", ".sqlite3", ".db"))
+    ):
+        return True
+    if t in {".", "./"}:
+        return False
+    if t in {"/", "/*", "*", "..", "../"} or t.endswith("/.."):
+        return True
+    if t.startswith(("~", "$HOME", "${HOME}")):
+        return True
+    if not t.startswith("/"):
+        return False
+    collapsed = re.sub(r"/+", "/", t) if "//" in t else t
+    norm = posixpath.normpath(collapsed)
+    if (
+        norm in _SAFE_OVERWRITE_DEV_PATHS
+        or norm.startswith("/dev/null#")
+        or norm.startswith("/dev/fd/")
+    ):
+        return False
+    if norm == "/dev" or any(norm.startswith(p) for p in _CRITICAL_DEV_PREFIXES):
+        return True
+    if norm.startswith("/dev/"):
+        return False
+    return norm in {"/", "/*", "*", ".."} or any(
+        norm == prefix or norm.startswith(f"{prefix}/")
+        for prefix in _CRITICAL_PATH_PREFIXES
+    )
+
+
 _SUBPROCESS_EXEC_FUNCS: frozenset[str] = frozenset(
     {"run", "Popen", "call", "check_call", "check_output"}
 )
 _OS_EXEC_FUNCS: frozenset[str] = frozenset({"system", "popen"})
-_PYTHON_AST_TRIGGER_WORDS: tuple[str, ...] = ("rmtree", "subprocess", "system", "popen")
+_OS_EXECL_FUNCS: frozenset[str] = frozenset({"execl", "execlp"})
+_OS_EXECLE_FUNCS: frozenset[str] = frozenset({"execle", "execlpe"})
+_OS_EXECV_FUNCS: frozenset[str] = frozenset({"execv", "execvp"})
+_OS_EXECVE_FUNCS: frozenset[str] = frozenset({"execve", "execvpe"})
+_OS_SPAWNL_FUNCS: frozenset[str] = frozenset({"spawnl", "spawnlp"})
+_OS_SPAWNLE_FUNCS: frozenset[str] = frozenset({"spawnle", "spawnlpe"})
+_OS_SPAWNV_FUNCS: frozenset[str] = frozenset({"spawnv", "spawnvp"})
+_OS_SPAWNVE_FUNCS: frozenset[str] = frozenset({"spawnve", "spawnvpe"})
+_OS_POSIX_SPAWN_FUNCS: frozenset[str] = frozenset({"posix_spawn", "posix_spawnp"})
+_OS_PROC_KIND_MAP: dict[str, str] = {
+    **{fn: "os_execl" for fn in _OS_EXECL_FUNCS},
+    **{fn: "os_execle" for fn in _OS_EXECLE_FUNCS},
+    **{fn: "os_execv" for fn in _OS_EXECV_FUNCS},
+    **{fn: "os_execve" for fn in _OS_EXECVE_FUNCS},
+    **{fn: "os_spawnl" for fn in _OS_SPAWNL_FUNCS},
+    **{fn: "os_spawnle" for fn in _OS_SPAWNLE_FUNCS},
+    **{fn: "os_spawnv" for fn in _OS_SPAWNV_FUNCS},
+    **{fn: "os_spawnve" for fn in _OS_SPAWNVE_FUNCS},
+    **{fn: "os_posix_spawn" for fn in _OS_POSIX_SPAWN_FUNCS},
+}
+_PROC_EXEC_KINDS: frozenset[str] = frozenset(
+    {
+        "os_execl",
+        "os_execle",
+        "os_execv",
+        "os_execve",
+        "os_spawnl",
+        "os_spawnle",
+        "os_spawnv",
+        "os_spawnve",
+        "os_posix_spawn",
+        "pty_spawn",
+    }
+)
+_FILEINPUT_FUNCS: frozenset[str] = frozenset({"input", "FileInput"})
+_OS_DELETE_FUNCS: frozenset[str] = frozenset({"remove", "unlink", "rmdir", "removedirs"})
+_OS_MOVE_FUNCS: frozenset[str] = frozenset({"rename", "renames", "replace"})
+_OS_LINK_FUNCS: frozenset[str] = frozenset({"symlink", "link"})
+_SHUTIL_COPY_FUNCS: frozenset[str] = frozenset({"copyfile", "copy", "copy2", "copytree"})
+_OS_OPEN_FLAG_NAMES: frozenset[str] = frozenset(
+    {"O_RDONLY", "O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND", "O_EXCL"}
+)
+_OS_OPEN_WRITE_MASK: int = (
+    getattr(os, "O_WRONLY", 1)
+    | getattr(os, "O_RDWR", 2)
+    | getattr(os, "O_CREAT", 64)
+    | getattr(os, "O_TRUNC", 512)
+    | getattr(os, "O_APPEND", 1024)
+)
+_OVERWRITE_STAGE_CMDS: frozenset[str] = frozenset(
+    {
+        "dd",
+        "cp",
+        "mv",
+        "shred",
+        "truncate",
+        "tee",
+        "install",
+        "ln",
+        "unlink",
+        "rmdir",
+        "sed",
+        "curl",
+        "wget",
+        "rsync",
+    }
+)
+_XARGS_DANGER_SINKS: frozenset[str] = (
+    frozenset(
+        {
+            "rm",
+            "chmod",
+            "git",
+            "psql",
+            "mysql",
+            "sqlite3",
+            "mkfs",
+            "wipefs",
+            "fdisk",
+            "parted",
+        }
+    )
+    | _OVERWRITE_STAGE_CMDS
+)
+_PATHLIB_PATH_CLASSES: frozenset[str] = frozenset(
+    {"Path", "PurePosixPath", "PurePath", "PosixPath"}
+)
+_PYTHON_AST_TRIGGER_WORDS: tuple[str, ...] = (
+    "rmtree",
+    "subprocess",
+    "system",
+    "popen",
+    "execl",
+    "execle",
+    "execlp",
+    "execlpe",
+    "execv",
+    "execve",
+    "execvp",
+    "execvpe",
+    "spawnl",
+    "spawnle",
+    "spawnlp",
+    "spawnlpe",
+    "spawnv",
+    "spawnve",
+    "spawnvp",
+    "spawnvpe",
+    "posix_spawn",
+    "posix_spawnp",
+    "pty",
+    "spawn",
+    "fileinput",
+    "getattr",
+    "remove",
+    "removedirs",
+    "unlink",
+    "rmdir",
+    "truncate",
+    "chmod",
+    "rename",
+    "renames",
+    "replace",
+    "move",
+    "write_text",
+    "write_bytes",
+    "open",
+    "symlink",
+    "hardlink_to",
+    "link",
+    "copyfile",
+    "copy2",
+    "copytree",
+    "copy",
+    "fileio",
+    "importlib",
+    "__import__",
+    "eval",
+    "exec",
+    "b64decode",
+    "urlsafe_b64decode",
+    "b16decode",
+    "b32decode",
+    "b85decode",
+    "a85decode",
+    "decodebytes",
+    "a2b_base64",
+    "fromhex",
+)
+_PYTHON_AST_TRIGGER_RE: re.Pattern[str] = re.compile(
+    r"rmtree|subprocess|system|popen|"
+    r"exec[lv][pe]*|spawn[lv][pe]*|posix_spawnp?|\bpty\b|\bspawn\b|fileinput|getattr|"
+    r"remove|unlink|rmdir|truncate|chmod|"
+    r"rename|replace|move|write_text|write_bytes|open|"
+    r"symlink|hardlink_to|\blink\b|copyfile|copy2|copytree|\bcopy\b|fileio|"
+    r"importlib|__import__|\beval\b|\bexec\b|"
+    r"b64decode|urlsafe_b64decode|b16decode|b32decode|b85decode|a85decode|"
+    r"decodebytes|a2b_base64|fromhex|"
+    r"__dict__|__builtins__|\bvars\b|attrgetter|sys\.modules|\bmodules\b|"
+    r"\bchr\b|\bbytes\b|\bbytearray\b|\blambda\b"
+)
 _PYTHON_MODULE_STMT_TYPES: tuple[type[ast.stmt], ...] = (
     ast.Import,
     ast.ImportFrom,
@@ -738,6 +1041,78 @@ _PYTHON_MODULE_STMT_TYPES: tuple[type[ast.stmt], ...] = (
 _NON_STR_VAL: object = object()
 _MAX_TRACKED_LIST_LEN: int = 1024
 _MAX_TRACKED_STR_LEN: int = 65536
+_DECODE_CALL_NAMES: frozenset[str] = frozenset(
+    {
+        "b64decode",
+        "urlsafe_b64decode",
+        "b16decode",
+        "b32decode",
+        "b85decode",
+        "a85decode",
+        "decodebytes",
+        "a2b_base64",
+        "fromhex",
+    }
+)
+_DYNAMIC_DANGEROUS_ATTRS: frozenset[str] = frozenset(
+    {
+        "rmtree",
+        "move",
+        "system",
+        "popen",
+        "spawn",
+        "truncate",
+        "chmod",
+        "open",
+        "FileIO",
+        "eval",
+        "exec",
+    }
+    | _SHUTIL_COPY_FUNCS
+    | _SUBPROCESS_EXEC_FUNCS
+    | set(_OS_PROC_KIND_MAP)
+    | _FILEINPUT_FUNCS
+    | _OS_DELETE_FUNCS
+    | _OS_MOVE_FUNCS
+    | _OS_LINK_FUNCS
+)
+_SENSITIVE_DYNAMIC_ATTR_MODULES: frozenset[str] = frozenset(
+    {
+        "os",
+        "shutil",
+        "subprocess",
+        "pty",
+        "builtins",
+        "io",
+        "codecs",
+        "fileinput",
+        "importlib",
+        "__dynamic_module__",
+    }
+)
+
+
+def _decode_static_call_payload(func_name: str, raw_arg: str) -> str | None:
+    if len(raw_arg) > _MAX_TRACKED_STR_LEN:
+        return None
+    with contextlib.suppress(ValueError, TypeError, binascii.Error, UnicodeDecodeError):
+        if func_name in {"b64decode", "a2b_base64", "decodebytes"}:
+            return base64.b64decode(raw_arg.encode("ascii")).decode("utf-8", errors="replace")
+        if func_name == "urlsafe_b64decode":
+            return base64.urlsafe_b64decode(raw_arg.encode("ascii")).decode(
+                "utf-8", errors="replace"
+            )
+        if func_name == "b16decode":
+            return base64.b16decode(raw_arg.encode("ascii")).decode("utf-8", errors="replace")
+        if func_name == "b32decode":
+            return base64.b32decode(raw_arg.encode("ascii")).decode("utf-8", errors="replace")
+        if func_name == "b85decode":
+            return base64.b85decode(raw_arg.encode("ascii")).decode("utf-8", errors="replace")
+        if func_name == "a85decode":
+            return base64.a85decode(raw_arg.encode("ascii")).decode("utf-8", errors="replace")
+        if func_name == "fromhex":
+            return bytes.fromhex(raw_arg).decode("utf-8", errors="replace")
+    return None
 
 
 def _dunder_import_module(node: ast.AST) -> str | None:
@@ -746,10 +1121,10 @@ def _dunder_import_module(node: ast.AST) -> str | None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "__import__"
         and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
     ):
-        return node.args[0].value
+        resolved = _extract_ast_path_target(node.args[0])
+        if isinstance(resolved, str):
+            return resolved
     return None
 
 
@@ -1059,10 +1434,14 @@ def _is_default_os_path_join(func_node: ast.AST) -> bool:
 
 class _AstPathCtx:
     __slots__ = (
+        "comp_path_resolver",
         "iterable_path_resolver",
+        "path_class_checker",
         "path_join_checker",
         "sorted_path_resolver",
+        "sys_argv_resolver",
         "truthiness_resolver",
+        "user_call_path_resolver",
     )
 
     def __init__(
@@ -1071,12 +1450,21 @@ class _AstPathCtx:
         iterable_path_resolver: Callable[[ast.AST], list[Any] | None] | None = None,
         sorted_path_resolver: Callable[[ast.Call], list[Any] | None] | None = None,
         path_join_checker: Callable[[ast.AST], bool] | None = None,
+        path_class_checker: Callable[[str], bool] | None = None,
         truthiness_resolver: Callable[[ast.AST], bool | None] | None = None,
+        comp_path_resolver: Callable[[ast.ListComp | ast.GeneratorExp], list[Any] | None]
+        | None = None,
+        user_call_path_resolver: Callable[[ast.Call], Any] | None = None,
+        sys_argv_resolver: Callable[[ast.AST], list[str] | None] | None = None,
     ) -> None:
         self.iterable_path_resolver = iterable_path_resolver
         self.sorted_path_resolver = sorted_path_resolver
         self.path_join_checker = path_join_checker
+        self.path_class_checker = path_class_checker
         self.truthiness_resolver = truthiness_resolver
+        self.comp_path_resolver = comp_path_resolver
+        self.user_call_path_resolver = user_call_path_resolver
+        self.sys_argv_resolver = sys_argv_resolver
 
 
 def _extract_dict_call_path(
@@ -1635,7 +2023,15 @@ def _resolve_ast_container_or_value(
             return cmd_list_vars[node.id]
         if path_vars is not None and node.id in path_vars:
             return path_vars[node.id]
+        if ctx is not None and ctx.sys_argv_resolver is not None:
+            argv_val = ctx.sys_argv_resolver(node)
+            if argv_val is not None:
+                return argv_val
         return int_resolver(node) if int_resolver is not None else None
+    if isinstance(node, ast.Attribute) and ctx is not None and ctx.sys_argv_resolver is not None:
+        argv_val = ctx.sys_argv_resolver(node)
+        if argv_val is not None:
+            return argv_val
     if isinstance(node, ast.Dict):
         if dict_path_resolver is not None:
             return dict_path_resolver(node)
@@ -2631,7 +3027,12 @@ def _extract_ast_path_target(
             func_name = node.func.id
         elif isinstance(node.func, ast.Attribute):
             func_name = node.func.attr
-        if func_name in {"Path", "PurePosixPath", "PurePath", "PosixPath"} and node.args:
+        is_path_cls = func_name in _PATHLIB_PATH_CLASSES or (
+            ctx is not None
+            and ctx.path_class_checker is not None
+            and ctx.path_class_checker(func_name)
+        )
+        if is_path_cls and node.args:
             path_parts = _resolve_join_args(node)
             if not path_parts:
                 return None
@@ -2702,6 +3103,252 @@ def _extract_ast_path_target(
             if env_key == "HOME":
                 return "$HOME"
             return None
+        if (
+            func_name == "decode"
+            and isinstance(node.func, ast.Attribute)
+            and not node.keywords
+            and len(node.args) <= 2
+        ):
+            if (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "codecs"
+                and node.args
+            ):
+                raw_payload = _extract_ast_path_target(
+                    node.args[0],
+                    path_vars,
+                    dict_path_vars,
+                    cmd_list_vars,
+                    list_path_vars,
+                    list_fn_vars,
+                    fn_container_resolver=fn_container_resolver,
+                    pop_resolver=pop_resolver,
+                    seq_path_resolver=seq_path_resolver,
+                    dict_path_resolver=dict_path_resolver,
+                    int_resolver=int_resolver,
+                    dict_call_resolver=dict_call_resolver,
+                    setdefault_resolver=setdefault_resolver,
+                    expr_flusher=expr_flusher,
+                    ctx=ctx,
+                )
+                encoding = (
+                    _extract_ast_path_target(
+                        node.args[1],
+                        path_vars,
+                        dict_path_vars,
+                        cmd_list_vars,
+                        list_path_vars,
+                        list_fn_vars,
+                        fn_container_resolver=fn_container_resolver,
+                        pop_resolver=pop_resolver,
+                        seq_path_resolver=seq_path_resolver,
+                        dict_path_resolver=dict_path_resolver,
+                        int_resolver=int_resolver,
+                        dict_call_resolver=dict_call_resolver,
+                        setdefault_resolver=setdefault_resolver,
+                        expr_flusher=expr_flusher,
+                        ctx=ctx,
+                    )
+                    if len(node.args) >= 2
+                    else "utf-8"
+                )
+                _flush_call_args_and_kws(node)
+                if raw_payload is not None and encoding is not None:
+                    enc_low = encoding.lower().replace("-", "").replace("_", "")
+                    if enc_low in {"base64", "base64codec"}:
+                        return _decode_static_call_payload("b64decode", raw_payload)
+                    if enc_low in {"hex", "hexcodec"}:
+                        return _decode_static_call_payload("fromhex", raw_payload)
+                return None
+            decoded_recv = _extract_ast_path_target(
+                node.func.value,
+                path_vars,
+                dict_path_vars,
+                cmd_list_vars,
+                list_path_vars,
+                list_fn_vars,
+                fn_container_resolver=fn_container_resolver,
+                pop_resolver=pop_resolver,
+                seq_path_resolver=seq_path_resolver,
+                dict_path_resolver=dict_path_resolver,
+                int_resolver=int_resolver,
+                dict_call_resolver=dict_call_resolver,
+                setdefault_resolver=setdefault_resolver,
+                expr_flusher=expr_flusher,
+                ctx=ctx,
+            )
+            _flush_call_args_and_kws(node)
+            if isinstance(decoded_recv, str):
+                return decoded_recv
+            return None
+        if func_name in _DECODE_CALL_NAMES and node.args and not node.keywords:
+            raw_arg = _extract_ast_path_target(
+                node.args[0],
+                path_vars,
+                dict_path_vars,
+                cmd_list_vars,
+                list_path_vars,
+                list_fn_vars,
+                fn_container_resolver=fn_container_resolver,
+                pop_resolver=pop_resolver,
+                seq_path_resolver=seq_path_resolver,
+                dict_path_resolver=dict_path_resolver,
+                int_resolver=int_resolver,
+                dict_call_resolver=dict_call_resolver,
+                setdefault_resolver=setdefault_resolver,
+                expr_flusher=expr_flusher,
+                ctx=ctx,
+            )
+            _flush_call_args_and_kws(node)
+            if raw_arg is not None:
+                return _decode_static_call_payload(func_name, raw_arg)
+            return None
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "chr"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            code_pt = (
+                int_resolver(node.args[0])
+                if int_resolver is not None
+                else _extract_ast_int(node.args[0])
+            )
+            _flush_call_args_and_kws(node)
+            if code_pt is not None and 0 <= code_pt <= 0x10FFFF:
+                return chr(code_pt)
+            return None
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id in {"bytes", "bytearray"}
+            and not node.keywords
+        ):
+            if not node.args:
+                return ""
+            if len(node.args) == 1:
+                seq_arg = node.args[0]
+                seq_val: Any = None
+                if (
+                    isinstance(seq_arg, (ast.ListComp, ast.GeneratorExp))
+                    and ctx is not None
+                    and ctx.comp_path_resolver is not None
+                ):
+                    seq_val = ctx.comp_path_resolver(seq_arg)
+                else:
+                    seq_val = _resolve_ast_container_or_value(
+                        seq_arg,
+                        path_vars,
+                        dict_path_vars,
+                        cmd_list_vars,
+                        list_path_vars,
+                        list_fn_vars,
+                        fn_container_resolver=fn_container_resolver,
+                        pop_resolver=pop_resolver,
+                        seq_path_resolver=seq_path_resolver,
+                        dict_path_resolver=dict_path_resolver,
+                        int_resolver=int_resolver,
+                        dict_call_resolver=dict_call_resolver,
+                        setdefault_resolver=setdefault_resolver,
+                        expr_flusher=expr_flusher,
+                        ctx=ctx,
+                    )
+                _flush_call_args_and_kws(node)
+                if (
+                    isinstance(seq_val, list)
+                    and len(seq_val) <= _MAX_TRACKED_STR_LEN
+                    and all(
+                        isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 255
+                        for x in seq_val
+                    )
+                ):
+                    return bytes(seq_val).decode("utf-8", errors="replace")
+                if isinstance(seq_val, str) and len(seq_val) <= _MAX_TRACKED_STR_LEN:
+                    return seq_val
+                return None
+            if len(node.args) == 2:
+                str_arg = _extract_ast_path_target(
+                    node.args[0],
+                    path_vars,
+                    dict_path_vars,
+                    cmd_list_vars,
+                    list_path_vars,
+                    list_fn_vars,
+                    fn_container_resolver=fn_container_resolver,
+                    pop_resolver=pop_resolver,
+                    seq_path_resolver=seq_path_resolver,
+                    dict_path_resolver=dict_path_resolver,
+                    int_resolver=int_resolver,
+                    dict_call_resolver=dict_call_resolver,
+                    setdefault_resolver=setdefault_resolver,
+                    expr_flusher=expr_flusher,
+                    ctx=ctx,
+                )
+                _flush_call_args_and_kws(node)
+                return str_arg
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            sep_str = _extract_ast_path_target(
+                node.func.value,
+                path_vars,
+                dict_path_vars,
+                cmd_list_vars,
+                list_path_vars,
+                list_fn_vars,
+                fn_container_resolver=fn_container_resolver,
+                pop_resolver=pop_resolver,
+                seq_path_resolver=seq_path_resolver,
+                dict_path_resolver=dict_path_resolver,
+                int_resolver=int_resolver,
+                dict_call_resolver=dict_call_resolver,
+                setdefault_resolver=setdefault_resolver,
+                expr_flusher=expr_flusher,
+                ctx=ctx,
+            )
+            if sep_str is not None:
+                it_node = node.args[0]
+                it_val: Any = None
+                if (
+                    isinstance(it_node, (ast.ListComp, ast.GeneratorExp))
+                    and ctx is not None
+                    and ctx.comp_path_resolver is not None
+                ):
+                    it_val = ctx.comp_path_resolver(it_node)
+                else:
+                    it_val = _resolve_ast_container_or_value(
+                        it_node,
+                        path_vars,
+                        dict_path_vars,
+                        cmd_list_vars,
+                        list_path_vars,
+                        list_fn_vars,
+                        fn_container_resolver=fn_container_resolver,
+                        pop_resolver=pop_resolver,
+                        seq_path_resolver=seq_path_resolver,
+                        dict_path_resolver=dict_path_resolver,
+                        int_resolver=int_resolver,
+                        dict_call_resolver=dict_call_resolver,
+                        setdefault_resolver=setdefault_resolver,
+                        expr_flusher=expr_flusher,
+                        ctx=ctx,
+                    )
+                _flush_call_args_and_kws(node)
+                if isinstance(it_val, list) and all(isinstance(x, str) for x in it_val):
+                    total_j = sum(len(x) for x in it_val) + len(sep_str) * max(0, len(it_val) - 1)
+                    if total_j <= _MAX_TRACKED_STR_LEN:
+                        return sep_str.join(it_val)
+                elif isinstance(it_val, str):
+                    total_j = len(it_val) + len(sep_str) * max(0, len(it_val) - 1)
+                    if total_j <= _MAX_TRACKED_STR_LEN:
+                        return sep_str.join(it_val)
+                return None
+        if ctx is not None and ctx.user_call_path_resolver is not None:
+            user_val = ctx.user_call_path_resolver(node)
+            if isinstance(user_val, str):
+                return user_val
         if isinstance(node.func, ast.Attribute) and expr_flusher is not None:
             expr_flusher(node.func.value)
         _flush_call_args_and_kws(node)
@@ -2898,13 +3545,21 @@ _MUTATING_CONTAINER_METHODS: frozenset[str] = frozenset(
 
 class _RhsSnapshot:
     __slots__ = (
+        "attrgetter_attr",
         "callable_kind",
         "cmd_list",
         "dict_fn",
+        "dict_mod",
         "dict_path",
         "fn_val",
+        "has_attrgetter_attr",
         "import_mod",
+        "is_attrgetter_fn",
+        "is_decoded",
         "is_getattr",
+        "is_sys_modules",
+        "is_vars_fn",
+        "lambda_node",
         "list_fn",
         "list_path",
         "path_val",
@@ -2923,6 +3578,14 @@ class _RhsSnapshot:
         callable_kind: str | None = None,
         import_mod: str | None = None,
         is_getattr: bool = False,
+        is_decoded: bool = False,
+        dict_mod: str | None = None,
+        is_sys_modules: bool = False,
+        is_vars_fn: bool = False,
+        is_attrgetter_fn: bool = False,
+        attrgetter_attr: str | None = None,
+        has_attrgetter_attr: bool = False,
+        lambda_node: ast.Lambda | None = None,
     ) -> None:
         self.dict_fn = dict_fn
         self.dict_path = dict_path
@@ -2934,6 +3597,59 @@ class _RhsSnapshot:
         self.callable_kind = callable_kind
         self.import_mod = import_mod
         self.is_getattr = is_getattr
+        self.is_decoded = is_decoded
+        self.dict_mod = dict_mod
+        self.is_sys_modules = is_sys_modules
+        self.is_vars_fn = is_vars_fn
+        self.is_attrgetter_fn = is_attrgetter_fn
+        self.attrgetter_attr = attrgetter_attr
+        self.has_attrgetter_attr = has_attrgetter_attr
+        self.lambda_node = lambda_node
+
+
+_PYTHON_AST_FAST_TOKENS: tuple[str, ...] = (
+    "rmtree",
+    "subprocess",
+    "system",
+    "popen",
+    "exec",
+    "spawn",
+    "pty",
+    "fileinput",
+    "getattr",
+    "remove",
+    "unlink",
+    "rmdir",
+    "truncate",
+    "chmod",
+    "rename",
+    "replace",
+    "move",
+    "write_text",
+    "write_bytes",
+    "open",
+    "symlink",
+    "hardlink_to",
+    "link",
+    "copy",
+    "fileio",
+    "importlib",
+    "__import__",
+    "eval",
+    "decode",
+    "a2b_base64",
+    "fromhex",
+    "__dict__",
+    "__builtins__",
+    "vars",
+    "attrgetter",
+    "sys.modules",
+    "modules",
+    "chr",
+    "bytes",
+    "bytearray",
+    "lambda",
+)
 
 
 def _check_python_ast_calls_impl(
@@ -2946,6 +3662,8 @@ def _check_python_ast_calls_impl(
     _cmd_depth: int = 0,
     _seen_texts: set[str] | None = None,
     _truncated_out: list[bool] | None = None,
+    _is_embedded_fragment: bool = False,
+    _python_argv: list[str] | None = None,
 ) -> tuple[str | None, bool]:
     if _ast_step_budget is None:
         _ast_step_budget = [0]
@@ -2954,7 +3672,9 @@ def _check_python_ast_calls_impl(
     if _char_budget is None:
         _char_budget = [0]
     low = text.lower()
-    if not any(trigger in low for trigger in _PYTHON_AST_TRIGGER_WORDS):
+    if not any(tok in low for tok in _PYTHON_AST_FAST_TOKENS):
+        return None, False
+    if _PYTHON_AST_TRIGGER_RE.search(low) is None:
         return None, False
     try:
         tree = ast.parse(text)
@@ -2971,8 +3691,29 @@ def _check_python_ast_calls_impl(
                         return "safety_floor:destructive_rm_root_or_glob", False
         return None, False
 
+    def _is_shell_div_assign_without_call(stmt: ast.stmt) -> bool:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.BinOp)
+            and isinstance(stmt.value.op, ast.Div)
+        ):
+            return False
+        walk_stack: list[ast.AST] = [stmt]
+        steps = 0
+        while walk_stack:
+            steps += 1
+            if steps > 32:
+                return False
+            cur_n = walk_stack.pop()
+            if isinstance(cur_n, ast.Call):
+                return False
+            walk_stack.extend(ast.iter_child_nodes(cur_n))
+        return True
+
     is_python_module = isinstance(tree, ast.Module) and any(
-        isinstance(stmt, _PYTHON_MODULE_STMT_TYPES) for stmt in tree.body
+        isinstance(stmt, _PYTHON_MODULE_STMT_TYPES)
+        and not _is_shell_div_assign_without_call(stmt)
+        for stmt in tree.body
     )
 
     shutil_aliases: set[str] = {"shutil"}
@@ -2981,10 +3722,40 @@ def _check_python_ast_calls_impl(
     subprocess_fn_aliases: set[str] = set()
     os_aliases: set[str] = {"os"}
     os_fn_aliases: set[str] = set()
+    os_delete_aliases: set[str] = set()
+    os_truncate_aliases: set[str] = set()
+    os_chmod_aliases: set[str] = set()
+    os_open_aliases: set[str] = set()
+    file_move_aliases: set[str] = set()
+    file_dst_write_aliases: set[str] = set()
+    open_aliases: set[str] = {"open"}
+    io_aliases: set[str] = {"io"}
+    codecs_aliases: set[str] = {"codecs"}
+    pty_aliases: set[str] = {"pty"}
+    fileinput_aliases: set[str] = {"fileinput"}
+    custom_fn_aliases: dict[str, str] = {}
     os_path_aliases: set[str] = {"posixpath"}
+    pathlib_class_aliases: set[str] = set(_PATHLIB_PATH_CLASSES)
     path_join_aliases: set[str] = set()
-    builtins_aliases: set[str] = {"builtins"}
+    builtins_aliases: set[str] = {"builtins", "__builtins__"}
     getattr_aliases: set[str] = {"getattr"}
+    vars_aliases: set[str] = {"vars"}
+    sys_aliases: set[str] = {"sys"}
+    sys_modules_aliases: set[str] = set()
+    sys_argv_aliases: set[str] = set()
+    operator_aliases: set[str] = {"operator"}
+    attrgetter_aliases: set[str] = set()
+    attrgetter_vars: dict[str, str | None] = {}
+    dict_module_vars: dict[str, str] = {}
+    func_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    lambda_defs: dict[str, ast.Lambda] = {}
+    importlib_aliases: set[str] = {"importlib"}
+    import_module_aliases: set[str] = set()
+    dunder_import_aliases: set[str] = {"__import__"}
+    dynamic_mod_aliases: set[str] = set()
+    eval_exec_aliases: set[str] = {"eval", "exec"}
+    decode_fn_aliases: set[str] = set()
+    decoded_vars: set[str] = set()
     path_vars: dict[str, str] = {}
     int_vars: dict[str, int] = {}
     cmd_list_vars: dict[str, list[str]] = {}
@@ -3008,6 +3779,8 @@ def _check_python_ast_calls_impl(
     applied_mutating_calls: set[int] = set()
     applied_named_exprs: set[int] = set()
     flushed_expr_nodes: set[int] = set()
+    skip_children_ids: set[int] = set()
+    call_depth: list[int] = [0]
     has_mutating_hint = any(method in low for method in _MUTATING_CONTAINER_METHODS)
     has_walrus_hint = ":=" in text
     truncated_by_depth = False
@@ -3108,7 +3881,7 @@ def _check_python_ast_calls_impl(
             return True
         if isinstance(mod_node, ast.Attribute) and mod_node.attr == "path":
             return _resolve_module_name(mod_node.value) == "os"
-        return _dunder_import_module(mod_node) in {"os.path", "posixpath"}
+        return _resolve_module_name(mod_node) in {"os.path", "posixpath"}
 
     def _is_path_join_callable(func_node: ast.AST) -> bool:
         if isinstance(func_node, ast.Name):
@@ -3116,6 +3889,35 @@ def _check_python_ast_calls_impl(
         if isinstance(func_node, ast.Attribute) and func_node.attr == "join":
             return _is_os_path_module(func_node.value)
         return False
+
+    def _is_range_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "range"
+            and not node.keywords
+            and 1 <= len(node.args) <= 3
+        )
+
+    def _resolve_range_ints(call_node: ast.Call) -> list[Any] | None:
+        raw_bounds = [_extract_int_node(a) for a in call_node.args]
+        for a in call_node.args:
+            _flush_unapplied_expr_calls(a)
+        if any(b is None for b in raw_bounds):
+            return None
+        bounds = [b for b in raw_bounds if b is not None]
+        if len(bounds) == 1:
+            r_start, r_stop, r_step = 0, bounds[0], 1
+        elif len(bounds) == 2:
+            r_start, r_stop, r_step = bounds[0], bounds[1], 1
+        else:
+            r_start, r_stop, r_step = bounds[0], bounds[1], bounds[2]
+        if r_step == 0:
+            return None
+        if abs(r_stop - r_start) // abs(r_step) > _MAX_TRACKED_LIST_LEN:
+            return None
+        r_vals: list[Any] = list(range(r_start, r_stop, r_step))
+        return r_vals if len(r_vals) <= _MAX_TRACKED_LIST_LEN else None
 
     def _resolve_iterable_both(
         iter_node: ast.AST, *, _allow_path_pad: bool = True
@@ -3128,6 +3930,15 @@ def _check_python_ast_calls_impl(
             cur_it = cur_it.args[0]
         if isinstance(cur_it, (ast.List, ast.Tuple)):
             res_f, res_p = _build_seq_both(cur_it, _allow_path_pad=_allow_path_pad)
+        elif isinstance(cur_it, (ast.ListComp, ast.GeneratorExp)):
+            comp_p = _resolve_comp_values(cur_it)
+            res_p = comp_p
+            res_f = ([None] * len(comp_p)) if (_allow_path_pad and comp_p is not None) else None
+        elif _is_range_call(cur_it):
+            assert isinstance(cur_it, ast.Call)
+            range_p = _resolve_range_ints(cur_it)
+            res_p = range_p
+            res_f = ([None] * len(range_p)) if (_allow_path_pad and range_p is not None) else None
         elif _is_sorted_call(cur_it):
             assert isinstance(cur_it, ast.Call)
             res_f, res_p = _build_sorted_both(cur_it, _allow_path_pad=_allow_path_pad)
@@ -3213,11 +4024,28 @@ def _check_python_ast_calls_impl(
         _, p_list = _build_sorted_both(call_node, _allow_path_pad=False)
         return p_list
 
+    def _resolve_sys_argv(expr: ast.AST) -> list[str] | None:
+        if _python_argv is None:
+            return None
+        if isinstance(expr, ast.Name) and expr.id in sys_argv_aliases:
+            return list(_python_argv)
+        if (
+            isinstance(expr, ast.Attribute)
+            and expr.attr == "argv"
+            and _resolve_module_name(expr.value) == "sys"
+        ):
+            return list(_python_argv)
+        return None
+
     ast_ctx = _AstPathCtx(
         iterable_path_resolver=_resolve_iterable_path_only,
         sorted_path_resolver=_resolve_sorted_path_only,
         path_join_checker=_is_path_join_callable,
+        path_class_checker=lambda name: name in pathlib_class_aliases,
         truthiness_resolver=_eval_static_truthiness,
+        comp_path_resolver=lambda comp_n: _resolve_comp_values(comp_n),
+        user_call_path_resolver=lambda call_n: _resolve_user_call_path(call_n),
+        sys_argv_resolver=_resolve_sys_argv,
     )
 
     def _apply_named_expr(named_node: ast.NamedExpr) -> None:
@@ -3336,24 +4164,208 @@ def _check_python_ast_calls_impl(
         rmtree_aliases.discard(name)
         subprocess_fn_aliases.discard(name)
         os_fn_aliases.discard(name)
+        os_delete_aliases.discard(name)
+        os_truncate_aliases.discard(name)
+        os_chmod_aliases.discard(name)
+        os_open_aliases.discard(name)
+        file_move_aliases.discard(name)
+        file_dst_write_aliases.discard(name)
+        open_aliases.discard(name)
+        io_aliases.discard(name)
+        codecs_aliases.discard(name)
+        pty_aliases.discard(name)
+        fileinput_aliases.discard(name)
+        custom_fn_aliases.pop(name, None)
         os_path_aliases.discard(name)
+        pathlib_class_aliases.discard(name)
         path_join_aliases.discard(name)
         shutil_aliases.discard(name)
         subprocess_aliases.discard(name)
         os_aliases.discard(name)
         builtins_aliases.discard(name)
         getattr_aliases.discard(name)
+        vars_aliases.discard(name)
+        sys_aliases.discard(name)
+        sys_modules_aliases.discard(name)
+        sys_argv_aliases.discard(name)
+        operator_aliases.discard(name)
+        attrgetter_aliases.discard(name)
+        attrgetter_vars.pop(name, None)
+        dict_module_vars.pop(name, None)
+        func_defs.pop(name, None)
+        lambda_defs.pop(name, None)
+        importlib_aliases.discard(name)
+        import_module_aliases.discard(name)
+        dunder_import_aliases.discard(name)
+        dynamic_mod_aliases.discard(name)
+        eval_exec_aliases.discard(name)
+        decode_fn_aliases.discard(name)
+        decoded_vars.discard(name)
 
     def _is_getattr_call(call_node: ast.Call) -> bool:
         if isinstance(call_node.func, ast.Name) and call_node.func.id in getattr_aliases:
             return True
-        if isinstance(call_node.func, ast.Attribute) and call_node.func.attr == "getattr":
-            val = call_node.func.value
-            if isinstance(val, ast.Name) and val.id in builtins_aliases:
-                return True
-            if _dunder_import_module(val) == "builtins":
+        return (
+            isinstance(call_node.func, ast.Attribute)
+            and call_node.func.attr == "getattr"
+            and _resolve_module_name(call_node.func.value) == "builtins"
+        )
+
+    def _is_vars_call(call_node: ast.Call) -> bool:
+        if isinstance(call_node.func, ast.Name) and call_node.func.id in vars_aliases:
+            return True
+        return (
+            isinstance(call_node.func, ast.Attribute)
+            and call_node.func.attr == "vars"
+            and _resolve_module_name(call_node.func.value) == "builtins"
+        )
+
+    def _is_sys_modules_expr(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name) and expr.id in sys_modules_aliases:
+            return True
+        if (
+            isinstance(expr, ast.Attribute)
+            and expr.attr == "modules"
+            and _resolve_module_name(expr.value) == "sys"
+        ):
+            return True
+        if isinstance(expr, ast.Subscript):
+            dict_m = _is_module_dict_expr(expr.value)
+            if dict_m == "sys" and _extract_path_str(expr.slice) == "modules":
                 return True
         return False
+
+    def _is_module_dict_expr(expr: ast.AST) -> str | None:
+        if isinstance(expr, ast.Name):
+            if expr.id in dict_module_vars:
+                return dict_module_vars[expr.id]
+            if expr.id == "__builtins__":
+                return "builtins"
+            return None
+        if isinstance(expr, ast.Attribute) and expr.attr == "__dict__":
+            return _resolve_module_name(expr.value)
+        if (
+            isinstance(expr, ast.Call)
+            and _is_vars_call(expr)
+            and len(expr.args) == 1
+            and not expr.keywords
+        ):
+            return _resolve_module_name(expr.args[0])
+        return None
+
+    def _resolve_attrgetter_expr(expr: ast.AST) -> tuple[bool, str | None]:
+        if isinstance(expr, ast.Name) and expr.id in attrgetter_vars:
+            return True, attrgetter_vars[expr.id]
+        if isinstance(expr, ast.Call):
+            is_ag = (
+                isinstance(expr.func, ast.Name) and expr.func.id in attrgetter_aliases
+            ) or (
+                isinstance(expr.func, ast.Attribute)
+                and expr.func.attr == "attrgetter"
+                and _resolve_module_name(expr.func.value) == "operator"
+            )
+            if is_ag and expr.args:
+                if len(expr.args) == 1 and not expr.keywords:
+                    return True, _extract_path_str(expr.args[0])
+                return True, None
+        return False, None
+
+    def _contains_decode_or_decoded_var(expr: ast.AST | None) -> bool:
+        if expr is None:
+            return False
+        walk_stack: list[ast.AST] = [expr]
+        steps = 0
+        while walk_stack:
+            steps += 1
+            if steps > 512:
+                return True
+            cur_n = walk_stack.pop()
+            if isinstance(cur_n, ast.Name) and cur_n.id in decoded_vars:
+                return True
+            if isinstance(cur_n, ast.Call):
+                fn = cur_n.func
+                if isinstance(fn, ast.Name) and (
+                    fn.id in _DECODE_CALL_NAMES or fn.id in decode_fn_aliases
+                ):
+                    return True
+                if isinstance(fn, ast.Attribute):
+                    if fn.attr in _DECODE_CALL_NAMES:
+                        return True
+                    if fn.attr == "decode" and _resolve_module_name(fn.value) == "codecs":
+                        return True
+            walk_stack.extend(ast.iter_child_nodes(cur_n))
+        return False
+
+    def _resolve_dynamic_import_call(node: ast.AST) -> tuple[bool, str | None]:
+        if not isinstance(node, ast.Call):
+            return False, None
+        fn = node.func
+        is_imp_call = False
+        is_import_module_fn = False
+        if isinstance(fn, ast.Name):
+            if fn.id in dunder_import_aliases:
+                is_imp_call = True
+            elif fn.id in import_module_aliases:
+                is_imp_call = True
+                is_import_module_fn = True
+        elif isinstance(fn, ast.Attribute):
+            if fn.attr == "import_module" and _resolve_module_name(fn.value) == "importlib":
+                is_imp_call = True
+                is_import_module_fn = True
+            elif fn.attr == "__import__" and _resolve_module_name(fn.value) == "builtins":
+                is_imp_call = True
+        elif isinstance(fn, ast.Call) and _is_getattr_call(fn) and len(fn.args) >= 2:
+            tgt_m = _resolve_module_name(fn.args[0])
+            tgt_a = _extract_path_str(fn.args[1])
+            if tgt_m == "importlib" and tgt_a == "import_module":
+                is_imp_call = True
+                is_import_module_fn = True
+            elif tgt_m == "builtins" and tgt_a == "__import__":
+                is_imp_call = True
+        elif isinstance(fn, (ast.Subscript, ast.Call, ast.IfExp, ast.NamedExpr)):
+            fn_kind = _resolve_callable_kind(fn)
+            if fn_kind == "import_module":
+                is_imp_call = True
+                is_import_module_fn = True
+            elif fn_kind == "dunder_import":
+                is_imp_call = True
+
+        if not is_imp_call:
+            return False, None
+
+        arg_node: ast.AST | None = None
+        if node.args and not isinstance(node.args[0], ast.Starred):
+            arg_node = node.args[0]
+        else:
+            for kw in node.keywords:
+                if kw.arg == "name":
+                    arg_node = kw.value
+                    break
+        if arg_node is None:
+            return True, None
+        mod_str = _extract_path_str(arg_node)
+        if mod_str is None:
+            return True, None
+        if is_import_module_fn and mod_str.startswith("."):
+            pkg_node: ast.AST | None = (
+                node.args[1]
+                if len(node.args) >= 2 and not isinstance(node.args[1], ast.Starred)
+                else None
+            )
+            if pkg_node is None:
+                for kw in node.keywords:
+                    if kw.arg == "package":
+                        pkg_node = kw.value
+                        break
+            if pkg_node is not None:
+                pkg_str = _extract_path_str(pkg_node)
+                if pkg_str and mod_str.startswith("."):
+                    mod_str = f"{pkg_str}{mod_str}"
+                else:
+                    return True, None
+            else:
+                return True, None
+        return True, mod_str
 
     def _resolve_module_name(mod_node: ast.AST) -> str | None:
         if isinstance(mod_node, ast.Name):
@@ -3364,16 +4376,87 @@ def _check_python_ast_calls_impl(
                 return "subprocess"
             if name in os_aliases:
                 return "os"
+            if name in builtins_aliases:
+                return "builtins"
+            if name in io_aliases:
+                return "io"
+            if name in codecs_aliases:
+                return "codecs"
+            if name in pty_aliases:
+                return "pty"
+            if name in fileinput_aliases:
+                return "fileinput"
+            if name in importlib_aliases:
+                return "importlib"
+            if name in sys_aliases:
+                return "sys"
+            if name in operator_aliases:
+                return "operator"
+            if name in dynamic_mod_aliases:
+                return "__dynamic_module__"
             return None
+        if isinstance(mod_node, ast.Subscript) and _is_sys_modules_expr(mod_node.value):
+            mod_key = _extract_path_str(mod_node.slice)
+            return mod_key if mod_key is not None else "__dynamic_module__"
+        if (
+            isinstance(mod_node, ast.Call)
+            and isinstance(mod_node.func, ast.Attribute)
+            and mod_node.func.attr in {"get", "setdefault"}
+            and _is_sys_modules_expr(mod_node.func.value)
+            and mod_node.args
+        ):
+            mod_key = _extract_path_str(mod_node.args[0])
+            return mod_key if mod_key is not None else "__dynamic_module__"
+        is_imp, imp_mod = _resolve_dynamic_import_call(mod_node)
+        if is_imp:
+            return imp_mod if imp_mod is not None else "__dynamic_module__"
         return _dunder_import_module(mod_node)
 
     def _match_module_attr(target_mod: str | None, attr: str) -> str | None:
+        if target_mod == "__dynamic_module__":
+            if attr in _DYNAMIC_DANGEROUS_ATTRS:
+                return "dynamic_import_sink"
+            return None
+        if attr == "import_module" and target_mod == "importlib":
+            return "import_module"
+        if attr == "__import__" and target_mod == "builtins":
+            return "dunder_import"
+        if attr in {"eval", "exec"} and target_mod == "builtins":
+            return "eval_exec"
+        if attr == "decode" and target_mod == "codecs":
+            return "decode_fn"
         if attr == "rmtree" and target_mod == "shutil":
             return "rmtree"
+        if attr == "move" and target_mod == "shutil":
+            return "file_move"
+        if attr in _SHUTIL_COPY_FUNCS and target_mod == "shutil":
+            return "file_dst_write"
         if attr in _SUBPROCESS_EXEC_FUNCS and target_mod == "subprocess":
             return "subprocess_cmd"
         if attr in _OS_EXEC_FUNCS and target_mod == "os":
             return "os_cmd"
+        if attr in _OS_PROC_KIND_MAP and target_mod == "os":
+            return _OS_PROC_KIND_MAP[attr]
+        if attr == "spawn" and target_mod == "pty":
+            return "pty_spawn"
+        if attr in _FILEINPUT_FUNCS and target_mod == "fileinput":
+            return "fileinput_input"
+        if attr in _OS_DELETE_FUNCS and target_mod == "os":
+            return "os_delete"
+        if attr == "truncate" and target_mod == "os":
+            return "os_truncate"
+        if attr == "chmod" and target_mod == "os":
+            return "os_chmod"
+        if attr in _OS_MOVE_FUNCS and target_mod == "os":
+            return "file_move"
+        if attr in _OS_LINK_FUNCS and target_mod == "os":
+            return "file_dst_write"
+        if attr == "open" and target_mod == "os":
+            return "os_open"
+        if attr == "open" and target_mod in {"builtins", "io", "codecs"}:
+            return "file_open"
+        if attr == "FileIO" and target_mod == "io":
+            return "file_open"
         return None
 
     def _build_seq_both(
@@ -3801,9 +4884,23 @@ def _check_python_ast_calls_impl(
             _flush_unapplied_expr_calls(node.body)
             res_o = _resolve_fn_container(node.orelse, _allow_path_pad=_allow_path_pad)
             _flush_unapplied_expr_calls(node.orelse)
-            if isinstance(res_b, str) and res_b in {"rmtree", "subprocess_cmd", "os_cmd"}:
+            _dangerous_fn_kinds = {
+                "rmtree",
+                "subprocess_cmd",
+                "os_cmd",
+                "os_delete",
+                "os_truncate",
+                "os_chmod",
+                "file_move",
+                "file_open",
+                "fileinput_input",
+                "eval_exec",
+                "dynamic_import_sink",
+                *_PROC_EXEC_KINDS,
+            }
+            if isinstance(res_b, str) and res_b in _dangerous_fn_kinds:
                 return res_b
-            if isinstance(res_o, str) and res_o in {"rmtree", "subprocess_cmd", "os_cmd"}:
+            if isinstance(res_o, str) and res_o in _dangerous_fn_kinds:
                 return res_o
             return None
         if isinstance(node, ast.Name):
@@ -4044,9 +5141,25 @@ def _check_python_ast_calls_impl(
             _flush_unapplied_expr_calls(func_node.body)
             k_o = _resolve_callable_kind(func_node.orelse)
             _flush_unapplied_expr_calls(func_node.orelse)
-            if k_b in {"rmtree", "subprocess_cmd", "os_cmd"}:
+            _ifexp_dangerous = {
+                "rmtree",
+                "subprocess_cmd",
+                "os_cmd",
+                "os_delete",
+                "os_truncate",
+                "os_chmod",
+                "os_open",
+                "file_move",
+                "file_dst_write",
+                "file_open",
+                "fileinput_input",
+                "eval_exec",
+                "dynamic_import_sink",
+                *_PROC_EXEC_KINDS,
+            }
+            if k_b in _ifexp_dangerous:
                 return k_b
-            if k_o in {"rmtree", "subprocess_cmd", "os_cmd"}:
+            if k_o in _ifexp_dangerous:
                 return k_o
             return k_b or k_o
 
@@ -4063,8 +5176,32 @@ def _check_python_ast_calls_impl(
                 return "subprocess_cmd"
             if ident in os_fn_aliases:
                 return "os_cmd"
+            if ident in os_delete_aliases:
+                return "os_delete"
+            if ident in os_truncate_aliases:
+                return "os_truncate"
+            if ident in os_chmod_aliases:
+                return "os_chmod"
+            if ident in os_open_aliases:
+                return "os_open"
+            if ident in file_move_aliases:
+                return "file_move"
+            if ident in file_dst_write_aliases:
+                return "file_dst_write"
+            if ident in open_aliases:
+                return "file_open"
             if ident in path_join_aliases:
                 return "path_join"
+            if ident in import_module_aliases:
+                return "import_module"
+            if ident in dunder_import_aliases:
+                return "dunder_import"
+            if ident in eval_exec_aliases:
+                return "eval_exec"
+            if ident in decode_fn_aliases or ident in _DECODE_CALL_NAMES:
+                return "decode_fn"
+            if ident in custom_fn_aliases:
+                return custom_fn_aliases[ident]
 
         if isinstance(func_node, ast.Call):
             if _is_pop_call(func_node):
@@ -4077,18 +5214,53 @@ def _check_python_ast_calls_impl(
                     if attr == "join" and _is_os_path_module(func_node.args[0]):
                         return "path_join"
                     return _match_module_attr(target_mod, attr)
+                if target_mod in _SENSITIVE_DYNAMIC_ATTR_MODULES:
+                    return "dynamic_import_sink"
+                return None
+            is_ag, ag_attr = _resolve_attrgetter_expr(func_node.func)
+            if is_ag and func_node.args:
+                target_mod = _resolve_module_name(func_node.args[0])
+                if ag_attr is not None:
+                    if target_mod == "os" and ag_attr == "path.join":
+                        return "path_join"
+                    return _match_module_attr(target_mod, ag_attr)
+                if target_mod in _SENSITIVE_DYNAMIC_ATTR_MODULES:
+                    return "dynamic_import_sink"
                 return None
             if (
                 isinstance(func_node.func, ast.Attribute)
                 and func_node.func.attr in {"get", "setdefault"}
                 and func_node.args
             ):
+                dict_mod = _is_module_dict_expr(func_node.func.value)
+                if dict_mod is not None:
+                    attr = _extract_path_str(func_node.args[0])
+                    if attr is not None:
+                        if attr == "join" and dict_mod in {"os.path", "posixpath"}:
+                            return "path_join"
+                        return _match_module_attr(dict_mod, attr)
+                    if dict_mod in _SENSITIVE_DYNAMIC_ATTR_MODULES:
+                        return "dynamic_import_sink"
+                    return None
                 resolved = _resolve_fn_container(func_node)
                 if isinstance(resolved, str):
                     return resolved
+            user_ret = _resolve_user_call_snapshot(func_node)
+            if user_ret is not None and user_ret.callable_kind is not None:
+                return user_ret.callable_kind
             return None
 
         if isinstance(func_node, ast.Subscript):
+            dict_mod = _is_module_dict_expr(func_node.value)
+            if dict_mod is not None:
+                attr = _extract_path_str(func_node.slice)
+                if attr is not None:
+                    if attr == "join" and dict_mod in {"os.path", "posixpath"}:
+                        return "path_join"
+                    return _match_module_attr(dict_mod, attr)
+                if dict_mod in _SENSITIVE_DYNAMIC_ATTR_MODULES:
+                    return "dynamic_import_sink"
+                return None
             resolved = _resolve_fn_container(func_node)
             if isinstance(resolved, str):
                 return resolved
@@ -4215,7 +5387,21 @@ def _check_python_ast_calls_impl(
                 fn_val=fn_l_copy,
             )
 
+        if isinstance(value, ast.Lambda):
+            return _RhsSnapshot(lambda_node=value)
+
         if isinstance(value, (ast.Subscript, ast.Call, ast.BinOp, ast.IfExp)):
+            dict_mod = _is_module_dict_expr(value)
+            is_sys_mods = _is_sys_modules_expr(value)
+            is_ag, ag_attr = _resolve_attrgetter_expr(value)
+            if dict_mod is not None or is_sys_mods or is_ag:
+                _flush_unapplied_expr_calls(value)
+                return _RhsSnapshot(
+                    dict_mod=dict_mod,
+                    is_sys_modules=is_sys_mods,
+                    has_attrgetter_attr=is_ag,
+                    attrgetter_attr=ag_attr,
+                )
             sub_fn = _resolve_fn_container(value)
             sub_path = _resolve_path_node(value)
             _flush_unapplied_expr_calls(value)
@@ -4235,7 +5421,7 @@ def _check_python_ast_calls_impl(
                     list_fn=l_f, list_path=l_p, cmd_list=c_l, path_val=l_p, fn_val=l_f
                 )
             c_kind = sub_fn if isinstance(sub_fn, str) else _resolve_callable_kind(value)
-            mod = _dunder_import_module(value)
+            mod = _resolve_module_name(value)
             if mod is None and _is_os_path_module(value):
                 mod = "os.path"
             c_lst = _extract_cmd_lst(value) if sub_path is None else None
@@ -4245,18 +5431,30 @@ def _check_python_ast_calls_impl(
                 fn_val=sub_fn,
                 callable_kind=c_kind,
                 import_mod=mod,
+                is_decoded=_contains_decode_or_decoded_var(value),
             )
 
         is_getattr = (
             isinstance(value, ast.Attribute)
             and value.attr == "getattr"
-            and (
-                (isinstance(value.value, ast.Name) and value.value.id in builtins_aliases)
-                or _dunder_import_module(value.value) == "builtins"
-            )
+            and _resolve_module_name(value.value) == "builtins"
         ) or (isinstance(value, ast.Name) and value.id in getattr_aliases)
+        is_vars_fn = (
+            isinstance(value, ast.Attribute)
+            and value.attr == "vars"
+            and _resolve_module_name(value.value) == "builtins"
+        ) or (isinstance(value, ast.Name) and value.id in vars_aliases)
+        is_attrgetter_fn = (
+            isinstance(value, ast.Attribute)
+            and value.attr == "attrgetter"
+            and _resolve_module_name(value.value) == "operator"
+        ) or (isinstance(value, ast.Name) and value.id in attrgetter_aliases)
+        dict_mod2 = _is_module_dict_expr(value)
+        is_sys_mods2 = _is_sys_modules_expr(value)
+        is_ag2, ag_attr2 = _resolve_attrgetter_expr(value)
+        lambda_ref = lambda_defs.get(value.id) if isinstance(value, ast.Name) else None
         kind = _resolve_callable_kind(value)
-        mod = _dunder_import_module(value)
+        mod = _resolve_module_name(value)
         if mod is None and _is_os_path_module(value):
             mod = "os.path"
         p_val2 = _resolve_path_node(value)
@@ -4270,6 +5468,14 @@ def _check_python_ast_calls_impl(
             callable_kind=kind,
             import_mod=mod,
             is_getattr=is_getattr,
+            is_decoded=_contains_decode_or_decoded_var(value),
+            dict_mod=dict_mod2,
+            is_sys_modules=is_sys_mods2,
+            is_vars_fn=is_vars_fn,
+            is_attrgetter_fn=is_attrgetter_fn,
+            has_attrgetter_attr=is_ag2,
+            attrgetter_attr=ag_attr2,
+            lambda_node=lambda_ref,
         )
 
     def _split_snapshot_for_target(target: ast.AST, snap: _RhsSnapshot) -> Any:
@@ -4415,9 +5621,61 @@ def _check_python_ast_calls_impl(
             _clear_var_bindings(var_name)
             os_fn_aliases.add(var_name)
             return
+        if snap.callable_kind == "os_delete":
+            _clear_var_bindings(var_name)
+            os_delete_aliases.add(var_name)
+            return
+        if snap.callable_kind == "os_truncate":
+            _clear_var_bindings(var_name)
+            os_truncate_aliases.add(var_name)
+            return
+        if snap.callable_kind == "os_chmod":
+            _clear_var_bindings(var_name)
+            os_chmod_aliases.add(var_name)
+            return
+        if snap.callable_kind == "os_open":
+            _clear_var_bindings(var_name)
+            os_open_aliases.add(var_name)
+            return
+        if snap.callable_kind == "file_move":
+            _clear_var_bindings(var_name)
+            file_move_aliases.add(var_name)
+            return
+        if snap.callable_kind == "file_dst_write":
+            _clear_var_bindings(var_name)
+            file_dst_write_aliases.add(var_name)
+            return
+        if snap.callable_kind == "file_open":
+            _clear_var_bindings(var_name)
+            open_aliases.add(var_name)
+            return
         if snap.callable_kind == "path_join":
             _clear_var_bindings(var_name)
             path_join_aliases.add(var_name)
+            return
+        if snap.callable_kind == "import_module":
+            _clear_var_bindings(var_name)
+            import_module_aliases.add(var_name)
+            return
+        if snap.callable_kind == "dunder_import":
+            _clear_var_bindings(var_name)
+            dunder_import_aliases.add(var_name)
+            return
+        if snap.callable_kind == "eval_exec":
+            _clear_var_bindings(var_name)
+            eval_exec_aliases.add(var_name)
+            return
+        if snap.callable_kind == "decode_fn":
+            _clear_var_bindings(var_name)
+            decode_fn_aliases.add(var_name)
+            return
+        if snap.import_mod == "importlib":
+            _clear_var_bindings(var_name)
+            importlib_aliases.add(var_name)
+            return
+        if snap.import_mod == "__dynamic_module__":
+            _clear_var_bindings(var_name)
+            dynamic_mod_aliases.add(var_name)
             return
         if snap.import_mod == "shutil":
             _clear_var_bindings(var_name)
@@ -4439,9 +5697,66 @@ def _check_python_ast_calls_impl(
             _clear_var_bindings(var_name)
             builtins_aliases.add(var_name)
             return
+        if snap.import_mod == "io":
+            _clear_var_bindings(var_name)
+            io_aliases.add(var_name)
+            return
+        if snap.import_mod == "codecs":
+            _clear_var_bindings(var_name)
+            codecs_aliases.add(var_name)
+            return
+        if snap.import_mod == "pty":
+            _clear_var_bindings(var_name)
+            pty_aliases.add(var_name)
+            return
+        if snap.import_mod == "fileinput":
+            _clear_var_bindings(var_name)
+            fileinput_aliases.add(var_name)
+            return
+        if snap.import_mod == "sys":
+            _clear_var_bindings(var_name)
+            sys_aliases.add(var_name)
+            return
+        if snap.import_mod == "operator":
+            _clear_var_bindings(var_name)
+            operator_aliases.add(var_name)
+            return
+        if snap.is_sys_modules:
+            _clear_var_bindings(var_name)
+            sys_modules_aliases.add(var_name)
+            return
+        if snap.is_vars_fn:
+            _clear_var_bindings(var_name)
+            vars_aliases.add(var_name)
+            return
+        if snap.is_attrgetter_fn:
+            _clear_var_bindings(var_name)
+            attrgetter_aliases.add(var_name)
+            return
+        if snap.has_attrgetter_attr:
+            _clear_var_bindings(var_name)
+            attrgetter_vars[var_name] = snap.attrgetter_attr
+            return
+        if snap.dict_mod is not None:
+            _clear_var_bindings(var_name)
+            dict_module_vars[var_name] = snap.dict_mod
+            return
+        if snap.lambda_node is not None:
+            _clear_var_bindings(var_name)
+            lambda_defs[var_name] = snap.lambda_node
+            return
+        if snap.callable_kind is not None and (
+            snap.callable_kind in _PROC_EXEC_KINDS
+            or snap.callable_kind in {"fileinput_input", "dynamic_import_sink"}
+        ):
+            _clear_var_bindings(var_name)
+            custom_fn_aliases[var_name] = snap.callable_kind
+            return
         if isinstance(snap.path_val, str):
             _clear_var_bindings(var_name)
             path_vars[var_name] = snap.path_val
+            if snap.is_decoded:
+                decoded_vars.add(var_name)
             return
         if isinstance(snap.path_val, int) and not isinstance(snap.path_val, bool):
             _clear_var_bindings(var_name)
@@ -4452,6 +5767,8 @@ def _check_python_ast_calls_impl(
             cmd_list_vars[var_name] = list(snap.cmd_list)
             return
         _clear_var_bindings(var_name)
+        if snap.is_decoded:
+            decoded_vars.add(var_name)
 
     def _apply_prepared_binding(target: ast.AST, prepared: Any) -> None:
         if isinstance(target, (ast.Tuple, ast.List)):
@@ -5563,6 +6880,389 @@ def _check_python_ast_calls_impl(
             if cmd_name is not None:
                 cmd_list_vars[cmd_name].clear()
 
+    _MISSING_SCOPE_VAL: object = object()
+    _MAX_AST_VISITED_NODES = 20_000
+    _ALIAS_SETS_FOR_SCOPE: tuple[set[str], ...] = (
+        rmtree_aliases,
+        subprocess_fn_aliases,
+        os_fn_aliases,
+        os_delete_aliases,
+        os_truncate_aliases,
+        os_chmod_aliases,
+        os_open_aliases,
+        file_move_aliases,
+        file_dst_write_aliases,
+        open_aliases,
+        io_aliases,
+        codecs_aliases,
+        pty_aliases,
+        fileinput_aliases,
+        os_path_aliases,
+        pathlib_class_aliases,
+        path_join_aliases,
+        shutil_aliases,
+        subprocess_aliases,
+        os_aliases,
+        builtins_aliases,
+        getattr_aliases,
+        vars_aliases,
+        sys_aliases,
+        sys_modules_aliases,
+        sys_argv_aliases,
+        operator_aliases,
+        attrgetter_aliases,
+        importlib_aliases,
+        import_module_aliases,
+        dunder_import_aliases,
+        dynamic_mod_aliases,
+        eval_exec_aliases,
+        decode_fn_aliases,
+        decoded_vars,
+    )
+
+    def _collect_target_names(tgt: ast.AST) -> set[str]:
+        names: set[str] = set()
+        t_stack: list[ast.AST] = [tgt]
+        while t_stack:
+            cur_t = t_stack.pop()
+            if isinstance(cur_t, ast.Name):
+                names.add(cur_t.id)
+            elif isinstance(cur_t, (ast.Tuple, ast.List)):
+                t_stack.extend(cur_t.elts)
+            elif isinstance(cur_t, ast.Starred):
+                t_stack.append(cur_t.value)
+        return names
+
+    def _collect_fn_local_names(
+        fn_def: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    ) -> set[str]:
+        names: set[str] = set()
+        args_spec = fn_def.args
+        for a in (*args_spec.posonlyargs, *args_spec.args, *args_spec.kwonlyargs):
+            names.add(a.arg)
+        if args_spec.vararg is not None:
+            names.add(args_spec.vararg.arg)
+        if args_spec.kwarg is not None:
+            names.add(args_spec.kwarg.arg)
+        if isinstance(fn_def, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nonlocal_or_global: set[str] = set()
+            w_stack: list[ast.AST] = list(fn_def.body)
+            steps = 0
+            while w_stack and steps < 512:
+                steps += 1
+                cur_n = w_stack.pop()
+                if isinstance(cur_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(cur_n.name)
+                    continue
+                if isinstance(cur_n, (ast.Global, ast.Nonlocal)):
+                    nonlocal_or_global.update(cur_n.names)
+                    continue
+                if isinstance(cur_n, ast.Assign):
+                    for t in cur_n.targets:
+                        if isinstance(t, ast.Name):
+                            names.add(t.id)
+                elif isinstance(cur_n, (ast.AnnAssign, ast.AugAssign)):
+                    if isinstance(cur_n.target, ast.Name):
+                        names.add(cur_n.target.id)
+                elif isinstance(cur_n, (ast.For, ast.AsyncFor)):
+                    names.update(_collect_target_names(cur_n.target))
+                w_stack.extend(ast.iter_child_nodes(cur_n))
+            names.difference_update(nonlocal_or_global)
+        return names
+
+    def _save_var_scope(names: set[str]) -> dict[str, dict[str, Any]]:
+        saved: dict[str, dict[str, Any]] = {}
+        for name in names:
+            entry: dict[str, Any] = {
+                "dict_fn": dict(dict_fn_vars[name]) if name in dict_fn_vars else _MISSING_SCOPE_VAL,
+                "dict_path": (
+                    dict(dict_path_vars[name]) if name in dict_path_vars else _MISSING_SCOPE_VAL
+                ),
+                "list_fn": list(list_fn_vars[name]) if name in list_fn_vars else _MISSING_SCOPE_VAL,
+                "list_path": (
+                    list(list_path_vars[name]) if name in list_path_vars else _MISSING_SCOPE_VAL
+                ),
+                "cmd_list": (
+                    list(cmd_list_vars[name]) if name in cmd_list_vars else _MISSING_SCOPE_VAL
+                ),
+                "path": path_vars.get(name, _MISSING_SCOPE_VAL),
+                "int": int_vars.get(name, _MISSING_SCOPE_VAL),
+                "custom_fn": custom_fn_aliases.get(name, _MISSING_SCOPE_VAL),
+                "attrgetter_var": attrgetter_vars.get(name, _MISSING_SCOPE_VAL),
+                "dict_module": dict_module_vars.get(name, _MISSING_SCOPE_VAL),
+                "func_def": func_defs.get(name, _MISSING_SCOPE_VAL),
+                "lambda_def": lambda_defs.get(name, _MISSING_SCOPE_VAL),
+                "sets": [idx for idx, s in enumerate(_ALIAS_SETS_FOR_SCOPE) if name in s],
+            }
+            saved[name] = entry
+        return saved
+
+    def _restore_var_scope(saved: dict[str, dict[str, Any]]) -> None:
+        for name, entry in saved.items():
+            _clear_var_bindings(name)
+            if entry["dict_fn"] is not _MISSING_SCOPE_VAL:
+                dict_fn_vars[name] = entry["dict_fn"]
+            if entry["dict_path"] is not _MISSING_SCOPE_VAL:
+                dict_path_vars[name] = entry["dict_path"]
+            if entry["list_fn"] is not _MISSING_SCOPE_VAL:
+                list_fn_vars[name] = entry["list_fn"]
+            if entry["list_path"] is not _MISSING_SCOPE_VAL:
+                list_path_vars[name] = entry["list_path"]
+            if entry["cmd_list"] is not _MISSING_SCOPE_VAL:
+                cmd_list_vars[name] = entry["cmd_list"]
+            if entry["path"] is not _MISSING_SCOPE_VAL:
+                path_vars[name] = entry["path"]
+            if entry["int"] is not _MISSING_SCOPE_VAL:
+                int_vars[name] = entry["int"]
+            if entry["custom_fn"] is not _MISSING_SCOPE_VAL:
+                custom_fn_aliases[name] = entry["custom_fn"]
+            if entry["attrgetter_var"] is not _MISSING_SCOPE_VAL:
+                attrgetter_vars[name] = entry["attrgetter_var"]
+            if entry["dict_module"] is not _MISSING_SCOPE_VAL:
+                dict_module_vars[name] = entry["dict_module"]
+            if entry["func_def"] is not _MISSING_SCOPE_VAL:
+                func_defs[name] = entry["func_def"]
+            if entry["lambda_def"] is not _MISSING_SCOPE_VAL:
+                lambda_defs[name] = entry["lambda_def"]
+            for idx in entry["sets"]:
+                _ALIAS_SETS_FOR_SCOPE[idx].add(name)
+
+    def _walk_subtree(root_node: ast.AST) -> str | None:
+        sub_stack: list[ast.AST] = [root_node]
+        while sub_stack:
+            _ast_step_budget[0] += 1
+            if _ast_step_budget[0] > _MAX_AST_VISITED_NODES:
+                return "safety_floor:python_ast_complexity_budget_exceeded"
+            cur_n = sub_stack.pop()
+            v_res = _visit_node(cur_n)
+            if v_res is not None:
+                return v_res
+            if id(cur_n) in skip_children_ids:
+                skip_children_ids.discard(id(cur_n))
+                continue
+            for child in reversed(list(ast.iter_child_nodes(cur_n))):
+                sub_stack.append(child)
+        return None
+
+    def _eval_comp_loop(
+        comp_node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
+        gen_idx: int,
+        out_vals: list[Any] | None,
+    ) -> str | None:
+        if gen_idx >= len(comp_node.generators):
+            if isinstance(comp_node, ast.DictComp):
+                r_k = _walk_subtree(comp_node.key)
+                if r_k is not None:
+                    return r_k
+                return _walk_subtree(comp_node.value)
+            r_elt = _walk_subtree(comp_node.elt)
+            if r_elt is not None:
+                return r_elt
+            if out_vals is not None and len(out_vals) < _MAX_TRACKED_LIST_LEN:
+                val = _resolve_path_node(comp_node.elt)
+                if val is None:
+                    val = _extract_int_node(comp_node.elt)
+                out_vals.append(val)
+            return None
+
+        gen = comp_node.generators[gen_idx]
+        if gen_idx == 0:
+            r_iter = _walk_subtree(gen.iter)
+            if r_iter is not None:
+                return r_iter
+        it_fn, it_path = _resolve_iterable_both(gen.iter, _allow_path_pad=True)
+        target_names = _collect_target_names(gen.target)
+        saved = _save_var_scope(target_names)
+        try:
+            if it_path is None and it_fn is None:
+                for n in target_names:
+                    _clear_var_bindings(n)
+                for if_node in gen.ifs:
+                    r_if = _walk_subtree(if_node)
+                    if r_if is not None:
+                        return r_if
+                if out_vals is not None:
+                    return None
+                return _eval_comp_loop(comp_node, gen_idx + 1, None)
+            n_items = len(it_path) if it_path is not None else len(it_fn or ())
+            if n_items > _MAX_TRACKED_LIST_LEN:
+                return None
+            for idx_item in range(n_items):
+                _ast_step_budget[0] += 1
+                if _ast_step_budget[0] > _MAX_AST_VISITED_NODES:
+                    return "safety_floor:python_ast_complexity_budget_exceeded"
+                p_elt = (
+                    it_path[idx_item] if it_path is not None and idx_item < len(it_path) else None
+                )
+                f_elt = it_fn[idx_item] if it_fn is not None and idx_item < len(it_fn) else None
+                snap = _snapshot_from_pair(f_elt, p_elt)
+                prepared = _split_snapshot_for_target(gen.target, snap)
+                if prepared is not None:
+                    _apply_prepared_binding(gen.target, prepared)
+                else:
+                    for n in target_names:
+                        _clear_var_bindings(n)
+                cond_ok = True
+                for if_node in gen.ifs:
+                    r_if = _walk_subtree(if_node)
+                    if r_if is not None:
+                        return r_if
+                    t_res = _eval_static_truthiness(if_node)
+                    if t_res is False:
+                        cond_ok = False
+                        break
+                if not cond_ok:
+                    continue
+                r_next = _eval_comp_loop(comp_node, gen_idx + 1, out_vals)
+                if r_next is not None:
+                    return r_next
+            return None
+        finally:
+            _restore_var_scope(saved)
+
+    def _resolve_comp_values(
+        comp_node: ast.ListComp | ast.GeneratorExp,
+    ) -> list[Any] | None:
+        if len(comp_node.generators) > 3:
+            return None
+        vals: list[Any] = []
+        viol = _eval_comp_loop(comp_node, 0, vals)
+        if viol is not None:
+            return None
+        return vals
+
+    def _resolve_callable_def_for_call(
+        call_node: ast.Call,
+    ) -> ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | None:
+        fn = call_node.func
+        if isinstance(fn, ast.Lambda):
+            return fn
+        if isinstance(fn, ast.Name):
+            if fn.id in func_defs:
+                return func_defs[fn.id]
+            if fn.id in lambda_defs:
+                return lambda_defs[fn.id]
+        return None
+
+    def _invoke_user_callable(
+        fn_def: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        call_node: ast.Call,
+        *,
+        capture_return: bool = False,
+    ) -> tuple[str | None, _RhsSnapshot | None]:
+        if call_depth[0] >= 8:
+            return None, None
+        arg_snaps: list[_RhsSnapshot | None] = []
+        for a in call_node.args:
+            if isinstance(a, ast.Starred):
+                arg_snaps.append(None)
+            else:
+                arg_snaps.append(_eval_rhs_snapshot(a))
+        kw_snaps: dict[str, _RhsSnapshot] = {}
+        for kw in call_node.keywords:
+            if kw.arg is not None:
+                kw_snaps[kw.arg] = _eval_rhs_snapshot(kw.value)
+
+        all_pos_params = [*fn_def.args.posonlyargs, *fn_def.args.args]
+        n_pos = len(all_pos_params)
+        n_defaults = len(fn_def.args.defaults)
+        pos_default_start = n_pos - n_defaults
+        default_snaps: dict[str, _RhsSnapshot] = {}
+        for idx_d, d_node in enumerate(fn_def.args.defaults):
+            p_name = all_pos_params[pos_default_start + idx_d].arg
+            default_snaps[p_name] = _eval_rhs_snapshot(d_node)
+        for kw_p, kw_d in zip(fn_def.args.kwonlyargs, fn_def.args.kw_defaults, strict=True):
+            if kw_d is not None:
+                default_snaps[kw_p.arg] = _eval_rhs_snapshot(kw_d)
+
+        local_names = _collect_fn_local_names(fn_def)
+        saved = _save_var_scope(local_names)
+        call_depth[0] += 1
+        try:
+            for lname in local_names:
+                _clear_var_bindings(lname)
+            for idx_p, p_arg in enumerate(all_pos_params):
+                if idx_p < len(arg_snaps) and arg_snaps[idx_p] is not None:
+                    snap_p = arg_snaps[idx_p]
+                    assert snap_p is not None
+                    _apply_name_snapshot(p_arg.arg, snap_p)
+                elif p_arg.arg in kw_snaps:
+                    _apply_name_snapshot(p_arg.arg, kw_snaps[p_arg.arg])
+                elif p_arg.arg in default_snaps:
+                    _apply_name_snapshot(p_arg.arg, default_snaps[p_arg.arg])
+            for kw_p in fn_def.args.kwonlyargs:
+                if kw_p.arg in kw_snaps:
+                    _apply_name_snapshot(kw_p.arg, kw_snaps[kw_p.arg])
+                elif kw_p.arg in default_snaps:
+                    _apply_name_snapshot(kw_p.arg, default_snaps[kw_p.arg])
+
+            if isinstance(fn_def, ast.Lambda):
+                viol = _walk_subtree(fn_def.body)
+                if viol is not None:
+                    return viol, None
+                if capture_return:
+                    return None, _eval_rhs_snapshot(fn_def.body)
+                return None, None
+
+            ret_snap: _RhsSnapshot | None = None
+            for stmt in fn_def.body:
+                if isinstance(stmt, ast.Return):
+                    if stmt.value is not None:
+                        viol_r = _walk_subtree(stmt.value)
+                        if viol_r is not None:
+                            return viol_r, None
+                        if capture_return:
+                            ret_snap = _eval_rhs_snapshot(stmt.value)
+                    break
+                viol_s = _walk_subtree(stmt)
+                if viol_s is not None:
+                    return viol_s, None
+            return None, ret_snap
+        finally:
+            call_depth[0] -= 1
+            _restore_var_scope(saved)
+
+    def _resolve_user_call_snapshot(call_node: ast.Call) -> _RhsSnapshot | None:
+        fn_def = _resolve_callable_def_for_call(call_node)
+        if fn_def is None:
+            return None
+        viol, ret_snap = _invoke_user_callable(fn_def, call_node, capture_return=True)
+        if viol is not None:
+            return None
+        return ret_snap
+
+    def _resolve_user_call_path(call_node: ast.Call) -> Any:
+        snap = _resolve_user_call_snapshot(call_node)
+        if snap is not None and isinstance(snap.path_val, str):
+            return snap.path_val
+        return None
+
+    def _has_dynamic_path_obfuscation(expr: ast.AST | None) -> bool:
+        if expr is None:
+            return False
+        w_stack: list[ast.AST] = [expr]
+        steps = 0
+        while w_stack and steps < 2048:
+            steps += 1
+            cur_e = w_stack.pop()
+            if isinstance(cur_e, ast.Name) and cur_e.id in decoded_vars:
+                return True
+            if isinstance(cur_e, ast.Call):
+                fn = cur_e.func
+                if isinstance(fn, ast.Name) and (
+                    fn.id in {"chr", "bytes", "bytearray", "input"}
+                    or fn.id in _DECODE_CALL_NAMES
+                    or fn.id in decode_fn_aliases
+                ):
+                    return True
+                if isinstance(fn, ast.Attribute):
+                    if fn.attr in _DECODE_CALL_NAMES:
+                        return True
+                    if fn.attr in {"join", "decode"} and not _is_os_path_module(fn.value):
+                        return True
+            w_stack.extend(ast.iter_child_nodes(cur_e))
+        return False
+
     def _visit_node(node: ast.AST) -> str | None:
         nonlocal truncated_by_depth
         if isinstance(node, ast.Import):
@@ -5583,11 +7283,45 @@ def _check_python_ast_calls_impl(
                     os_path_aliases.add(bound)
                 elif alias.name == "builtins":
                     builtins_aliases.add(bound)
+                elif alias.name == "io":
+                    io_aliases.add(bound)
+                elif alias.name == "codecs":
+                    codecs_aliases.add(bound)
+                elif alias.name == "pty":
+                    pty_aliases.add(bound)
+                elif alias.name == "fileinput":
+                    fileinput_aliases.add(bound)
+                elif alias.name == "sys":
+                    sys_aliases.add(bound)
+                elif alias.name == "operator":
+                    operator_aliases.add(bound)
+                elif alias.name == "importlib" or (
+                    alias.name.startswith("importlib.") and not alias.asname
+                ):
+                    importlib_aliases.add(bound)
         elif isinstance(node, ast.ImportFrom):
             if node.module == "shutil":
                 for alias in node.names:
                     if alias.name == "rmtree":
                         rmtree_aliases.add(alias.asname or "rmtree")
+                    elif alias.name == "move":
+                        file_move_aliases.add(alias.asname or "move")
+                    elif alias.name in _SHUTIL_COPY_FUNCS:
+                        file_dst_write_aliases.add(alias.asname or alias.name)
+            elif node.module == "sys":
+                for alias in node.names:
+                    if alias.name == "modules":
+                        sys_modules_aliases.add(alias.asname or "modules")
+                    elif alias.name == "argv":
+                        sys_argv_aliases.add(alias.asname or "argv")
+            elif node.module == "operator":
+                for alias in node.names:
+                    if alias.name == "attrgetter":
+                        attrgetter_aliases.add(alias.asname or "attrgetter")
+            elif node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        import_module_aliases.add(alias.asname or "import_module")
             elif node.module == "subprocess":
                 for alias in node.names:
                     if alias.name in _SUBPROCESS_EXEC_FUNCS:
@@ -5596,16 +7330,60 @@ def _check_python_ast_calls_impl(
                 for alias in node.names:
                     if alias.name in _OS_EXEC_FUNCS:
                         os_fn_aliases.add(alias.asname or alias.name)
+                    elif alias.name in _OS_PROC_KIND_MAP:
+                        custom_fn_aliases[alias.asname or alias.name] = _OS_PROC_KIND_MAP[
+                            alias.name
+                        ]
+                    elif alias.name in _OS_DELETE_FUNCS:
+                        os_delete_aliases.add(alias.asname or alias.name)
+                    elif alias.name == "truncate":
+                        os_truncate_aliases.add(alias.asname or "truncate")
+                    elif alias.name == "chmod":
+                        os_chmod_aliases.add(alias.asname or "chmod")
+                    elif alias.name in _OS_MOVE_FUNCS:
+                        file_move_aliases.add(alias.asname or alias.name)
+                    elif alias.name in _OS_LINK_FUNCS:
+                        file_dst_write_aliases.add(alias.asname or alias.name)
+                    elif alias.name == "open":
+                        os_open_aliases.add(alias.asname or "open")
                     elif alias.name == "path":
                         os_path_aliases.add(alias.asname or "path")
+            elif node.module == "pathlib":
+                for alias in node.names:
+                    if alias.name in _PATHLIB_PATH_CLASSES:
+                        pathlib_class_aliases.add(alias.asname or alias.name)
             elif node.module in {"os.path", "posixpath"}:
                 for alias in node.names:
                     if alias.name == "join":
                         path_join_aliases.add(alias.asname or "join")
-            elif node.module == "builtins":
+            elif node.module in {"builtins", "io", "codecs"}:
                 for alias in node.names:
-                    if alias.name == "getattr":
+                    if alias.name == "getattr" and node.module == "builtins":
                         getattr_aliases.add(alias.asname or "getattr")
+                    elif alias.name == "vars" and node.module == "builtins":
+                        vars_aliases.add(alias.asname or "vars")
+                    elif alias.name == "__import__" and node.module == "builtins":
+                        dunder_import_aliases.add(alias.asname or "__import__")
+                    elif alias.name in {"eval", "exec"} and node.module == "builtins":
+                        eval_exec_aliases.add(alias.asname or alias.name)
+                    elif alias.name == "decode" and node.module == "codecs":
+                        decode_fn_aliases.add(alias.asname or "decode")
+                    elif alias.name == "open" or (
+                        alias.name == "FileIO" and node.module == "io"
+                    ):
+                        open_aliases.add(alias.asname or alias.name)
+            elif node.module in {"base64", "binascii"}:
+                for alias in node.names:
+                    if alias.name in _DECODE_CALL_NAMES:
+                        decode_fn_aliases.add(alias.asname or alias.name)
+            elif node.module == "pty":
+                for alias in node.names:
+                    if alias.name == "spawn":
+                        custom_fn_aliases[alias.asname or "spawn"] = "pty_spawn"
+            elif node.module == "fileinput":
+                for alias in node.names:
+                    if alias.name in _FILEINPUT_FUNCS:
+                        custom_fn_aliases[alias.asname or alias.name] = "fileinput_input"
         elif isinstance(node, ast.Assign):
             prepared_targets = [
                 (tgt, _prepare_rhs_for_target(tgt, node.value))
@@ -5889,11 +7667,177 @@ def _check_python_ast_calls_impl(
                                         cmd_list_vars.pop(cmd_name, None)
                             if rhs_f is not None and isinstance(fn_c, list):
                                 fn_c.extend(rhs_f)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_defs[node.name] = node
+            fn_locals = _collect_fn_local_names(node)
+            saved_fn = _save_var_scope(fn_locals)
+            try:
+                for lname in fn_locals:
+                    _clear_var_bindings(lname)
+                for stmt in node.body:
+                    viol_fn = _walk_subtree(stmt)
+                    if viol_fn is not None:
+                        return viol_fn
+            finally:
+                _restore_var_scope(saved_fn)
+            skip_children_ids.add(id(node))
+        elif isinstance(node, ast.Lambda):
+            lam_locals = _collect_fn_local_names(node)
+            saved_lam = _save_var_scope(lam_locals)
+            try:
+                for lname in lam_locals:
+                    _clear_var_bindings(lname)
+                viol_lam = _walk_subtree(node.body)
+                if viol_lam is not None:
+                    return viol_lam
+            finally:
+                _restore_var_scope(saved_lam)
+            skip_children_ids.add(id(node))
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            viol_comp = _eval_comp_loop(node, 0, None)
+            if viol_comp is not None:
+                return viol_comp
+            skip_children_ids.add(id(node))
         elif isinstance(node, ast.Call):
+            fn_def = _resolve_callable_def_for_call(node)
+            if fn_def is not None:
+                for arg in node.args:
+                    viol_a = _walk_subtree(arg.value if isinstance(arg, ast.Starred) else arg)
+                    if viol_a is not None:
+                        return viol_a
+                for kw in node.keywords:
+                    viol_k = _walk_subtree(kw.value)
+                    if viol_k is not None:
+                        return viol_k
+                viol_call, _ = _invoke_user_callable(fn_def, node, capture_return=False)
+                if viol_call is not None:
+                    return viol_call
+                skip_children_ids.add(id(node))
+                return None
             kind = _resolve_callable_kind(node.func)
+            if kind == "dynamic_import_sink":
+                return "safety_floor:python_dynamic_import_sink"
             if kind is None and isinstance(node.func, ast.Attribute):
+                attr_name = node.func.attr
+                if attr_name in {
+                    "unlink",
+                    "rmdir",
+                    "write_text",
+                    "write_bytes",
+                    "open",
+                    "chmod",
+                    "rename",
+                    "replace",
+                    "symlink_to",
+                    "hardlink_to",
+                }:
+                    recv_path = _extract_path_str(node.func.value)
+                    _flush_unapplied_expr_calls(node.func.value)
+                    pos_str_args: list[str | None] = []
+                    kw_str_args: dict[str, str | None] = {}
+                    for arg in node.args:
+                        if isinstance(arg, ast.Starred):
+                            _flush_unapplied_expr_calls(arg.value)
+                            pos_str_args.append(None)
+                        else:
+                            pos_str_args.append(_extract_path_str(arg))
+                            _flush_unapplied_expr_calls(arg)
+                    for kw in node.keywords:
+                        if kw.arg is not None:
+                            kw_str_args[kw.arg] = _extract_path_str(kw.value)
+                        _flush_unapplied_expr_calls(kw.value)
+                    is_path_cls_recv = (
+                        isinstance(node.func.value, ast.Name)
+                        and node.func.value.id in pathlib_class_aliases
+                    ) or (
+                        isinstance(node.func.value, ast.Attribute)
+                        and node.func.value.attr in _PATHLIB_PATH_CLASSES
+                    )
+                    cls_target: str | None = None
+                    if is_path_cls_recv:
+                        cls_target = pos_str_args[0] if pos_str_args else kw_str_args.get("self")
+                    if attr_name in {"unlink", "rmdir"}:
+                        if recv_path is not None and _is_critical_rm_target(recv_path):
+                            return "safety_floor:destructive_rm_root_or_glob"
+                        if cls_target is not None and _is_critical_rm_target(cls_target):
+                            return "safety_floor:destructive_rm_root_or_glob"
+                        if (
+                            recv_path is None
+                            and cls_target is None
+                            and (is_python_module or not _is_embedded_fragment)
+                            and (
+                                _has_dynamic_path_obfuscation(node.func.value)
+                                or (
+                                    is_path_cls_recv
+                                    and node.args
+                                    and _has_dynamic_path_obfuscation(node.args[0])
+                                )
+                            )
+                        ):
+                            return "safety_floor:python_dynamic_path_target"
+                    elif attr_name in {"write_text", "write_bytes", "symlink_to", "hardlink_to"}:
+                        if recv_path is not None and _is_critical_overwrite_target(recv_path):
+                            return "safety_floor:destructive_redirect_truncate"
+                        if cls_target is not None and _is_critical_overwrite_target(cls_target):
+                            return "safety_floor:destructive_redirect_truncate"
+                        if (
+                            recv_path is None
+                            and cls_target is None
+                            and (is_python_module or not _is_embedded_fragment)
+                            and _has_dynamic_path_obfuscation(node.func.value)
+                        ):
+                            return "safety_floor:python_dynamic_path_target"
+                    elif attr_name == "chmod":
+                        chmod_target = recv_path if recv_path is not None else cls_target
+                        if chmod_target is not None and (
+                            _is_critical_rm_target(chmod_target)
+                            or _is_critical_overwrite_target(chmod_target)
+                        ):
+                            return "safety_floor:destructive_chmod_000_root"
+                        if (
+                            chmod_target is None
+                            and (is_python_module or not _is_embedded_fragment)
+                            and _has_dynamic_path_obfuscation(node.func.value)
+                        ):
+                            return "safety_floor:python_dynamic_path_target"
+                    elif attr_name in {"rename", "replace"}:
+                        src_p = recv_path if recv_path is not None else cls_target
+                        dst_idx = 1 if (is_path_cls_recv and recv_path is None) else 0
+                        dst_p = kw_str_args.get("target")
+                        if dst_p is None and len(pos_str_args) > dst_idx:
+                            dst_p = pos_str_args[dst_idx]
+                        if (src_p is not None and _is_critical_overwrite_target(src_p)) or (
+                            dst_p is not None and _is_critical_overwrite_target(dst_p)
+                        ):
+                            return "safety_floor:destructive_mv_critical"
+                    elif attr_name == "open":
+                        open_target = recv_path if recv_path is not None else cls_target
+                        mode_idx = 1 if (is_path_cls_recv and recv_path is None) else 0
+                        open_mode = kw_str_args.get("mode")
+                        if open_mode is None:
+                            open_mode = (
+                                pos_str_args[mode_idx]
+                                if len(pos_str_args) > mode_idx
+                                else "r"
+                            )
+                        if (
+                            open_target is not None
+                            and isinstance(open_mode, str)
+                            and any(ch in open_mode for ch in ("w", "a", "x", "+"))
+                            and _is_critical_overwrite_target(open_target)
+                        ):
+                            return "safety_floor:destructive_redirect_truncate"
                 _apply_mutating_call(node)
-            elif kind == "rmtree":
+            elif kind in {
+                "rmtree",
+                "os_delete",
+                "os_truncate",
+                "os_chmod",
+                "os_open",
+                "file_move",
+                "file_dst_write",
+                "file_open",
+            }:
                 pos_candidates: list[str | None] = []
                 for arg in node.args:
                     if isinstance(arg, ast.Starred):
@@ -5912,70 +7856,543 @@ def _check_python_ast_calls_impl(
                     else:
                         pos_candidates.append(_extract_path_str(arg))
                         _flush_unapplied_expr_calls(arg)
-                target_str: str | None = pos_candidates[0] if pos_candidates else None
+                kw_strs: dict[str, str | None] = {}
+                kw_starred_maps: list[Mapping[Any, Any]] = []
                 for kw in node.keywords:
-                    if target_str is None:
-                        if kw.arg == "path":
-                            target_str = _extract_path_str(kw.value)
-                        elif kw.arg is None:
-                            kw_val = _resolve_path_node(kw.value)
-                            if isinstance(kw_val, Mapping):
-                                p_val = kw_val.get("path")
-                                if isinstance(p_val, str):
-                                    target_str = p_val
-                                else:
-                                    d_val = kw_val.get("dir_fd")
-                                    if isinstance(d_val, str):
-                                        target_str = d_val
+                    if kw.arg is not None:
+                        kw_strs[kw.arg] = _extract_path_str(kw.value)
+                    else:
+                        kw_val = _resolve_path_node(kw.value)
+                        if isinstance(kw_val, Mapping):
+                            kw_starred_maps.append(kw_val)
                     _flush_unapplied_expr_calls(kw.value)
-                if target_str is not None and _is_critical_rm_target(target_str):
-                    return "safety_floor:destructive_rm_root_or_glob"
-            elif kind in {"subprocess_cmd", "os_cmd"}:
-                cmd_node: ast.AST | None = None
-                starred_cmd_val: Any = None
+
+                def _resolve_arg(pos_idx: int, kw_keys: tuple[str, ...]) -> str | None:
+                    if pos_idx < len(pos_candidates) and pos_candidates[pos_idx] is not None:
+                        return pos_candidates[pos_idx]
+                    for k_name in kw_keys:
+                        val = kw_strs.get(k_name)
+                        if val is not None:
+                            return val
+                    for kw_m in kw_starred_maps:
+                        for k_name in kw_keys:
+                            m_val = kw_m.get(k_name)
+                            if isinstance(m_val, str):
+                                return m_val
+                    return None
+
+                def _resolve_arg_node(pos_idx: int, kw_keys: tuple[str, ...]) -> ast.AST | None:
+                    if pos_idx < len(node.args) and not isinstance(node.args[pos_idx], ast.Starred):
+                        return node.args[pos_idx]
+                    for kw in node.keywords:
+                        if kw.arg in kw_keys:
+                            return kw.value
+                    return None
+
+                if kind in {"rmtree", "os_delete"}:
+                    target_str = _resolve_arg(0, ("path", "dir_fd"))
+                    if target_str is not None and _is_critical_rm_target(target_str):
+                        return "safety_floor:destructive_rm_root_or_glob"
+                    if (
+                        target_str is None
+                        and (is_python_module or not _is_embedded_fragment)
+                        and _has_dynamic_path_obfuscation(
+                            _resolve_arg_node(0, ("path", "dir_fd"))
+                        )
+                    ):
+                        return "safety_floor:python_dynamic_path_target"
+                elif kind == "os_truncate":
+                    target_str = _resolve_arg(0, ("path",))
+                    if target_str is not None and _is_critical_overwrite_target(target_str):
+                        return "safety_floor:destructive_truncate_file"
+                    if (
+                        target_str is None
+                        and (is_python_module or not _is_embedded_fragment)
+                        and _has_dynamic_path_obfuscation(_resolve_arg_node(0, ("path",)))
+                    ):
+                        return "safety_floor:python_dynamic_path_target"
+                elif kind == "os_chmod":
+                    target_str = _resolve_arg(0, ("path",))
+                    if target_str is not None and (
+                        _is_critical_rm_target(target_str)
+                        or _is_critical_overwrite_target(target_str)
+                    ):
+                        return "safety_floor:destructive_chmod_000_root"
+                    if (
+                        target_str is None
+                        and (is_python_module or not _is_embedded_fragment)
+                        and _has_dynamic_path_obfuscation(_resolve_arg_node(0, ("path",)))
+                    ):
+                        return "safety_floor:python_dynamic_path_target"
+                elif kind == "file_move":
+                    src_str = _resolve_arg(0, ("src",))
+                    dst_str = _resolve_arg(1, ("dst",))
+                    if (src_str is not None and _is_critical_overwrite_target(src_str)) or (
+                        dst_str is not None and _is_critical_overwrite_target(dst_str)
+                    ):
+                        return "safety_floor:destructive_mv_critical"
+                elif kind == "file_dst_write":
+                    dst_str = _resolve_arg(1, ("dst",))
+                    if dst_str is not None and _is_critical_overwrite_target(dst_str):
+                        return "safety_floor:destructive_redirect_truncate"
+                elif kind == "os_open":
+                    target_str = _resolve_arg(0, ("path",))
+                    flags_node: ast.AST | None = None
+                    if len(node.args) > 1 and not isinstance(node.args[1], ast.Starred):
+                        flags_node = node.args[1]
+                    else:
+                        for kw in node.keywords:
+                            if kw.arg == "flags":
+                                flags_node = kw.value
+                                break
+                    flags_val: int | None = None
+                    if flags_node is not None:
+                        def _eval_open_flags(fn: ast.AST) -> int | None:
+                            if (
+                                isinstance(fn, ast.Constant)
+                                and isinstance(fn.value, int)
+                                and not isinstance(fn.value, bool)
+                            ):
+                                return fn.value
+                            if isinstance(fn, ast.Name):
+                                if fn.id in _OS_OPEN_FLAG_NAMES:
+                                    return int(getattr(os, fn.id, 0))
+                                if fn.id in int_vars:
+                                    return int_vars[fn.id]
+                                return None
+                            if (
+                                isinstance(fn, ast.Attribute)
+                                and _resolve_module_name(fn.value) == "os"
+                                and fn.attr.startswith("O_")
+                                and hasattr(os, fn.attr)
+                            ):
+                                raw_attr = getattr(os, fn.attr)
+                                return int(raw_attr) if isinstance(raw_attr, int) else None
+                            if isinstance(fn, ast.BinOp) and isinstance(
+                                fn.op, (ast.BitOr, ast.Add)
+                            ):
+                                lv = _eval_open_flags(fn.left)
+                                rv = _eval_open_flags(fn.right)
+                                if lv is not None and rv is not None:
+                                    return (
+                                        (lv | rv)
+                                        if isinstance(fn.op, ast.BitOr)
+                                        else (lv + rv)
+                                    )
+                            return None
+
+                        flags_val = _eval_open_flags(flags_node)
+                    if (
+                        target_str is not None
+                        and _is_critical_overwrite_target(target_str)
+                        and flags_val is not None
+                        and (flags_val & _OS_OPEN_WRITE_MASK) != 0
+                    ):
+                        return "safety_floor:destructive_redirect_truncate"
+                    if (
+                        target_str is None
+                        and flags_val is not None
+                        and (flags_val & _OS_OPEN_WRITE_MASK) != 0
+                        and (is_python_module or not _is_embedded_fragment)
+                        and _has_dynamic_path_obfuscation(_resolve_arg_node(0, ("path",)))
+                    ):
+                        return "safety_floor:python_dynamic_path_target"
+                elif kind == "file_open":
+                    target_str = _resolve_arg(0, ("file", "filename"))
+                    mode_str = _resolve_arg(1, ("mode",))
+                    if mode_str is None:
+                        mode_str = "r"
+                    is_write_mode = isinstance(mode_str, str) and any(
+                        ch in mode_str for ch in ("w", "a", "x", "+")
+                    )
+                    if (
+                        target_str is not None
+                        and is_write_mode
+                        and _is_critical_overwrite_target(target_str)
+                    ):
+                        return "safety_floor:destructive_redirect_truncate"
+                    if (
+                        target_str is None
+                        and is_write_mode
+                        and (is_python_module or not _is_embedded_fragment)
+                        and _has_dynamic_path_obfuscation(
+                            _resolve_arg_node(0, ("file", "filename"))
+                        )
+                    ):
+                        return "safety_floor:python_dynamic_path_target"
+            elif kind == "fileinput_input":
+                fi_pos: list[tuple[ast.AST | None, Any]] = []
+                for arg in node.args:
+                    if isinstance(arg, ast.Starred):
+                        unpacked = (
+                            _resolve_iterable_path_only(arg.value)
+                            if _is_reversed_call(arg.value)
+                            else _resolve_path_node(arg.value)
+                        )
+                        _flush_unapplied_expr_calls(arg.value)
+                        if isinstance(unpacked, list):
+                            for item in unpacked:
+                                fi_pos.append((None, item))
+                        else:
+                            fi_pos.append((None, None))
+                    else:
+                        fi_pos.append((arg, None))
+                        _flush_unapplied_expr_calls(arg)
+                fi_kw_nodes: dict[str, ast.AST] = {}
+                fi_kw_maps: list[Mapping[Any, Any]] = []
+                for kw in node.keywords:
+                    if kw.arg is not None:
+                        fi_kw_nodes[kw.arg] = kw.value
+                    else:
+                        kw_val = _resolve_path_node(kw.value)
+                        if isinstance(kw_val, Mapping):
+                            fi_kw_maps.append(kw_val)
+                    _flush_unapplied_expr_calls(kw.value)
+
+                fi_targets: list[str] = []
+                files_node = fi_kw_nodes.get("files")
+                if files_node is not None:
+                    f_str = _extract_path_str(files_node)
+                    if f_str is not None:
+                        fi_targets.append(f_str)
+                    else:
+                        f_seq = _resolve_path_node(files_node)
+                        if isinstance(f_seq, (list, tuple)):
+                            fi_targets.extend(x for x in f_seq if isinstance(x, str))
+                elif fi_pos:
+                    n0, v0 = fi_pos[0]
+                    if n0 is not None:
+                        f_str = _extract_path_str(n0)
+                        if f_str is not None:
+                            fi_targets.append(f_str)
+                        else:
+                            f_seq = _resolve_path_node(n0)
+                            if isinstance(f_seq, (list, tuple)):
+                                fi_targets.extend(x for x in f_seq if isinstance(x, str))
+                    elif isinstance(v0, str):
+                        fi_targets.append(v0)
+                    elif isinstance(v0, (list, tuple)):
+                        fi_targets.extend(x for x in v0 if isinstance(x, str))
+                else:
+                    for kw_m in fi_kw_maps:
+                        mv = kw_m.get("files")
+                        if isinstance(mv, str):
+                            fi_targets.append(mv)
+                        elif isinstance(mv, (list, tuple)):
+                            fi_targets.extend(x for x in mv if isinstance(x, str))
+
+                is_inplace: bool | None = None
+                if "inplace" in fi_kw_nodes:
+                    is_inplace = _extract_bool_node(fi_kw_nodes["inplace"])
+                elif len(fi_pos) > 1:
+                    n1, v1 = fi_pos[1]
+                    is_inplace = (
+                        _extract_bool_node(n1)
+                        if n1 is not None
+                        else (bool(v1) if isinstance(v1, (bool, int)) else None)
+                    )
+                else:
+                    for kw_m in fi_kw_maps:
+                        if "inplace" in kw_m and isinstance(kw_m["inplace"], (bool, int)):
+                            is_inplace = bool(kw_m["inplace"])
+                            break
+
+                fi_mode: str | None = None
+                if "mode" in fi_kw_nodes:
+                    fi_mode = _extract_path_str(fi_kw_nodes["mode"])
+                elif len(fi_pos) > 3:
+                    n3, v3 = fi_pos[3]
+                    fi_mode = (
+                        _extract_path_str(n3)
+                        if n3 is not None
+                        else (v3 if isinstance(v3, str) else None)
+                    )
+                else:
+                    for kw_m in fi_kw_maps:
+                        if isinstance(kw_m.get("mode"), str):
+                            fi_mode = kw_m["mode"]
+                            break
+
+                has_fi_write = isinstance(fi_mode, str) and any(
+                    ch in fi_mode for ch in ("w", "a", "x", "+")
+                )
+                if (is_inplace is True or has_fi_write) and any(
+                    _is_critical_overwrite_target(t) for t in fi_targets
+                ):
+                    return "safety_floor:destructive_redirect_truncate"
+            elif kind == "eval_exec":
+                eval_code_node: ast.AST | None = None
+                eval_starred_val: Any = None
+                eval_has_decode = False
                 if node.args:
                     if isinstance(node.args[0], ast.Starred):
-                        unpacked = (
+                        eval_has_decode = _contains_decode_or_decoded_var(node.args[0].value)
+                        unpacked_e = (
                             _resolve_iterable_path_only(node.args[0].value)
                             if _is_reversed_call(node.args[0].value)
                             else _resolve_path_node(node.args[0].value)
                         )
-                        if isinstance(unpacked, list) and unpacked:
-                            starred_cmd_val = unpacked[0]
+                        if isinstance(unpacked_e, list) and unpacked_e:
+                            eval_starred_val = unpacked_e[0]
                     else:
-                        cmd_node = node.args[0]
-                if cmd_node is None and starred_cmd_val is None:
-                    kw_names = ("args",) if kind == "subprocess_cmd" else ("cmd", "command")
+                        eval_code_node = node.args[0]
+                        eval_has_decode = _contains_decode_or_decoded_var(eval_code_node)
+                if eval_code_node is None and eval_starred_val is None:
                     for kw in node.keywords:
-                        if kw.arg in kw_names:
-                            cmd_node = kw.value
+                        if kw.arg in {"source", "expression"}:
+                            eval_code_node = kw.value
+                            eval_has_decode = eval_has_decode or _contains_decode_or_decoded_var(
+                                kw.value
+                            )
                             break
                         if kw.arg is None:
+                            eval_has_decode = eval_has_decode or _contains_decode_or_decoded_var(
+                                kw.value
+                            )
                             kw_val = _resolve_path_node(kw.value)
                             if isinstance(kw_val, Mapping):
-                                for k_name in kw_names:
+                                for k_name in ("source", "expression"):
                                     if k_name in kw_val:
-                                        starred_cmd_val = kw_val[k_name]
+                                        eval_starred_val = kw_val[k_name]
                                         break
-                                if starred_cmd_val is not None:
+                                if eval_starred_val is not None:
                                     break
-                cmd_list: list[str] | None = None
-                cmd_str: str | None = None
-                if cmd_node is not None:
-                    cmd_list = _extract_cmd_lst(cmd_node)
-                    if not cmd_list:
-                        cmd_str = _extract_path_str(cmd_node)
-                elif starred_cmd_val is not None:
-                    if isinstance(starred_cmd_val, list) and all(
-                        isinstance(x, str) for x in starred_cmd_val
-                    ):
-                        cmd_list = list(starred_cmd_val)
-                    elif isinstance(starred_cmd_val, str):
-                        cmd_str = starred_cmd_val
                 for arg in node.args:
-                    _flush_unapplied_expr_calls(arg.value if isinstance(arg, ast.Starred) else arg)
+                    _flush_unapplied_expr_calls(
+                        arg.value if isinstance(arg, ast.Starred) else arg
+                    )
                 for kw in node.keywords:
                     _flush_unapplied_expr_calls(kw.value)
+                eval_code_str: str | None = None
+                if eval_code_node is not None:
+                    eval_code_str = _extract_path_str(eval_code_node)
+                elif isinstance(eval_starred_val, str):
+                    eval_code_str = eval_starred_val
+                if eval_code_str is not None and eval_code_str.strip():
+                    if _ast_depth < 4:
+                        sub_trunc_eval = [False]
+                        eval_violation = _check_text_against_safety_patterns(
+                            eval_code_str,
+                            _ast_depth=_ast_depth + 1,
+                            _cmd_depth=_cmd_depth,
+                            _step_budget=_step_budget,
+                            _ast_step_budget=_ast_step_budget,
+                            _char_budget=_char_budget,
+                            _seen_texts=_seen_texts,
+                            _truncated_out=sub_trunc_eval,
+                        )
+                        if sub_trunc_eval[0]:
+                            truncated_by_depth = True
+                        if eval_violation is not None:
+                            return eval_violation
+                    else:
+                        truncated_by_depth = True
+                        if _truncated_out is not None:
+                            _truncated_out[0] = True
+                        return "safety_floor:python_ast_complexity_budget_exceeded"
+                if eval_has_decode:
+                    return "safety_floor:python_dynamic_decoded_exec"
+                if eval_code_str is None and (is_python_module or not _is_embedded_fragment):
+                    return "safety_floor:python_dynamic_command_exec"
+            elif kind in {"subprocess_cmd", "os_cmd", *_PROC_EXEC_KINDS}:
+                cmd_list: list[str] | None = None
+                cmd_str: str | None = None
+                has_decode_arg = False
+                has_unresolved_proc_args = False
+                if kind in {"subprocess_cmd", "os_cmd"}:
+                    cmd_node: ast.AST | None = None
+                    starred_cmd_val: Any = None
+                    if node.args:
+                        if isinstance(node.args[0], ast.Starred):
+                            has_decode_arg = _contains_decode_or_decoded_var(node.args[0].value)
+                            unpacked = (
+                                _resolve_iterable_path_only(node.args[0].value)
+                                if _is_reversed_call(node.args[0].value)
+                                else _resolve_path_node(node.args[0].value)
+                            )
+                            if isinstance(unpacked, list) and unpacked:
+                                starred_cmd_val = unpacked[0]
+                        else:
+                            cmd_node = node.args[0]
+                            has_decode_arg = _contains_decode_or_decoded_var(cmd_node)
+                    if cmd_node is None and starred_cmd_val is None:
+                        kw_names = ("args",) if kind == "subprocess_cmd" else ("cmd", "command")
+                        for kw in node.keywords:
+                            if kw.arg in kw_names:
+                                cmd_node = kw.value
+                                has_decode_arg = (
+                                    has_decode_arg
+                                    or _contains_decode_or_decoded_var(kw.value)
+                                )
+                                break
+                            if kw.arg is None:
+                                has_decode_arg = (
+                                    has_decode_arg
+                                    or _contains_decode_or_decoded_var(kw.value)
+                                )
+                                kw_val = _resolve_path_node(kw.value)
+                                if isinstance(kw_val, Mapping):
+                                    for k_name in kw_names:
+                                        if k_name in kw_val:
+                                            starred_cmd_val = kw_val[k_name]
+                                            break
+                                    if starred_cmd_val is not None:
+                                        break
+                    if cmd_node is not None:
+                        cmd_list = _extract_cmd_lst(cmd_node)
+                        if not cmd_list:
+                            cmd_str = _extract_path_str(cmd_node)
+                    elif starred_cmd_val is not None:
+                        if isinstance(starred_cmd_val, list) and all(
+                            isinstance(x, str) for x in starred_cmd_val
+                        ):
+                            cmd_list = list(starred_cmd_val)
+                        elif isinstance(starred_cmd_val, str):
+                            cmd_str = starred_cmd_val
+                    for arg in node.args:
+                        _flush_unapplied_expr_calls(
+                            arg.value if isinstance(arg, ast.Starred) else arg
+                        )
+                    for kw in node.keywords:
+                        _flush_unapplied_expr_calls(kw.value)
+                else:
+                    proc_pos: list[tuple[ast.AST | None, Any]] = []
+                    for arg in node.args:
+                        if isinstance(arg, ast.Starred):
+                            has_decode_arg = (
+                                has_decode_arg
+                                or _contains_decode_or_decoded_var(arg.value)
+                            )
+                            unpacked = (
+                                _resolve_iterable_path_only(arg.value)
+                                if _is_reversed_call(arg.value)
+                                else _resolve_path_node(arg.value)
+                            )
+                            _flush_unapplied_expr_calls(arg.value)
+                            if isinstance(unpacked, list):
+                                for item in unpacked:
+                                    proc_pos.append((None, item))
+                            else:
+                                proc_pos.append((None, None))
+                        else:
+                            has_decode_arg = (
+                                has_decode_arg or _contains_decode_or_decoded_var(arg)
+                            )
+                            proc_pos.append((arg, None))
+                            _flush_unapplied_expr_calls(arg)
+                    proc_kw_nodes: dict[str, ast.AST] = {}
+                    proc_kw_maps: list[Mapping[Any, Any]] = []
+                    for kw in node.keywords:
+                        if kw.arg is not None:
+                            if kw.arg in {"path", "file", "args", "argv"}:
+                                has_decode_arg = (
+                                    has_decode_arg
+                                    or _contains_decode_or_decoded_var(kw.value)
+                                )
+                            proc_kw_nodes[kw.arg] = kw.value
+                        else:
+                            has_decode_arg = (
+                                has_decode_arg
+                                or _contains_decode_or_decoded_var(kw.value)
+                            )
+                            kw_val = _resolve_path_node(kw.value)
+                            if isinstance(kw_val, Mapping):
+                                proc_kw_maps.append(kw_val)
+                        _flush_unapplied_expr_calls(kw.value)
+
+                    def _proc_pos_str(idx: int) -> str | None:
+                        if idx >= len(proc_pos):
+                            return None
+                        pn, pv = proc_pos[idx]
+                        if pn is not None:
+                            return _extract_path_str(pn)
+                        return pv if isinstance(pv, str) else None
+
+                    def _proc_pos_cmd_list(idx: int) -> list[str] | None:
+                        if idx >= len(proc_pos):
+                            return None
+                        pn, pv = proc_pos[idx]
+                        if pn is not None:
+                            return _extract_cmd_lst(pn)
+                        if isinstance(pv, list) and all(isinstance(x, str) for x in pv):
+                            return list(pv)
+                        return None
+
+                    def _proc_kw_str(keys: tuple[str, ...]) -> str | None:
+                        for k_name in keys:
+                            if k_name in proc_kw_nodes:
+                                val = _extract_path_str(proc_kw_nodes[k_name])
+                                if val is not None:
+                                    return val
+                        for kw_m in proc_kw_maps:
+                            for k_name in keys:
+                                mv = kw_m.get(k_name)
+                                if isinstance(mv, str):
+                                    return mv
+                        return None
+
+                    def _proc_kw_cmd_list(keys: tuple[str, ...]) -> list[str] | None:
+                        for k_name in keys:
+                            if k_name in proc_kw_nodes:
+                                val = _extract_cmd_lst(proc_kw_nodes[k_name])
+                                if val:
+                                    return val
+                        for kw_m in proc_kw_maps:
+                            for k_name in keys:
+                                mv = kw_m.get(k_name)
+                                if isinstance(mv, list) and all(isinstance(x, str) for x in mv):
+                                    return list(mv)
+                        return None
+
+                    if kind == "pty_spawn":
+                        cmd_list = _proc_pos_cmd_list(0) or _proc_kw_cmd_list(("argv",))
+                        if not cmd_list:
+                            cmd_str = _proc_pos_str(0) or _proc_kw_str(("argv",))
+                    elif kind in {"os_execl", "os_execle", "os_spawnl", "os_spawnle"}:
+                        exe_idx = 1 if kind in {"os_spawnl", "os_spawnle"} else 0
+                        exe_str = _proc_pos_str(exe_idx) or _proc_kw_str(("path", "file"))
+                        end_idx = (
+                            len(proc_pos) - 1
+                            if (
+                                kind in {"os_execle", "os_spawnle"}
+                                and len(proc_pos) > exe_idx + 2
+                                and _proc_pos_str(len(proc_pos) - 1) is None
+                            )
+                            else len(proc_pos)
+                        )
+                        raw_arg_strs = [_proc_pos_str(idx) for idx in range(exe_idx + 1, end_idx)]
+                        if exe_str is None or any(s is None for s in raw_arg_strs):
+                            has_unresolved_proc_args = True
+                        arg_strs = [s for s in raw_arg_strs if s is not None]
+                        if arg_strs and not arg_strs[0].startswith("-"):
+                            arg_strs = arg_strs[1:]
+                        if exe_str:
+                            cmd_list = [exe_str, *arg_strs]
+                        elif arg_strs:
+                            cmd_list = arg_strs
+                    else:
+                        exe_idx = 1 if kind in {"os_spawnv", "os_spawnve"} else 0
+                        exe_str = _proc_pos_str(exe_idx) or _proc_kw_str(("path", "file"))
+                        argv_list = _proc_pos_cmd_list(exe_idx + 1) or _proc_kw_cmd_list(
+                            ("args", "argv")
+                        )
+                        has_argv_arg = (
+                            len(proc_pos) > exe_idx + 1
+                            or "args" in proc_kw_nodes
+                            or "argv" in proc_kw_nodes
+                            or any("args" in kw_m or "argv" in kw_m for kw_m in proc_kw_maps)
+                        )
+                        if exe_str is None or (has_argv_arg and argv_list is None):
+                            has_unresolved_proc_args = True
+                        if argv_list:
+                            tail = (
+                                argv_list[1:]
+                                if (exe_str and not argv_list[0].startswith("-"))
+                                else argv_list
+                            )
+                            cmd_list = [exe_str, *tail] if exe_str else list(argv_list)
+                        elif exe_str:
+                            cmd_list = [exe_str]
                 if cmd_list:
                     raw_head = Path(cmd_list[0].strip("\"'")).name.lower()
                     eff_cmd_list = (
@@ -6079,6 +8496,13 @@ def _check_python_ast_calls_impl(
                             truncated_by_depth = True
                     if violation is not None:
                         return violation
+                if has_decode_arg:
+                    return "safety_floor:python_dynamic_decoded_exec"
+                if (
+                    (cmd_list is None and not (cmd_str and cmd_str.strip()))
+                    or has_unresolved_proc_args
+                ) and (is_python_module or not _is_embedded_fragment):
+                    return "safety_floor:python_dynamic_command_exec"
         return None
 
     _MAX_AST_VISITED_NODES = 20_000
@@ -6093,6 +8517,9 @@ def _check_python_ast_calls_impl(
             if _truncated_out is not None and truncated_by_depth:
                 _truncated_out[0] = True
             return res, is_python_module
+        if id(cur_node) in skip_children_ids:
+            skip_children_ids.discard(id(cur_node))
+            continue
         children = list(ast.iter_child_nodes(cur_node))
         for child in reversed(children):
             stack.append(child)
@@ -6539,9 +8966,10 @@ def _is_shell_redirection_tail_span(text: str, start: int, end: int) -> bool:
             break
         if i >= end:
             return True
-        if i == end - 1 and text[i] == "\\":
+        ch = text[i]
+        if i == end - 1 and ch == "\\":
             return True
-        if text[i] == "#" and (
+        if ch == "#" and (
             (i > start and (text[i - 1].isspace() or text[i - 1] in ";|&()<>"))
             or (i == start and (start == 0 or text[start - 1] in ";|&()<> \t\r\n"))
         ):
@@ -6555,6 +8983,8 @@ def _is_shell_redirection_tail_span(text: str, start: int, end: int) -> bool:
                 if text[i] != "#":
                     return False
             return True
+        if ch not in "><&0123456789{":
+            return False
         m = _SHELL_REDIR_OP_RE.match(text, i, end)
         if m is None:
             return False
@@ -7182,6 +9612,10 @@ _SHELL_AMBIGUOUS_VAR_SENTINEL: str = "$__AMBIGUOUS__"
 _SHELL_KEYWORD_STAGE_HEADS: frozenset[str] = frozenset(
     {"for", "while", "until", "if", "case", "then", "do", "else", "elif", "done", "fi", "esac"}
 )
+_SHELL_KEYWORD_STAGE_HEAD_FIRST_CHARS: frozenset[str] = frozenset(
+    kw[0] for kw in _SHELL_KEYWORD_STAGE_HEADS
+)
+_CACHE_MISS: object = object()
 
 
 class _AmbiguousPipedCompoundShell(Exception):
@@ -7529,6 +9963,8 @@ def _parse_var_assignment_chain(
     _step_budget: list[int] | None = None,
     _char_budget: list[int] | None = None,
 ) -> tuple[str, list[tuple[str, list[str]]]] | None:
+    if text.find("=", c_s, c_e) == -1 and text.find("unset", c_s, c_e) == -1:
+        return None
     pos = _strip_non_opener_flow_prefixes_span(text, c_s, c_e)
     raw = text[pos:c_e].strip()
     if not raw:
@@ -7838,25 +10274,54 @@ def _check_unresolved_cmd_args(
             permissive = False
             after_dd = False
             seen_mode = False
+            skip_next_ref = False
             for idx_t, tok in enumerate(tokens[1:], start=1):
                 clean = tok.strip("\"'")
                 low = clean.lower()
+                if skip_next_ref:
+                    if flags[idx_t]:
+                        return "safety_floor:shell_ambiguous_variable_expansion"
+                    skip_next_ref = False
+                    continue
                 if not after_dd and clean == "--":
                     after_dd = True
                     continue
                 if not after_dd and clean.startswith("-"):
                     if flags[idx_t]:
                         return "safety_floor:shell_ambiguous_variable_expansion"
+                    if low == "--reference":
+                        permissive = True
+                        seen_mode = True
+                        skip_next_ref = True
+                        continue
+                    if low.startswith("--reference="):
+                        permissive = True
+                        seen_mode = True
+                        continue
                     if low == "--recursive" or (not clean.startswith("--") and "r" in low[1:]):
                         has_rec = True
                     continue
-                if not seen_mode and _is_permissive_chmod_mode(clean):
+                if not seen_mode and (
+                    _is_permissive_chmod_mode(clean) or _is_lockout_chmod_mode(clean)
+                ):
                     permissive = True
                     seen_mode = True
                     continue
                 seen_mode = True
             if has_rec or permissive or has_upstream_crit or flags[1]:
                 return "safety_floor:shell_ambiguous_variable_expansion"
+    elif cmd in {"unlink", "rmdir"}:
+        if len(tokens) > 1 and any(flags[1:]):
+            after_dd = False
+            for idx_t, tok in enumerate(tokens[1:], start=1):
+                clean = tok.strip("\"'")
+                if not after_dd and clean == "--":
+                    after_dd = True
+                    continue
+                if not after_dd and clean.startswith("-") and len(clean) > 1:
+                    continue
+                if flags[idx_t] or _is_critical_rm_target(clean):
+                    return "safety_floor:shell_ambiguous_variable_expansion"
     elif cmd == "dd":
         for idx_t in range(1, len(tokens)):
             if flags[idx_t]:
@@ -8756,19 +11221,28 @@ def _split_span_outside_quotes(
         cached_parts = split_cache.get(cache_key)
         if cached_parts is not None:
             return cached_parts
-    disallow_re = _PIPE_FAST_DISALLOW_GRP_RE if respect_groups else _PIPE_FAST_DISALLOW_NOGRP_RE
-    if seps is _SHELL_PIPE_SEPS and disallow_re.search(text, start, end) is None:
-        parts_fast: list[tuple[int, int, str | None]] = []
-        p_s = start
-        while True:
-            pipe_idx = text.find("|", p_s, end)
-            if pipe_idx == -1:
-                parts_fast.append((p_s, end, None))
-                if split_cache is not None and len(split_cache) < 32_768:
-                    split_cache[(start, end, seps, respect_groups)] = parts_fast
-                return parts_fast
-            parts_fast.append((p_s, pipe_idx, "|"))
-            p_s = pipe_idx + 1
+    if seps is _SHELL_PIPE_SEPS:
+        if text.find("|", start, end) == -1:
+            parts_no_pipe: list[tuple[int, int, str | None]] = [(start, end, None)]
+            if split_cache is not None and len(split_cache) < 32_768:
+                split_cache[(start, end, seps, respect_groups)] = parts_no_pipe
+            return parts_no_pipe
+        disallow_re = _PIPE_FAST_DISALLOW_GRP_RE if respect_groups else _PIPE_FAST_DISALLOW_NOGRP_RE
+        if (
+            (not respect_groups or text[start] not in ("(", "{"))
+            and disallow_re.search(text, start, end) is None
+        ):
+            parts_fast: list[tuple[int, int, str | None]] = []
+            p_s = start
+            while True:
+                pipe_idx = text.find("|", p_s, end)
+                if pipe_idx == -1:
+                    parts_fast.append((p_s, end, None))
+                    if split_cache is not None and len(split_cache) < 32_768:
+                        split_cache[(start, end, seps, respect_groups)] = parts_fast
+                    return parts_fast
+                parts_fast.append((p_s, pipe_idx, "|"))
+                p_s = pipe_idx + 1
 
     ordered_seps = _ORDERED_SEPS_BY_SEPS.get(seps)
     if ordered_seps is None:
@@ -8781,6 +11255,11 @@ def _split_span_outside_quotes(
     pending_op_continuation = False
     i = start
     while i < end:
+        if respect_groups and group_depth == 0 and i in pairs and pairs[i] < end:
+            i = pairs[i] + 1
+            prev_was_escaped = False
+            pending_op_continuation = False
+            continue
         m = scan_re.search(text, i, end)
         if m is None:
             break
@@ -9442,6 +11921,11 @@ _STDIN_PASSTHROUGH_CMDS: frozenset[str] = frozenset(
 )
 
 
+_STDIN_PASSTHROUGH_WORDS_RE: re.Pattern[str] = re.compile(
+    r"\b(?:" + "|".join(sorted(_STDIN_PASSTHROUGH_CMDS)) + r")\b"
+)
+
+
 def _span_has_nonspace(text: str, start: int, end: int) -> bool:
     return any(not text[idx].isspace() for idx in range(start, end))
 
@@ -9497,13 +11981,20 @@ def _group_is_stdin_passthrough(
         tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
     ]
     | None = None,
+    has_stdin_passthrough_kw: bool = True,
 ) -> bool | object:
+    if not has_stdin_passthrough_kw:
+        return False
     root_u_s, root_u_e, _ = _unwrap_span_groups(
         text, root_start, root_end, pairs, unwrap_cache=unwrap_cache
     )
     if root_u_s >= root_u_e:
         return False
-    root_key = _loop_vars_cache_key(root_u_s, root_u_e, loop_vars or {})
+    root_key = (
+        (root_u_s, root_u_e, ())
+        if not loop_vars
+        else _loop_vars_cache_key(root_u_s, root_u_e, loop_vars)
+    )
     if group_passthrough_cache is not None and root_key in group_passthrough_cache:
         return group_passthrough_cache[root_key]
     work: list[tuple[int, int]] = [(root_u_s, root_u_e)]
@@ -9623,13 +12114,20 @@ def _group_may_passthrough_stdin(
         tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
     ]
     | None = None,
+    has_may_passthrough_kw: bool = True,
 ) -> bool:
+    if not has_may_passthrough_kw:
+        return False
     root_u_s, root_u_e, _ = _unwrap_span_groups(
         text, root_start, root_end, pairs, unwrap_cache=unwrap_cache
     )
     if root_u_s >= root_u_e:
         return False
-    root_key = _loop_vars_cache_key(root_u_s, root_u_e, loop_vars or {})
+    root_key = (
+        (root_u_s, root_u_e, ())
+        if not loop_vars
+        else _loop_vars_cache_key(root_u_s, root_u_e, loop_vars)
+    )
     if group_may_passthrough_cache is not None and root_key in group_may_passthrough_cache:
         return group_may_passthrough_cache[root_key]
     slice_low = text[root_u_s:root_u_e].lower()
@@ -9749,6 +12247,10 @@ def _find_group_upstream_critical_path(
     positional_sample: str | None,
     loop_vars: Mapping[str, list[str]],
     has_for_keyword: bool = True,
+    has_cond_or_case_kw: bool = True,
+    has_eq_or_unset: bool = True,
+    has_chain_sep_in_segment: bool = True,
+    has_compound_closers: bool = True,
     _step_budget: list[int] | None = None,
     _char_budget: list[int] | None = None,
     unwrap_cache: dict[tuple[int, int], tuple[int, int, bool]] | None = None,
@@ -9762,9 +12264,9 @@ def _find_group_upstream_critical_path(
     if _char_budget is None:
         _char_budget = [0]
     dfs_stack: list[
-        tuple[str, int, int, dict[str, list[str]], tuple[int, int, tuple[Any, ...]] | None]
+        tuple[str, int, int, Mapping[str, list[str]], tuple[int, int, tuple[Any, ...]] | None]
     ] = [
-        ("visit", root_start, root_end, dict(loop_vars), None),
+        ("visit", root_start, root_end, loop_vars, None),
     ]
     while dfs_stack:
         _step_budget[0] += 1
@@ -9780,40 +12282,52 @@ def _find_group_upstream_critical_path(
         )
         if u_s >= u_e:
             continue
-        ckey = _loop_vars_cache_key(u_s, u_e, cur_lvars)
+        ckey = (
+            (u_s, u_e, ())
+            if not cur_lvars
+            else _loop_vars_cache_key(u_s, u_e, cur_lvars)
+        )
         if ckey in group_crit_cache:
             cached_crit = group_crit_cache[ckey]
             if cached_crit is not None:
                 return cached_crit
             continue
         dfs_stack.append(("finish", u_s, u_e, cur_lvars, ckey))
-        child_groups: list[tuple[int, int, dict[str, list[str]]]] = []
-        block_lvars = dict(cur_lvars)
+        child_groups: list[tuple[int, int, Mapping[str, list[str]]]] = []
+        block_lvars: Mapping[str, list[str]] = cur_lvars
         case_depth = 0
         expect_case_pattern = False
         cond_stack: list[str] = []
         has_inner_groups = bool(pairs) and (
             text.find("(", u_s, u_e) != -1 or text.find("{", u_s, u_e) != -1
         )
-        chains = _split_span_outside_quotes(
-            text,
-            u_s,
-            u_e,
-            _SHELL_CHAIN_SEPS,
-            pairs,
-            closers,
-            respect_groups=True,
-            split_cache=split_cache,
+        chains: list[tuple[int, int, str | None]] = (
+            _split_span_outside_quotes(
+                text,
+                u_s,
+                u_e,
+                _SHELL_CHAIN_SEPS,
+                pairs,
+                closers,
+                respect_groups=True,
+                split_cache=split_cache,
+            )
+            if has_chain_sep_in_segment
+            else [(u_s, u_e, None)]
         )
-        coalesced_chains = _coalesce_piped_compound_chains(
-            text,
-            u_s,
-            u_e,
-            chains,
-            pairs,
-            closers,
-            respect_groups=True,
-            split_cache=split_cache,
+        coalesced_chains = (
+            _coalesce_piped_compound_chains(
+                text,
+                u_s,
+                u_e,
+                chains,
+                pairs,
+                closers,
+                respect_groups=True,
+                split_cache=split_cache,
+            )
+            if has_compound_closers and len(chains) >= 2
+            else None
         )
         chain_items: list[
             tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]
@@ -9872,9 +12386,14 @@ def _find_group_upstream_critical_path(
                 if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
                     expect_case_pattern = True
                 continue
-            c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
-                text, c_start, c_e, pairs, case_depth, expect_case_pattern, cond_stack
-            )
+            if has_cond_or_case_kw:
+                c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
+                    text, c_start, c_e, pairs, case_depth, expect_case_pattern, cond_stack
+                )
+            else:
+                c_s = c_start
+                while c_s < c_e and text[c_s].isspace():
+                    c_s += 1
             while c_e > c_s and text[c_e - 1].isspace():
                 c_e -= 1
             if c_s < c_e:
@@ -9902,17 +12421,21 @@ def _find_group_upstream_critical_path(
                         block_lvars = dict(block_lvars)
                         block_lvars[var_name] = expanded_words
                 else:
-                    var_binding = _parse_var_assignment_chain(
-                        text,
-                        c_s,
-                        c_e,
-                        block_lvars,
-                        _step_budget=_step_budget,
-                        _char_budget=_char_budget,
+                    var_binding = (
+                        _parse_var_assignment_chain(
+                            text,
+                            c_s,
+                            c_e,
+                            block_lvars,
+                            _step_budget=_step_budget,
+                            _char_budget=_char_budget,
+                        )
+                        if has_eq_or_unset
+                        else None
                     )
                     if var_binding is not None:
                         block_lvars = _apply_var_bindings(
-                            block_lvars,
+                            dict(block_lvars),
                             var_binding[0],
                             var_binding[1],
                             bool(cond_stack),
@@ -9995,43 +12518,120 @@ def _is_permissive_chmod_mode(mode_tok: str) -> bool:
             if m is None:
                 continue
             scope = m.group(1)
-            if ("a" in scope or "o" in scope) and re.search(r"[+=][rwxXst]*w", part) is not None:
+            if (not scope or "a" in scope or "o" in scope) and (
+                re.search(r"[+=][rwxXst]*w", part) is not None
+            ):
                 return True
     return False
+
+
+_CHMOD_LOCKOUT_SET_RE = re.compile(r"^([ugoa]*)=([rwxXst]*)$")
+_CHMOD_LOCKOUT_SUB_RE = re.compile(r"^([ugoa]*)-[rwxXst]*r[rwxXst]*$")
+
+
+def _is_lockout_chmod_mode(mode_tok: str) -> bool:
+    low = mode_tok.strip("\"'").lower()
+    if not low:
+        return False
+    if re.fullmatch(r"[0-7]{1,4}", low) is not None:
+        return all((int(d) & 4) == 0 for d in low[-3:])
+    if "=" in low or "-" in low:
+        cleared_u = False
+        cleared_g = False
+        cleared_o = False
+        for part in low.split(","):
+            m_set = _CHMOD_LOCKOUT_SET_RE.fullmatch(part)
+            if m_set is not None and "r" not in m_set.group(2):
+                scope = m_set.group(1)
+                if not scope or "a" in scope or ("u" in scope and "g" in scope and "o" in scope):
+                    return True
+                if "u" in scope:
+                    cleared_u = True
+                if "g" in scope:
+                    cleared_g = True
+                if "o" in scope:
+                    cleared_o = True
+                continue
+            m_sub = _CHMOD_LOCKOUT_SUB_RE.fullmatch(part)
+            if m_sub is not None:
+                scope = m_sub.group(1)
+                if not scope or "a" in scope or ("u" in scope and "g" in scope and "o" in scope):
+                    return True
+                if "u" in scope:
+                    cleared_u = True
+                if "g" in scope:
+                    cleared_g = True
+                if "o" in scope:
+                    cleared_o = True
+        if cleared_u and cleared_g and cleared_o:
+            return True
+    return False
+
+
+_CHMOD_SHORT_FLAGS: frozenset[str] = frozenset({"c", "f", "v", "R"})
 
 
 def _check_chmod_tokens(tokens: list[str]) -> str | None:
     has_recursive = False
     permissive_mode = False
+    lockout_mode = False
+    has_reference = False
     targets: list[str] = []
     after_dash_dash = False
     seen_mode = False
+    skip_next_ref = False
     for tok in tokens[1:]:
         clean_tok = tok.strip("\"'")
         low_tok = clean_tok.lower()
+        if skip_next_ref:
+            skip_next_ref = False
+            continue
         if not after_dash_dash:
             if clean_tok == "--":
                 after_dash_dash = True
                 continue
-            if low_tok == "--recursive" or (
-                clean_tok.startswith("-")
-                and not clean_tok.startswith("--")
-                and "r" in low_tok[1:]
-            ):
+            if low_tok == "--reference":
+                has_reference = True
+                seen_mode = True
+                skip_next_ref = True
+                continue
+            if low_tok.startswith("--reference="):
+                has_reference = True
+                seen_mode = True
+                continue
+            if low_tok == "--recursive":
                 has_recursive = True
                 continue
-            if clean_tok.startswith("-"):
+            if (
+                clean_tok.startswith("-")
+                and not clean_tok.startswith("--")
+                and len(clean_tok) > 1
+                and set(clean_tok[1:]).issubset(_CHMOD_SHORT_FLAGS)
+            ):
+                if "R" in clean_tok[1:]:
+                    has_recursive = True
                 continue
-        if not seen_mode and _is_permissive_chmod_mode(clean_tok):
-            permissive_mode = True
-            seen_mode = True
-            continue
+            if clean_tok.startswith("--"):
+                continue
+        if not seen_mode:
+            if _is_permissive_chmod_mode(clean_tok):
+                permissive_mode = True
+                seen_mode = True
+                continue
+            if _is_lockout_chmod_mode(clean_tok):
+                lockout_mode = True
+                seen_mode = True
+                continue
         seen_mode = True
         targets.append(clean_tok)
-    if has_recursive and permissive_mode:
+    if (has_recursive and permissive_mode) or lockout_mode or has_reference:
         for target in targets:
             if target.startswith("/*") or _is_critical_rm_target(target):
-                return "safety_floor:destructive_chmod_777_root"
+                return (
+                    "safety_floor:destructive_chmod_000_root"
+                    if (lockout_mode or has_reference)
+                    else "safety_floor:destructive_chmod_777_root"
+                )
     return None
 
 
@@ -10142,6 +12742,13 @@ def _find_group_upstream_echo_samples(
     positional_sample: str | None,
     loop_vars: Mapping[str, list[str]],
     has_for_keyword: bool,
+    has_cond_or_case_kw: bool = True,
+    has_eq_or_unset: bool = True,
+    has_echo_or_printf_or_read: bool = True,
+    has_stdin_passthrough_kw: bool = True,
+    has_may_passthrough_kw: bool = True,
+    has_chain_sep_in_segment: bool = True,
+    has_compound_closers: bool = True,
     _step_budget: list[int],
     _char_budget: list[int],
     group_echo_cache: dict[
@@ -10164,12 +12771,18 @@ def _find_group_upstream_echo_samples(
     | None = None,
     stdin_line_samples: tuple[str, ...] = (),
 ) -> tuple[list[tuple[str | None, list[str]]], bool, bool]:
+    if not has_echo_or_printf_or_read and not stdin_line_samples:
+        return [], False, False
     root_u_s, root_u_e, _ = _unwrap_span_groups(
         text, root_start, root_end, pairs, unwrap_cache=unwrap_cache
     )
     if root_u_s >= root_u_e:
         return [], False, False
-    root_key = _loop_vars_cache_key(root_u_s, root_u_e, loop_vars)
+    root_key = (
+        (root_u_s, root_u_e, ())
+        if not loop_vars
+        else _loop_vars_cache_key(root_u_s, root_u_e, loop_vars)
+    )
     if (
         not stdin_line_samples
         and group_echo_cache is not None
@@ -10177,8 +12790,8 @@ def _find_group_upstream_echo_samples(
     ):
         cached_samples, cached_unsup, cached_unres = group_echo_cache[root_key]
         return list(cached_samples), cached_unsup, cached_unres
-    work: list[tuple[int, int, dict[str, list[str]]]] = [
-        (root_u_s, root_u_e, dict(loop_vars))
+    work: list[tuple[int, int, Mapping[str, list[str]]]] = [
+        (root_u_s, root_u_e, loop_vars)
     ]
     visited = 0
     samples: list[tuple[str | None, list[str]]] = []
@@ -10203,32 +12816,40 @@ def _find_group_upstream_echo_samples(
         )
         if u_s >= u_e:
             continue
-        block_lvars = dict(cur_lvars)
+        block_lvars: Mapping[str, list[str]] = cur_lvars
         case_depth = 0
         expect_case_pattern = False
         cond_stack: list[str] = []
         has_inner_groups = bool(pairs) and (
             text.find("(", u_s, u_e) != -1 or text.find("{", u_s, u_e) != -1
         )
-        chains = _split_span_outside_quotes(
-            text,
-            u_s,
-            u_e,
-            _SHELL_CHAIN_SEPS,
-            pairs,
-            closers,
-            respect_groups=True,
-            split_cache=split_cache,
+        chains: list[tuple[int, int, str | None]] = (
+            _split_span_outside_quotes(
+                text,
+                u_s,
+                u_e,
+                _SHELL_CHAIN_SEPS,
+                pairs,
+                closers,
+                respect_groups=True,
+                split_cache=split_cache,
+            )
+            if has_chain_sep_in_segment
+            else [(u_s, u_e, None)]
         )
-        coalesced_chains = _coalesce_piped_compound_chains(
-            text,
-            u_s,
-            u_e,
-            chains,
-            pairs,
-            closers,
-            respect_groups=True,
-            split_cache=split_cache,
+        coalesced_chains = (
+            _coalesce_piped_compound_chains(
+                text,
+                u_s,
+                u_e,
+                chains,
+                pairs,
+                closers,
+                respect_groups=True,
+                split_cache=split_cache,
+            )
+            if has_compound_closers and len(chains) >= 2
+            else None
         )
         chain_items: list[
             tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]
@@ -10275,6 +12896,7 @@ def _find_group_upstream_echo_samples(
                                 group_passthrough_cache=group_passthrough_cache,
                                 unwrap_cache=unwrap_cache,
                                 split_cache=split_cache,
+                                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
                             )
                             if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                                 raise _ShellComplexityBudgetExceeded()
@@ -10293,6 +12915,7 @@ def _find_group_upstream_echo_samples(
                                 group_may_passthrough_cache=group_may_passthrough_cache,
                                 unwrap_cache=unwrap_cache,
                                 split_cache=split_cache,
+                                has_may_passthrough_kw=has_may_passthrough_kw,
                             ):
                                 continue
                             break
@@ -10352,9 +12975,14 @@ def _find_group_upstream_echo_samples(
                 if case_depth > 0 and trailing_sep in _SHELL_CASE_END_SEPS:
                     expect_case_pattern = True
                 continue
-            c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
-                text, c_start, c_e, pairs, case_depth, expect_case_pattern, cond_stack
-            )
+            if has_cond_or_case_kw:
+                c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
+                    text, c_start, c_e, pairs, case_depth, expect_case_pattern, cond_stack
+                )
+            else:
+                c_s = c_start
+                while c_s < c_e and text[c_s].isspace():
+                    c_s += 1
             while c_e > c_s and text[c_e - 1].isspace():
                 c_e -= 1
             if c_s < c_e:
@@ -10382,17 +13010,21 @@ def _find_group_upstream_echo_samples(
                         block_lvars = dict(block_lvars)
                         block_lvars[var_name] = expanded_words
                 else:
-                    var_binding = _parse_var_assignment_chain(
-                        text,
-                        c_s,
-                        c_e,
-                        block_lvars,
-                        _step_budget=_step_budget,
-                        _char_budget=_char_budget,
+                    var_binding = (
+                        _parse_var_assignment_chain(
+                            text,
+                            c_s,
+                            c_e,
+                            block_lvars,
+                            _step_budget=_step_budget,
+                            _char_budget=_char_budget,
+                        )
+                        if has_eq_or_unset
+                        else None
                     )
                     if var_binding is not None:
                         block_lvars = _apply_var_bindings(
-                            block_lvars,
+                            dict(block_lvars),
                             var_binding[0],
                             var_binding[1],
                             bool(cond_stack),
@@ -10450,6 +13082,7 @@ def _find_group_upstream_echo_samples(
                                     group_passthrough_cache=group_passthrough_cache,
                                     unwrap_cache=unwrap_cache,
                                     split_cache=split_cache,
+                                    has_stdin_passthrough_kw=has_stdin_passthrough_kw,
                                 )
                                 if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                                     raise _ShellComplexityBudgetExceeded()
@@ -10468,6 +13101,7 @@ def _find_group_upstream_echo_samples(
                                     group_may_passthrough_cache=group_may_passthrough_cache,
                                     unwrap_cache=unwrap_cache,
                                     split_cache=split_cache,
+                                    has_may_passthrough_kw=has_may_passthrough_kw,
                                 ):
                                     continue
                                 break
@@ -10537,6 +13171,322 @@ def _find_group_upstream_echo_samples(
     return samples, has_unsupported, has_unresolved_var
 
 
+def _unquote_heredoc_delim(raw_delim: str) -> tuple[str, bool]:
+    out: list[str] = []
+    quoted = False
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(raw_delim)
+    while i < n:
+        ch = raw_delim[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < n and raw_delim[i + 1] in {'"', "\\", "$", "`"}:
+                out.append(raw_delim[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            quoted = True
+            if i + 1 < n:
+                out.append(raw_delim[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if ch == "'":
+            quoted = True
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            quoted = True
+            in_double = True
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), quoted
+
+
+def _expand_heredoc_line(
+    line: str,
+    loop_vars: Mapping[str, list[str]],
+    *,
+    _step_budget: list[int],
+    _char_budget: list[int],
+) -> tuple[list[str], bool]:
+    if "$" not in line and "`" not in line:
+        return [line], False
+    variants: list[str] = [""]
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and i + 1 < n and line[i + 1] in {"$", "`", "\\"}:
+            lit = line[i + 1]
+            variants = [v + lit for v in variants]
+            i += 2
+            continue
+        if ch == "`":
+            return [], True
+        if ch == "$":
+            if i + 1 >= n:
+                variants = [v + "$" for v in variants]
+                i += 1
+                continue
+            nxt = line[i + 1]
+            if nxt in {"(", "'", '"'}:
+                return [], True
+            if nxt == "{":
+                close_b = line.find("}", i + 2)
+                if close_b == -1:
+                    return [], True
+                var_name = line[i + 2 : close_b]
+                if not _SHELL_IDENT_RE.fullmatch(var_name):
+                    return [], True
+                end_pos = close_b + 1
+            elif nxt.isalpha() or nxt == "_":
+                end_pos = i + 2
+                while end_pos < n and (line[end_pos].isalnum() or line[end_pos] == "_"):
+                    end_pos += 1
+                var_name = line[i + 1 : end_pos]
+            else:
+                return [], True
+            vals = loop_vars.get(var_name)
+            if not vals or any(v == _SHELL_AMBIGUOUS_VAR_SENTINEL for v in vals):
+                return [], True
+            next_variants: list[str] = []
+            for base_v in variants:
+                for val in vals:
+                    _step_budget[0] += 1
+                    _char_budget[0] += len(val)
+                    if (
+                        _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS
+                        or _char_budget[0] > _MAX_SHELL_EXPANDED_CHARS
+                    ):
+                        raise _ShellComplexityBudgetExceeded()
+                    next_variants.append(base_v + val)
+                    if len(next_variants) >= 64:
+                        return [], True
+            variants = next_variants
+            i = end_pos
+            continue
+        variants = [v + ch for v in variants]
+        i += 1
+    return variants, False
+
+
+def _extract_stage_stdin_redir_samples(
+    full_text: str,
+    stage_start: int,
+    stage_end: int,
+    loop_vars: Mapping[str, list[str]],
+    *,
+    _step_budget: list[int],
+    _char_budget: list[int],
+) -> tuple[list[tuple[str | None, list[str]]], bool, bool]:
+    if "<<" not in full_text[stage_start:stage_end]:
+        return [], False, False
+    line_start = full_text.rfind("\n", 0, stage_start) + 1
+    nl_pos = full_text.find("\n", stage_start)
+    line_end = nl_pos if nl_pos != -1 else len(full_text)
+
+    samples: list[tuple[str | None, list[str]]] = []
+    seen_lines: set[str] = set()
+    unsupported = False
+    unresolved = False
+
+    def _add_line_sample(ln_val: str) -> None:
+        nonlocal unsupported
+        if not ln_val:
+            return
+        if any(ws in ln_val for ws in (" ", "\t", "\n", "\r")):
+            w_list = _split_env_string_tokens(ln_val)
+        else:
+            w_list = [ln_val]
+        if ln_val not in seen_lines:
+            if len(seen_lines) < 64:
+                seen_lines.add(ln_val)
+                samples.append((ln_val, w_list))
+            else:
+                unsupported = True
+
+    line_heredocs: list[tuple[int, bool, str]] = []
+    in_single = False
+    in_double = False
+    i = line_start
+    while i < line_end:
+        ch = full_text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < line_end:
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2 if i + 1 < line_end else 1
+            continue
+        if ch == "'":
+            if full_text.find("'", i + 1, line_end) != -1:
+                in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            if _has_closing_double_quote(full_text, i + 1, line_end):
+                in_double = True
+            i += 1
+            continue
+        if ch == "#" and (
+            i == line_start or full_text[i - 1].isspace() or full_text[i - 1] in ";|&()<>"
+        ):
+            break
+        if full_text.startswith(("<(", ">("), i):
+            i += 2
+            continue
+        if ch in {"<", ">", "{", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"} and (
+            ch == "<"
+            or i == line_start
+            or full_text[i - 1].isspace()
+            or full_text[i - 1] in ";|&()<>"
+        ):
+            m = _SHELL_REDIR_OP_RE.match(full_text, i, line_end)
+            if m is not None:
+                op = m.group(0)
+                if op.endswith(("<<<", "<<-", "<<")):
+                    j = m.end()
+                    while j < line_end and full_text[j] in " \t":
+                        j += 1
+                    w_start = j
+                    w_single = False
+                    w_double = False
+                    while j < line_end:
+                        wch = full_text[j]
+                        if w_single:
+                            if wch == "'":
+                                w_single = False
+                            j += 1
+                            continue
+                        if w_double:
+                            if wch == "\\" and j + 1 < line_end:
+                                j += 2
+                                continue
+                            if wch == '"':
+                                w_double = False
+                            j += 1
+                            continue
+                        if wch == "\\":
+                            j += 2 if j + 1 < line_end else 1
+                            continue
+                        if wch == "'":
+                            w_single = True
+                            j += 1
+                            continue
+                        if wch == '"':
+                            w_double = True
+                            j += 1
+                            continue
+                        if wch.isspace() or wch in "<>;|&()":
+                            break
+                        j += 1
+                    raw_word = full_text[w_start:j]
+                    if raw_word:
+                        if op.endswith("<<<"):
+                            if stage_start <= i < stage_end:
+                                if "$" in raw_word or "`" in raw_word:
+                                    # Check backticks outside single quotes
+                                    in_sq = False
+                                    k = 0
+                                    while k < len(raw_word):
+                                        rk = raw_word[k]
+                                        if rk == "\\" and not in_sq and k + 1 < len(raw_word):
+                                            k += 2
+                                            continue
+                                        if rk == "'":
+                                            in_sq = not in_sq
+                                        elif rk == "`" and not in_sq:
+                                            unresolved = True
+                                            break
+                                        k += 1
+                                    ann_w = _tokenize_raw_with_expand_segments(
+                                        raw_word, strip_flow_prefixes=False
+                                    )
+                                    exp_w = _expand_annotated_tokens(
+                                        ann_w,
+                                        loop_vars,
+                                        _step_budget=_step_budget,
+                                        _char_budget=_char_budget,
+                                        word_split_unquoted=False,
+                                    )
+                                    for toks, flags in exp_w:
+                                        if any(flags):
+                                            unresolved = True
+                                        elif toks:
+                                            _add_line_sample(toks[0])
+                                else:
+                                    try:
+                                        unq_parts = _posix_shlex_split(raw_word)
+                                        ln_w = " ".join(unq_parts) if unq_parts else ""
+                                    except ValueError:
+                                        ln_w = raw_word.strip("\"'")
+                                    _add_line_sample(ln_w)
+                        else:
+                            line_heredocs.append((i, op.endswith("<<-"), raw_word))
+                    i = j
+                    continue
+        i += 1
+
+    if line_heredocs and nl_pos != -1:
+        pos = nl_pos + 1
+        n_full = len(full_text)
+        for redir_pos, strip_tabs, raw_delim in line_heredocs:
+            delim, is_quoted_delim = _unquote_heredoc_delim(raw_delim)
+            is_target = stage_start <= redir_pos < stage_end
+            while pos < n_full:
+                next_nl = full_text.find("\n", pos)
+                raw_ln = full_text[pos:next_nl] if next_nl != -1 else full_text[pos:]
+                pos = (next_nl + 1) if next_nl != -1 else n_full
+                if raw_ln.endswith("\r"):
+                    raw_ln = raw_ln[:-1]
+                cmp_ln = raw_ln.lstrip("\t") if strip_tabs else raw_ln
+                if cmp_ln == delim:
+                    break
+                if is_target and cmp_ln:
+                    if not is_quoted_delim and ("$" in cmp_ln or "`" in cmp_ln):
+                        exp_lns, unres_ln = _expand_heredoc_line(
+                            cmp_ln,
+                            loop_vars,
+                            _step_budget=_step_budget,
+                            _char_budget=_char_budget,
+                        )
+                        if unres_ln:
+                            unresolved = True
+                        for e_ln in exp_lns:
+                            _add_line_sample(e_ln)
+                    else:
+                        _add_line_sample(cmp_ln)
+    return samples, unsupported, unresolved
+
+
 def _collect_upstream_xargs_echo_samples(
     text: str,
     target_stage_idx: int,
@@ -10572,7 +13522,21 @@ def _collect_upstream_xargs_echo_samples(
         tuple[int, int, tuple[str, ...], bool], list[tuple[int, int, str | None]]
     ]
     | None = None,
+    has_cond_or_case_kw: bool = True,
+    has_eq_or_unset: bool = True,
+    has_echo_or_printf_or_read: bool = True,
+    has_stdin_passthrough_kw: bool = True,
+    has_may_passthrough_kw: bool = True,
+    has_chain_sep_in_segment: bool = True,
+    has_compound_closers: bool = True,
 ) -> tuple[list[tuple[str | None, list[str]]], bool, bool]:
+    has_inherited_echo = (
+        inherited_echo_samples is not None
+        or inherited_unsupported
+        or inherited_unresolved_var
+    )
+    if not has_echo_or_printf_or_read and not has_inherited_echo:
+        return [], False, False
     merged_samples: list[tuple[str | None, list[str]]] = []
     seen_lines: set[str] = set()
     batch_count = 0
@@ -10627,6 +13591,7 @@ def _collect_upstream_xargs_echo_samples(
                 group_passthrough_cache=group_passthrough_cache,
                 unwrap_cache=unwrap_cache,
                 split_cache=split_cache,
+                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
             )
             if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                 raise _ShellComplexityBudgetExceeded()
@@ -10657,6 +13622,13 @@ def _collect_upstream_xargs_echo_samples(
                         group_may_passthrough_cache=group_may_passthrough_cache,
                         unwrap_cache=unwrap_cache,
                         split_cache=split_cache,
+                        has_cond_or_case_kw=has_cond_or_case_kw,
+                        has_eq_or_unset=has_eq_or_unset,
+                        has_echo_or_printf_or_read=has_echo_or_printf_or_read,
+                        has_stdin_passthrough_kw=has_stdin_passthrough_kw,
+                        has_may_passthrough_kw=has_may_passthrough_kw,
+                        has_chain_sep_in_segment=has_chain_sep_in_segment,
+                        has_compound_closers=has_compound_closers,
                     )
                 else:
                     up_echo_s = list(inherited_echo_samples or [])
@@ -10682,6 +13654,13 @@ def _collect_upstream_xargs_echo_samples(
                 positional_sample=positional_sample,
                 loop_vars=loop_vars,
                 has_for_keyword=has_for_keyword,
+                has_cond_or_case_kw=has_cond_or_case_kw,
+                has_eq_or_unset=has_eq_or_unset,
+                has_echo_or_printf_or_read=has_echo_or_printf_or_read,
+                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
+                has_may_passthrough_kw=has_may_passthrough_kw,
+                has_chain_sep_in_segment=has_chain_sep_in_segment,
+                has_compound_closers=has_compound_closers,
                 _step_budget=_step_budget,
                 _char_budget=_char_budget,
                 group_echo_cache=group_echo_cache,
@@ -10704,6 +13683,7 @@ def _collect_upstream_xargs_echo_samples(
                 group_may_passthrough_cache=group_may_passthrough_cache,
                 unwrap_cache=unwrap_cache,
                 split_cache=split_cache,
+                has_may_passthrough_kw=has_may_passthrough_kw,
             ):
                 idx -= 1
                 continue
@@ -10740,6 +13720,18 @@ def _collect_upstream_xargs_echo_samples(
             not fl[0] and _shell_cmd_name(et[0]) in _STDIN_PASSTHROUGH_CMDS
             for et, fl in exp_ups
         ):
+            if "<<" in text[up_s:up_e]:
+                r_samples, r_unsup, r_unres = _extract_stage_stdin_redir_samples(
+                    text,
+                    up_s,
+                    up_e,
+                    loop_vars,
+                    _step_budget=_step_budget,
+                    _char_budget=_char_budget,
+                )
+                if r_samples or r_unsup or r_unres:
+                    _merge(r_samples, r_unsup, r_unres)
+                    return merged_samples, merged_unsup, merged_unres
             idx -= 1
             continue
         return merged_samples, merged_unsup, merged_unres
@@ -10780,7 +13772,9 @@ def _inspect_python_stage_tokens(
             _truncated_out[0] = True
         return "safety_floor:python_ast_complexity_budget_exceeded"
     py_script = inline_script if inline_script is not None else tokens[script_idx]
-    if _seen_texts is not None and py_script in _seen_texts:
+    extra_py_argv = tokens[script_idx + 1 :]
+    python_argv = ["-c", *extra_py_argv] if extra_py_argv else None
+    if python_argv is None and _seen_texts is not None and py_script in _seen_texts:
         return None
     trunc_flag = [False]
     violation = _check_text_against_safety_patterns(
@@ -10792,13 +13786,15 @@ def _inspect_python_stage_tokens(
         _char_budget=_char_budget,
         _seen_texts=_seen_texts,
         _truncated_out=trunc_flag,
+        _python_argv=python_argv,
     )
     if trunc_flag[0] and _truncated_out is not None:
         _truncated_out[0] = True
     if violation is not None:
         return violation
     if (
-        _seen_texts is not None
+        python_argv is None
+        and _seen_texts is not None
         and _ast_depth == 0
         and _cmd_depth == 0
         and not trunc_flag[0]
@@ -10824,7 +13820,7 @@ def _check_expanded_subcommand(
     pattern_violation = _match_safety_patterns(sub_cmd)
     if pattern_violation is not None:
         return pattern_violation
-    if any(w in sub_cmd.lower() for w in _PYTHON_AST_TRIGGER_WORDS):
+    if _PYTHON_AST_TRIGGER_RE.search(sub_cmd.lower()) is not None:
         ast_violation, _ = _check_python_ast_calls_impl(
             sub_cmd,
             _ast_depth=_ast_depth,
@@ -10850,6 +13846,432 @@ def _check_expanded_subcommand(
         _seen_texts=_seen_texts,
         _truncated_out=_truncated_out,
     )
+
+
+_RSYNC_ARG_OPTS: frozenset[str] = frozenset(
+    {
+        "-e",
+        "--rsh",
+        "--rsync-path",
+        "--exclude",
+        "--exclude-from",
+        "--include",
+        "--include-from",
+        "--filter",
+        "-f",
+        "--files-from",
+        "--from0",
+        "--log-file",
+        "--log-file-format",
+        "--out-format",
+        "--chmod",
+        "--chown",
+        "--compare-dest",
+        "--copy-dest",
+        "--link-dest",
+        "--backup-dir",
+        "--suffix",
+        "--bwlimit",
+        "--max-size",
+        "--min-size",
+        "--partial-dir",
+        "--temp-dir",
+        "-T",
+        "--timeout",
+        "--contimeout",
+        "--address",
+        "--port",
+        "--sockopts",
+        "--password-file",
+        "--iconv",
+        "--compress-level",
+        "--skip-compress",
+        "--block-size",
+        "-B",
+        "--modify-window",
+        "-@",
+        "--max-delete",
+    }
+)
+
+
+def _check_overwrite_or_delete_stage_tokens(cmd: str, tokens: list[str]) -> str | None:
+    if cmd == "dd":
+        for dd_tok in tokens[1:]:
+            clean_dd = dd_tok.strip("\"'")
+            if clean_dd.lower().startswith("of="):
+                of_target = clean_dd.split("=", 1)[1].strip("\"'")
+                if _is_critical_overwrite_target(of_target):
+                    return "safety_floor:destructive_dd_device"
+    elif cmd == "cp":
+        cp_args: list[str] = []
+        cp_after_dd = False
+        cp_skip_next = False
+        for cp_tok in tokens[1:]:
+            clean_cp = cp_tok.strip("\"'")
+            if cp_skip_next:
+                cp_args.append(clean_cp)
+                cp_skip_next = False
+                continue
+            if not cp_after_dd:
+                if clean_cp == "--":
+                    cp_after_dd = True
+                    continue
+                if clean_cp.startswith("--target-directory="):
+                    cp_args.append(clean_cp.split("=", 1)[1].strip("\"'"))
+                    continue
+                if clean_cp in {"-t", "--target-directory"}:
+                    cp_skip_next = True
+                    continue
+                if clean_cp in {"-S", "--suffix"}:
+                    cp_skip_next = True
+                    continue
+                if clean_cp.startswith("-") and len(clean_cp) > 1:
+                    continue
+            cp_args.append(clean_cp)
+        if any(a in {"/dev/null", "/dev/zero"} for a in cp_args) and any(
+            a not in {"/dev/null", "/dev/zero"} and _is_critical_overwrite_target(a)
+            for a in cp_args
+        ):
+            return "safety_floor:destructive_cp_dev_null"
+    elif cmd == "mv":
+        mv_args: list[str] = []
+        mv_after_dd = False
+        mv_skip_next = False
+        for mv_tok in tokens[1:]:
+            clean_mv = mv_tok.strip("\"'")
+            if mv_skip_next:
+                mv_args.append(clean_mv)
+                mv_skip_next = False
+                continue
+            if not mv_after_dd:
+                if clean_mv == "--":
+                    mv_after_dd = True
+                    continue
+                if clean_mv.startswith("--target-directory="):
+                    mv_args.append(clean_mv.split("=", 1)[1].strip("\"'"))
+                    continue
+                if clean_mv in {"-t", "--target-directory", "-S", "--suffix"}:
+                    mv_skip_next = True
+                    continue
+                if clean_mv.startswith("-") and len(clean_mv) > 1:
+                    continue
+            mv_args.append(clean_mv)
+        if any(_is_critical_overwrite_target(a) for a in mv_args):
+            return "safety_floor:destructive_mv_critical"
+    elif cmd == "shred":
+        shred_after_dd = False
+        for sh_tok in tokens[1:]:
+            clean_sh = sh_tok.strip("\"'")
+            if not shred_after_dd:
+                if clean_sh == "--":
+                    shred_after_dd = True
+                    continue
+                if clean_sh in {"--help", "--version"}:
+                    continue
+                if clean_sh.startswith("-") and len(clean_sh) > 1:
+                    continue
+            if clean_sh:
+                return "safety_floor:destructive_shred"
+    elif cmd == "tee":
+        tee_after_dd = False
+        for tee_tok in tokens[1:]:
+            clean_tee = tee_tok.strip("\"'")
+            if not tee_after_dd:
+                if clean_tee == "--":
+                    tee_after_dd = True
+                    continue
+                if clean_tee.startswith("-") and len(clean_tee) > 1:
+                    continue
+            if clean_tee and _is_critical_overwrite_target(clean_tee):
+                return "safety_floor:destructive_redirect_truncate"
+    elif cmd == "install":
+        inst_pos: list[str] = []
+        inst_dest_dirs: list[str] = []
+        inst_dir_mode = False
+        inst_after_dd = False
+        inst_skip_next = False
+        inst_cap_next_dir = False
+        for inst_tok in tokens[1:]:
+            clean_inst = inst_tok.strip("\"'")
+            if inst_cap_next_dir:
+                inst_dest_dirs.append(clean_inst)
+                inst_cap_next_dir = False
+                continue
+            if inst_skip_next:
+                inst_skip_next = False
+                continue
+            if not inst_after_dd:
+                if clean_inst == "--":
+                    inst_after_dd = True
+                    continue
+                if clean_inst.startswith("--target-directory="):
+                    inst_dest_dirs.append(clean_inst.split("=", 1)[1].strip("\"'"))
+                    continue
+                if clean_inst in {"-t", "--target-directory"}:
+                    inst_cap_next_dir = True
+                    continue
+                if clean_inst in {
+                    "-g",
+                    "--group",
+                    "-m",
+                    "--mode",
+                    "-o",
+                    "--owner",
+                    "-S",
+                    "--suffix",
+                    "-Z",
+                    "--context",
+                }:
+                    inst_skip_next = True
+                    continue
+                if clean_inst in {"-d", "--directory"}:
+                    inst_dir_mode = True
+                    continue
+                if clean_inst.startswith("-") and len(clean_inst) > 1:
+                    if "d" in clean_inst[1:] and not clean_inst.startswith("--"):
+                        inst_dir_mode = True
+                    continue
+            inst_pos.append(clean_inst)
+        inst_targets = list(inst_dest_dirs)
+        if inst_dir_mode:
+            inst_targets.extend(inst_pos)
+        elif not inst_dest_dirs and len(inst_pos) >= 2:
+            inst_targets.append(inst_pos[-1])
+        if any(_is_critical_overwrite_target(t) for t in inst_targets):
+            return "safety_floor:destructive_redirect_truncate"
+    elif cmd == "ln":
+        ln_pos: list[str] = []
+        ln_dest_dirs: list[str] = []
+        ln_after_dd = False
+        ln_skip_next = False
+        ln_cap_next_dir = False
+        for ln_tok in tokens[1:]:
+            clean_ln = ln_tok.strip("\"'")
+            if ln_cap_next_dir:
+                ln_dest_dirs.append(clean_ln)
+                ln_cap_next_dir = False
+                continue
+            if ln_skip_next:
+                ln_skip_next = False
+                continue
+            if not ln_after_dd:
+                if clean_ln == "--":
+                    ln_after_dd = True
+                    continue
+                if clean_ln.startswith("--target-directory="):
+                    ln_dest_dirs.append(clean_ln.split("=", 1)[1].strip("\"'"))
+                    continue
+                if clean_ln in {"-t", "--target-directory"}:
+                    ln_cap_next_dir = True
+                    continue
+                if clean_ln in {"-S", "--suffix"}:
+                    ln_skip_next = True
+                    continue
+                if clean_ln.startswith("-") and len(clean_ln) > 1:
+                    continue
+            ln_pos.append(clean_ln)
+        ln_targets = list(ln_dest_dirs)
+        if not ln_dest_dirs and len(ln_pos) >= 2:
+            ln_targets.append(ln_pos[-1])
+        if any(_is_critical_overwrite_target(t) for t in ln_targets):
+            return "safety_floor:destructive_redirect_truncate"
+    elif cmd in {"unlink", "rmdir"}:
+        del_after_dd = False
+        for del_tok in tokens[1:]:
+            clean_del = del_tok.strip("\"'")
+            if not del_after_dd:
+                if clean_del == "--":
+                    del_after_dd = True
+                    continue
+                if clean_del.startswith("-") and len(clean_del) > 1:
+                    continue
+            if clean_del and _is_critical_rm_target(clean_del):
+                return "safety_floor:destructive_rm_root_or_glob"
+    elif cmd == "sed":
+        sed_in_place = False
+        sed_has_expr = False
+        sed_after_dd = False
+        sed_skip_next = False
+        sed_pos: list[str] = []
+        for sed_tok in tokens[1:]:
+            clean_sed = sed_tok.strip("\"'")
+            if sed_skip_next:
+                sed_skip_next = False
+                continue
+            if not sed_after_dd:
+                if clean_sed == "--":
+                    sed_after_dd = True
+                    continue
+                if clean_sed == "--in-place" or clean_sed.startswith("--in-place="):
+                    sed_in_place = True
+                    continue
+                if clean_sed in {"-e", "--expression", "-f", "--file"}:
+                    sed_has_expr = True
+                    sed_skip_next = True
+                    continue
+                if clean_sed.startswith(("--expression=", "--file=")):
+                    sed_has_expr = True
+                    continue
+                if (
+                    clean_sed.startswith("-")
+                    and not clean_sed.startswith("--")
+                    and len(clean_sed) > 1
+                ):
+                    flags_part = clean_sed[1:]
+                    if "i" in flags_part:
+                        sed_in_place = True
+                    if flags_part.endswith(("e", "f")):
+                        sed_has_expr = True
+                        sed_skip_next = True
+                    elif "e" in flags_part or "f" in flags_part:
+                        sed_has_expr = True
+                    continue
+                if clean_sed.startswith("--"):
+                    continue
+            sed_pos.append(clean_sed)
+        if sed_in_place:
+            file_args = sed_pos if sed_has_expr else sed_pos[1:]
+            if any(_is_critical_overwrite_target(t) for t in file_args):
+                return "safety_floor:destructive_redirect_truncate"
+    elif cmd == "curl":
+        curl_after_dd = False
+        curl_cap_next = False
+        curl_targets: list[str] = []
+        for c_tok in tokens[1:]:
+            clean_c = c_tok.strip("\"'")
+            if curl_cap_next:
+                curl_targets.append(clean_c)
+                curl_cap_next = False
+                continue
+            if not curl_after_dd:
+                if clean_c == "--":
+                    curl_after_dd = True
+                    continue
+                if clean_c in {"-o", "--output"}:
+                    curl_cap_next = True
+                    continue
+                if clean_c.startswith("--output="):
+                    curl_targets.append(clean_c.split("=", 1)[1].strip("\"'"))
+                    continue
+                if clean_c.startswith("-o") and len(clean_c) > 2:
+                    curl_targets.append(clean_c[2:])
+                    continue
+                if (
+                    clean_c.startswith("-")
+                    and not clean_c.startswith("--")
+                    and clean_c.endswith("o")
+                ):
+                    curl_cap_next = True
+                    continue
+        if any(_is_critical_overwrite_target(t) for t in curl_targets):
+            return "safety_floor:destructive_redirect_truncate"
+    elif cmd == "wget":
+        wget_after_dd = False
+        wget_cap_next = False
+        wget_targets: list[str] = []
+        for w_tok in tokens[1:]:
+            clean_w = w_tok.strip("\"'")
+            if wget_cap_next:
+                wget_targets.append(clean_w)
+                wget_cap_next = False
+                continue
+            if not wget_after_dd:
+                if clean_w == "--":
+                    wget_after_dd = True
+                    continue
+                if clean_w in {"-O", "--output-document"}:
+                    wget_cap_next = True
+                    continue
+                if clean_w.startswith("--output-document="):
+                    wget_targets.append(clean_w.split("=", 1)[1].strip("\"'"))
+                    continue
+                if clean_w.startswith("-O") and len(clean_w) > 2:
+                    wget_targets.append(clean_w[2:])
+                    continue
+                if (
+                    clean_w.startswith("-")
+                    and not clean_w.startswith("--")
+                    and clean_w.endswith("O")
+                ):
+                    wget_cap_next = True
+                    continue
+        if any(_is_critical_overwrite_target(t) for t in wget_targets):
+            return "safety_floor:destructive_redirect_truncate"
+    elif cmd == "rsync":
+        rs_has_delete = False
+        rs_remove_src = False
+        rs_after_dd = False
+        rs_skip_next = False
+        rs_pos: list[str] = []
+        for rs_tok in tokens[1:]:
+            clean_rs = rs_tok.strip("\"'")
+            if rs_skip_next:
+                rs_skip_next = False
+                continue
+            if not rs_after_dd:
+                if clean_rs == "--":
+                    rs_after_dd = True
+                    continue
+                if clean_rs == "--delete" or clean_rs.startswith("--delete-"):
+                    rs_has_delete = True
+                    continue
+                if clean_rs == "--remove-source-files":
+                    rs_remove_src = True
+                    continue
+                if clean_rs in _RSYNC_ARG_OPTS:
+                    rs_skip_next = True
+                    continue
+                if clean_rs.startswith("-") and len(clean_rs) > 1:
+                    continue
+            rs_pos.append(clean_rs)
+        if rs_has_delete and len(rs_pos) >= 2:
+            dst_rs = rs_pos[-1]
+            if _is_critical_rm_target(dst_rs) or _is_critical_overwrite_target(dst_rs):
+                return "safety_floor:destructive_rm_root_or_glob"
+        if (
+            rs_remove_src
+            and len(rs_pos) >= 2
+            and any(
+                _is_critical_rm_target(src_rs) or _is_critical_overwrite_target(src_rs)
+                for src_rs in rs_pos[:-1]
+            )
+        ):
+            return "safety_floor:destructive_rm_root_or_glob"
+    elif cmd == "truncate":
+        trunc_after_dd = False
+        trunc_skip_next = False
+        trunc_targets: list[str] = []
+        for tr_tok in tokens[1:]:
+            clean_tr = tr_tok.strip("\"'")
+            if trunc_skip_next:
+                trunc_skip_next = False
+                continue
+            if not trunc_after_dd:
+                if clean_tr == "--":
+                    trunc_after_dd = True
+                    continue
+                if clean_tr in {"-s", "--size", "-r", "--reference"}:
+                    trunc_skip_next = True
+                    continue
+                if clean_tr.startswith(("--size=", "--reference=")):
+                    continue
+                if (
+                    clean_tr.startswith("-")
+                    and not clean_tr.startswith("--")
+                    and len(clean_tr) > 1
+                ):
+                    flags_part = clean_tr[1:]
+                    if flags_part.endswith(("s", "r")):
+                        trunc_skip_next = True
+                    continue
+                if clean_tr.startswith("--"):
+                    continue
+            if clean_tr:
+                trunc_targets.append(clean_tr)
+        if any(_is_critical_overwrite_target(t) for t in trunc_targets):
+            return "safety_floor:destructive_truncate_file"
+    return None
 
 
 def _check_deobfuscated_commands(
@@ -10937,8 +14359,60 @@ def _check_deobfuscated_commands_impl(
     )
     pairs, closers = _match_shell_groups(segment_source)
     has_for_keyword = "for" in segment_source
-    segment_source_low: str | None = None
+    segment_source_low: str = segment_source.lower()
     segment_low_offsets: list[int] | None = None
+    if len(segment_source_low) != len(segment_source):
+        offsets = [0] * (len(segment_source) + 1)
+        acc = 0
+        for idx_ch, ch_val in enumerate(segment_source):
+            acc += len(ch_val.lower())
+            offsets[idx_ch + 1] = acc
+        segment_low_offsets = offsets
+    has_gt_in_segment = ">" in segment_source
+    has_dollar_in_segment = "$" in segment_source
+    has_eq_or_unset = ("=" in segment_source) or ("unset" in segment_source_low)
+    has_cond_or_case_kw = any(
+        kw in segment_source
+        for kw in (
+            "!",
+            "if",
+            "elif",
+            "while",
+            "until",
+            "do",
+            "then",
+            "else",
+            "time",
+            "case",
+            "esac",
+            "fi",
+            "for",
+        )
+    )
+    has_echo_or_printf_or_read = (
+        ("echo" in segment_source_low)
+        or ("printf" in segment_source_low)
+        or ("read" in segment_source_low)
+        or ("<<" in segment_source)
+    )
+    has_stdin_passthrough_kw = has_dollar_in_segment or (
+        _STDIN_PASSTHROUGH_WORDS_RE.search(segment_source_low) is not None
+    )
+    has_may_passthrough_kw = has_stdin_passthrough_kw or (
+        "read" in segment_source_low
+    )
+    has_compound_closers = (
+        ("done" in segment_source)
+        or ("fi" in segment_source)
+        or ("esac" in segment_source)
+    )
+    has_chain_sep_in_segment = (
+        (";" in segment_source)
+        or ("\n" in segment_source)
+        or ("\r" in segment_source)
+        or ("&" in segment_source)
+        or ("||" in segment_source)
+    )
     parsed_tok_cache: dict[str, list[str]] = {}
     group_crit_cache: dict[
         tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]], str | None
@@ -10984,6 +14458,9 @@ def _check_deobfuscated_commands_impl(
         )
     ]
 
+    has_quote_or_dollar_in_segment = has_dollar_in_segment or any(
+        ch in segment_source for ch in ("'", '"', "\\")
+    )
     while worklist:
         _step_budget[0] += 1
         if _step_budget[0] > _MAX_SHELL_WORKLIST_STEPS:
@@ -11003,25 +14480,33 @@ def _check_deobfuscated_commands_impl(
         )
         if u_start >= u_end:
             continue
-        chains = _split_span_outside_quotes(
-            segment_source,
-            u_start,
-            u_end,
-            _SHELL_CHAIN_SEPS,
-            pairs,
-            closers,
-            respect_groups=_respect_groups,
-            split_cache=split_cache,
+        chains: list[tuple[int, int, str | None]] = (
+            _split_span_outside_quotes(
+                segment_source,
+                u_start,
+                u_end,
+                _SHELL_CHAIN_SEPS,
+                pairs,
+                closers,
+                respect_groups=_respect_groups,
+                split_cache=split_cache,
+            )
+            if has_chain_sep_in_segment
+            else [(u_start, u_end, None)]
         )
-        coalesced_chains = _coalesce_piped_compound_chains(
-            segment_source,
-            u_start,
-            u_end,
-            chains,
-            pairs,
-            closers,
-            respect_groups=_respect_groups,
-            split_cache=split_cache,
+        coalesced_chains = (
+            _coalesce_piped_compound_chains(
+                segment_source,
+                u_start,
+                u_end,
+                chains,
+                pairs,
+                closers,
+                respect_groups=_respect_groups,
+                split_cache=split_cache,
+            )
+            if has_compound_closers and len(chains) >= 2
+            else None
         )
         chain_items: list[
             tuple[int, int, str | None, tuple[tuple[bool, int, int], ...] | None]
@@ -11083,22 +14568,29 @@ def _check_deobfuscated_commands_impl(
                     toks = _parse_stage_cached(segment_source[p_s:p_e], parsed_tok_cache)
                     stage_entries.append((False, p_s, p_e, toks))
             else:
-                prev_loop_depth = sum(1 for item in cond_stack if item == "loop")
-                c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
-                    segment_source,
-                    c_start,
-                    c_e,
-                    pairs,
-                    case_depth,
-                    expect_case_pattern,
-                    cond_stack,
-                )
-                new_loop_depth = sum(1 for item in cond_stack if item == "loop")
-                if new_loop_depth > prev_loop_depth:
-                    for_mult_stack.append(1)
-                elif new_loop_depth < prev_loop_depth and for_mult_stack:
-                    for_mult_stack.pop()
-                    loop_mult = _recompute_loop_mult()
+                if has_cond_or_case_kw:
+                    prev_loop_depth = sum(1 for item in cond_stack if item == "loop")
+                    c_s, case_depth, expect_case_pattern = _strip_case_prefix_in_chain(
+                        segment_source,
+                        c_start,
+                        c_e,
+                        pairs,
+                        case_depth,
+                        expect_case_pattern,
+                        cond_stack,
+                    )
+                    new_loop_depth = sum(1 for item in cond_stack if item == "loop")
+                    if new_loop_depth > prev_loop_depth:
+                        for_mult_stack.append(1)
+                    elif new_loop_depth < prev_loop_depth and for_mult_stack:
+                        for_mult_stack.pop()
+                        loop_mult = _recompute_loop_mult()
+                else:
+                    prev_loop_depth = 0
+                    new_loop_depth = 0
+                    c_s = c_start
+                    while c_s < c_e and segment_source[c_s].isspace():
+                        c_s += 1
                 while c_e > c_s and segment_source[c_e - 1].isspace():
                     c_e -= 1
                 if c_s >= c_e:
@@ -11144,13 +14636,17 @@ def _check_deobfuscated_commands_impl(
                         expect_case_pattern = True
                     continue
 
-                var_binding = _parse_var_assignment_chain(
-                    segment_source,
-                    c_s,
-                    c_e,
-                    loop_vars,
-                    _step_budget=_step_budget,
-                    _char_budget=_char_budget,
+                var_binding = (
+                    _parse_var_assignment_chain(
+                        segment_source,
+                        c_s,
+                        c_e,
+                        loop_vars,
+                        _step_budget=_step_budget,
+                        _char_budget=_char_budget,
+                    )
+                    if has_eq_or_unset
+                    else None
                 )
                 if var_binding is not None:
                     loop_vars = _apply_var_bindings(
@@ -11259,23 +14755,35 @@ def _check_deobfuscated_commands_impl(
                     up_is_grp, up_s, up_e, up_toks = cur_stage_entries[upstream_scanned_until]
                     upstream_scanned_until += 1
                     if up_is_grp:
-                        grp_crit = _find_group_upstream_critical_path(
-                            segment_source,
-                            up_s,
-                            up_e,
-                            pairs,
-                            closers,
-                            parsed_tok_cache,
-                            group_crit_cache,
-                            effective_pos_samples=effective_pos_samples,
-                            positional_sample=_positional_sample,
-                            loop_vars=cur_lvars,
-                            has_for_keyword=has_for_keyword,
-                            _step_budget=_step_budget,
-                            _char_budget=_char_budget,
-                            unwrap_cache=unwrap_cache,
-                            split_cache=split_cache,
+                        cached_grp_crit = (
+                            group_crit_cache.get((up_s, up_e, ()), _CACHE_MISS)
+                            if not cur_lvars
+                            else _CACHE_MISS
                         )
+                        if cached_grp_crit is not _CACHE_MISS:
+                            grp_crit = cached_grp_crit
+                        else:
+                            grp_crit = _find_group_upstream_critical_path(
+                                segment_source,
+                                up_s,
+                                up_e,
+                                pairs,
+                                closers,
+                                parsed_tok_cache,
+                                group_crit_cache,
+                                effective_pos_samples=effective_pos_samples,
+                                positional_sample=_positional_sample,
+                                loop_vars=cur_lvars,
+                                has_for_keyword=has_for_keyword,
+                                has_cond_or_case_kw=has_cond_or_case_kw,
+                                has_eq_or_unset=has_eq_or_unset,
+                                has_chain_sep_in_segment=has_chain_sep_in_segment,
+                                has_compound_closers=has_compound_closers,
+                                _step_budget=_step_budget,
+                                _char_budget=_char_budget,
+                                unwrap_cache=unwrap_cache,
+                                split_cache=split_cache,
+                            )
                         if grp_crit is _SHELL_COMPLEXITY_EXCEEDED:
                             return _SHELL_COMPLEXITY_EXCEEDED
                         if isinstance(grp_crit, str):
@@ -11294,6 +14802,7 @@ def _check_deobfuscated_commands_impl(
                                 group_passthrough_cache=group_passthrough_cache,
                                 unwrap_cache=unwrap_cache,
                                 split_cache=split_cache,
+                                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
                             )
                             if is_pt is _SHELL_COMPLEXITY_EXCEEDED:
                                 return _SHELL_COMPLEXITY_EXCEEDED
@@ -11309,6 +14818,7 @@ def _check_deobfuscated_commands_impl(
                                 group_may_passthrough_cache=group_may_passthrough_cache,
                                 unwrap_cache=unwrap_cache,
                                 split_cache=split_cache,
+                                has_may_passthrough_kw=has_may_passthrough_kw,
                             ):
                                 inherited_active_crit = None
                     elif up_toks:
@@ -11375,15 +14885,6 @@ def _check_deobfuscated_commands_impl(
                         if running_upstream_critical_path is not None
                         else inherited_active_crit
                     )
-                    if segment_source_low is None:
-                        segment_source_low = segment_source.lower()
-                        if len(segment_source_low) != len(segment_source):
-                            offsets = [0] * (len(segment_source) + 1)
-                            acc = 0
-                            for idx_ch, ch_val in enumerate(segment_source):
-                                acc += len(ch_val.lower())
-                                offsets[idx_ch + 1] = acc
-                            segment_low_offsets = offsets
                     low_s = sg_s if segment_low_offsets is None else segment_low_offsets[sg_s]
                     low_e = sg_e if segment_low_offsets is None else segment_low_offsets[sg_e]
                     has_xargs_hint = segment_source_low.find("xargs", low_s, low_e) != -1
@@ -11414,6 +14915,13 @@ def _check_deobfuscated_commands_impl(
                             group_may_passthrough_cache=group_may_passthrough_cache,
                             unwrap_cache=unwrap_cache,
                             split_cache=split_cache,
+                            has_cond_or_case_kw=has_cond_or_case_kw,
+                            has_eq_or_unset=has_eq_or_unset,
+                            has_echo_or_printf_or_read=has_echo_or_printf_or_read,
+                            has_stdin_passthrough_kw=has_stdin_passthrough_kw,
+                            has_may_passthrough_kw=has_may_passthrough_kw,
+                            has_chain_sep_in_segment=has_chain_sep_in_segment,
+                            has_compound_closers=has_compound_closers,
                         )
                 resolved_subgroups.append(
                     (
@@ -11434,7 +14942,7 @@ def _check_deobfuscated_commands_impl(
                 if is_grp:
                     continue
                 raw_stage_slice = segment_source[_st_s:_st_e]
-                if len(stage_entries) >= 2:
+                if len(stage_entries) >= 2 and has_cond_or_case_kw:
                     kw_s = _st_s
                     while kw_s < _st_e and segment_source[kw_s].isspace():
                         kw_s += 1
@@ -11460,22 +14968,27 @@ def _check_deobfuscated_commands_impl(
                                 continue
                         break
                     if stage_idx > 0:
-                        for kw in _SHELL_KEYWORD_STAGE_HEADS:
-                            if _match_shell_kw_boundary(
-                                segment_source, kw_s, _st_e, kw, allow_group_after=True
-                            ):
-                                return "safety_floor:ambiguous_piped_compound_shell"
+                        if (
+                            kw_s < _st_e
+                            and segment_source[kw_s] in _SHELL_KEYWORD_STAGE_HEAD_FIRST_CHARS
+                        ):
+                            for kw in _SHELL_KEYWORD_STAGE_HEADS:
+                                if _match_shell_kw_boundary(
+                                    segment_source, kw_s, _st_e, kw, allow_group_after=True
+                                ):
+                                    return "safety_floor:ambiguous_piped_compound_shell"
                     else:
-                        for kw in ("done", "fi", "esac"):
-                            if _match_shell_kw_boundary(
-                                segment_source, kw_s, _st_e, kw, allow_group_after=False
-                            ):
-                                return "safety_floor:ambiguous_piped_compound_shell"
+                        if kw_s < _st_e and segment_source[kw_s] in {"d", "f", "e"}:
+                            for kw in ("done", "fi", "esac"):
+                                if _match_shell_kw_boundary(
+                                    segment_source, kw_s, _st_e, kw, allow_group_after=False
+                                ):
+                                    return "safety_floor:ambiguous_piped_compound_shell"
 
                 if not base_tokens:
                     continue
                 expanded_unq_flags: list[list[bool]] = []
-                if "$" in raw_stage_slice:
+                if has_dollar_in_segment and "$" in raw_stage_slice:
                     ann_toks = _tokenize_raw_with_expand_segments(
                         raw_stage_slice, strip_flow_prefixes=True
                     )
@@ -11500,7 +15013,9 @@ def _check_deobfuscated_commands_impl(
                         return "safety_floor:shell_complexity_budget_exceeded"
                     if not tokens:
                         continue
-                    if "$" in raw_stage_slice or (loop_vars and tokens is not base_tokens):
+                    if (has_dollar_in_segment and "$" in raw_stage_slice) or (
+                        loop_vars and tokens is not base_tokens
+                    ):
                         first_head = _shell_cmd_name(tokens[0])
                         if first_head in _WRAPPER_COMMANDS or (
                             "=" in tokens[0]
@@ -11522,11 +15037,45 @@ def _check_deobfuscated_commands_impl(
                         tokens is not base_tokens
                         or _cmd_depth > 0
                         or segment_normalized
-                        or any(ch in raw_stage_slice for ch in ("'", '"', "\\", "$"))
+                        or (
+                            has_quote_or_dollar_in_segment
+                            and any(ch in raw_stage_slice for ch in ("'", '"', "\\", "$"))
+                        )
                     ):
                         stage_pattern_violation = _match_safety_patterns(" ".join(tokens))
                         if stage_pattern_violation is not None:
                             return stage_pattern_violation
+                    if has_gt_in_segment or (
+                        tokens is not base_tokens and any(">" in t for t in tokens)
+                    ):
+                        redir_token_lists: tuple[list[str], ...] = (
+                            (tokens, base_tokens)
+                            if (tokens is not base_tokens and ">" in raw_stage_slice)
+                            else (tokens,)
+                        )
+                        for r_tok_list in redir_token_lists:
+                            for r_idx, r_tok in enumerate(r_tok_list):
+                                if ">" not in r_tok:
+                                    continue
+                                r_match = _SHELL_REDIR_OP_RE.match(r_tok)
+                                if r_match is not None:
+                                    r_op = r_match.group(0)
+                                    is_trunc_redir = (
+                                        r_op.endswith((">", ">|"))
+                                        and not r_op.endswith((">>", "<>"))
+                                    ) or (r_op.endswith(">&") and not r_op.endswith("<&"))
+                                    if is_trunc_redir:
+                                        if r_match.end() == len(r_tok):
+                                            r_target = (
+                                                r_tok_list[r_idx + 1]
+                                                if r_idx + 1 < len(r_tok_list)
+                                                else ""
+                                            )
+                                        else:
+                                            r_tail = r_tok[r_match.end() :]
+                                            r_target = re.split(r"[<>]", r_tail, maxsplit=1)[0]
+                                        if _is_critical_overwrite_target(r_target):
+                                            return "safety_floor:destructive_redirect_truncate"
                     if unresolved_flags and unresolved_flags[0]:
                         return "safety_floor:shell_ambiguous_variable_expansion"
                     cmd = _shell_cmd_name(tokens[0])
@@ -11536,6 +15085,10 @@ def _check_deobfuscated_commands_impl(
                         )
                         if unres_viol is not None:
                             return unres_viol
+                    if cmd in _OVERWRITE_STAGE_CMDS:
+                        stage_ow_viol = _check_overwrite_or_delete_stage_tokens(cmd, tokens)
+                        if stage_ow_viol is not None:
+                            return stage_ow_viol
                     if cmd == "rm":
                         has_recursive, has_force, targets = _parse_rm_tokens(tokens[1:])
                         rm_violation = _check_rm_targets(has_recursive, has_force, targets)
@@ -11830,10 +15383,17 @@ def _check_deobfuscated_commands_impl(
                                         )
                                         if exec_pattern_violation is not None:
                                             return exec_pattern_violation
-                                        if _shell_cmd_name(exec_tokens[0]) == "chmod":
+                                        exec_head = _shell_cmd_name(exec_tokens[0])
+                                        if exec_head == "chmod":
                                             chmod_violation = _check_chmod_tokens(exec_tokens)
                                             if chmod_violation is not None:
                                                 return chmod_violation
+                                        elif exec_head in _OVERWRITE_STAGE_CMDS:
+                                            exec_ow_viol = _check_overwrite_or_delete_stage_tokens(
+                                                exec_head, exec_tokens
+                                            )
+                                            if exec_ow_viol is not None:
+                                                return exec_ow_viol
                                         py_violation = _inspect_python_stage_tokens(
                                             exec_tokens,
                                             _ast_depth=_ast_depth,
@@ -11856,13 +15416,19 @@ def _check_deobfuscated_commands_impl(
                         raw_inner_offset = 1 + len(tokens[1:]) - len(xargs_inner_raw)
                         xargs_inner_raw_flags = unresolved_flags[raw_inner_offset:]
                         xargs_inner_raw_unq = unquoted_flags[raw_inner_offset:]
-                        orig_xargs_for_unq = list(xargs_inner_raw)
-                        xargs_inner, xargs_inner_flags = _unwrap_command_tokens_with_flags(
-                            xargs_inner_raw, xargs_inner_raw_flags
-                        )
-                        _, xargs_inner_unq_flags = _unwrap_command_tokens_with_flags(
-                            orig_xargs_for_unq, xargs_inner_raw_unq
-                        )
+                        if any(xargs_inner_raw_flags) or any(xargs_inner_raw_unq):
+                            orig_xargs_for_unq = list(xargs_inner_raw)
+                            xargs_inner, xargs_inner_flags = _unwrap_command_tokens_with_flags(
+                                xargs_inner_raw, xargs_inner_raw_flags
+                            )
+                            _, xargs_inner_unq_flags = _unwrap_command_tokens_with_flags(
+                                orig_xargs_for_unq, xargs_inner_raw_unq
+                            )
+                        else:
+                            xargs_inner, xargs_inner_flags = _unwrap_command_tokens_with_flags(
+                                xargs_inner_raw, None
+                            )
+                            xargs_inner_unq_flags = xargs_inner_flags
                         if xargs_inner:
                             if xargs_inner_flags and xargs_inner_flags[0]:
                                 return "safety_floor:shell_ambiguous_variable_expansion"
@@ -11876,20 +15442,7 @@ def _check_deobfuscated_commands_impl(
                                 if xargs_sh_ambig_opt:
                                     return "safety_floor:shell_ambiguous_variable_expansion"
                             is_xargs_danger_sink = (
-                                xargs_cmd
-                                in {
-                                    "rm",
-                                    "chmod",
-                                    "dd",
-                                    "git",
-                                    "psql",
-                                    "mysql",
-                                    "sqlite3",
-                                    "mkfs",
-                                    "wipefs",
-                                    "fdisk",
-                                    "parted",
-                                }
+                                xargs_cmd in _XARGS_DANGER_SINKS
                                 or _is_python_cmd_name(xargs_cmd)
                                 or is_xargs_shell
                             )
@@ -11902,6 +15455,23 @@ def _check_deobfuscated_commands_impl(
                             echo_samples: list[tuple[str | None, list[str]]] = []
                             echo_unsupported = False
                             echo_unresolved_var = False
+                            has_stage_stdin_redir = "<<" in raw_stage_slice
+                            stage_redir_samples: list[tuple[str | None, list[str]]] = []
+                            stage_redir_unsup = False
+                            stage_redir_unres = False
+                            if has_stage_stdin_redir:
+                                (
+                                    stage_redir_samples,
+                                    stage_redir_unsup,
+                                    stage_redir_unres,
+                                ) = _extract_stage_stdin_redir_samples(
+                                    segment_source,
+                                    _st_s,
+                                    _st_e,
+                                    loop_vars,
+                                    _step_budget=_step_budget,
+                                    _char_budget=_char_budget,
+                                )
                             if needs_upstream:
                                 if stage_idx > 0 and (
                                     _advance_upstream_critical_path(
@@ -11935,33 +15505,55 @@ def _check_deobfuscated_commands_impl(
                                     or inherited_echo_samples is not None
                                     or inherited_echo_unsupported
                                     or inherited_echo_unresolved
+                                    or has_stage_stdin_redir
                                 ):
-                                    echo_samples, echo_unsupported, echo_unresolved_var = (
-                                        _collect_upstream_xargs_echo_samples(
-                                            segment_source,
-                                            stage_idx,
-                                            stage_entries,
-                                            pairs,
-                                            closers,
-                                            parsed_tok_cache,
-                                            effective_pos_samples=effective_pos_samples,
-                                            positional_sample=_positional_sample,
-                                            loop_vars=loop_vars,
-                                            has_for_keyword=has_for_keyword,
-                                            inherited_echo_samples=inherited_echo_samples,
-                                            inherited_unsupported=inherited_echo_unsupported,
-                                            inherited_unresolved_var=inherited_echo_unresolved,
-                                            _step_budget=_step_budget,
-                                            _char_budget=_char_budget,
-                                            group_echo_cache=group_echo_cache,
-                                            group_passthrough_cache=group_passthrough_cache,
-                                            group_may_passthrough_cache=(
-                                                group_may_passthrough_cache
-                                            ),
-                                            unwrap_cache=unwrap_cache,
-                                            split_cache=split_cache,
+                                    if (
+                                        stage_idx > 0
+                                        or inherited_echo_samples is not None
+                                        or inherited_echo_unsupported
+                                        or inherited_echo_unresolved
+                                    ):
+                                        echo_samples, echo_unsupported, echo_unresolved_var = (
+                                            _collect_upstream_xargs_echo_samples(
+                                                segment_source,
+                                                stage_idx,
+                                                stage_entries,
+                                                pairs,
+                                                closers,
+                                                parsed_tok_cache,
+                                                effective_pos_samples=effective_pos_samples,
+                                                positional_sample=_positional_sample,
+                                                loop_vars=loop_vars,
+                                                has_for_keyword=has_for_keyword,
+                                                inherited_echo_samples=inherited_echo_samples,
+                                                inherited_unsupported=inherited_echo_unsupported,
+                                                inherited_unresolved_var=inherited_echo_unresolved,
+                                                _step_budget=_step_budget,
+                                                _char_budget=_char_budget,
+                                                group_echo_cache=group_echo_cache,
+                                                group_passthrough_cache=group_passthrough_cache,
+                                                group_may_passthrough_cache=(
+                                                    group_may_passthrough_cache
+                                                ),
+                                                unwrap_cache=unwrap_cache,
+                                                split_cache=split_cache,
+                                                has_cond_or_case_kw=has_cond_or_case_kw,
+                                                has_eq_or_unset=has_eq_or_unset,
+                                                has_echo_or_printf_or_read=(
+                                                    has_echo_or_printf_or_read
+                                                ),
+                                                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
+                                                has_may_passthrough_kw=has_may_passthrough_kw,
+                                                has_chain_sep_in_segment=has_chain_sep_in_segment,
+                                                has_compound_closers=has_compound_closers,
+                                            )
                                         )
-                                    )
+                                    if has_stage_stdin_redir:
+                                        echo_samples = [*echo_samples, *stage_redir_samples]
+                                        echo_unsupported = echo_unsupported or stage_redir_unsup
+                                        echo_unresolved_var = (
+                                            echo_unresolved_var or stage_redir_unres
+                                        )
                                     if echo_unsupported:
                                         return "safety_floor:shell_complexity_budget_exceeded"
                                     if echo_unresolved_var and not _is_embedded_fragment:
@@ -12033,33 +15625,55 @@ def _check_deobfuscated_commands_impl(
                                     or inherited_echo_samples is not None
                                     or inherited_echo_unsupported
                                     or inherited_echo_unresolved
+                                    or has_stage_stdin_redir
                                 ):
-                                    echo_samples, echo_unsupported, echo_unresolved_var = (
-                                        _collect_upstream_xargs_echo_samples(
-                                            segment_source,
-                                            stage_idx,
-                                            stage_entries,
-                                            pairs,
-                                            closers,
-                                            parsed_tok_cache,
-                                            effective_pos_samples=effective_pos_samples,
-                                            positional_sample=_positional_sample,
-                                            loop_vars=loop_vars,
-                                            has_for_keyword=has_for_keyword,
-                                            inherited_echo_samples=inherited_echo_samples,
-                                            inherited_unsupported=inherited_echo_unsupported,
-                                            inherited_unresolved_var=inherited_echo_unresolved,
-                                            _step_budget=_step_budget,
-                                            _char_budget=_char_budget,
-                                            group_echo_cache=group_echo_cache,
-                                            group_passthrough_cache=group_passthrough_cache,
-                                            group_may_passthrough_cache=(
-                                                group_may_passthrough_cache
-                                            ),
-                                            unwrap_cache=unwrap_cache,
-                                            split_cache=split_cache,
+                                    if (
+                                        stage_idx > 0
+                                        or inherited_echo_samples is not None
+                                        or inherited_echo_unsupported
+                                        or inherited_echo_unresolved
+                                    ):
+                                        echo_samples, echo_unsupported, echo_unresolved_var = (
+                                            _collect_upstream_xargs_echo_samples(
+                                                segment_source,
+                                                stage_idx,
+                                                stage_entries,
+                                                pairs,
+                                                closers,
+                                                parsed_tok_cache,
+                                                effective_pos_samples=effective_pos_samples,
+                                                positional_sample=_positional_sample,
+                                                loop_vars=loop_vars,
+                                                has_for_keyword=has_for_keyword,
+                                                inherited_echo_samples=inherited_echo_samples,
+                                                inherited_unsupported=inherited_echo_unsupported,
+                                                inherited_unresolved_var=inherited_echo_unresolved,
+                                                _step_budget=_step_budget,
+                                                _char_budget=_char_budget,
+                                                group_echo_cache=group_echo_cache,
+                                                group_passthrough_cache=group_passthrough_cache,
+                                                group_may_passthrough_cache=(
+                                                    group_may_passthrough_cache
+                                                ),
+                                                unwrap_cache=unwrap_cache,
+                                                split_cache=split_cache,
+                                                has_cond_or_case_kw=has_cond_or_case_kw,
+                                                has_eq_or_unset=has_eq_or_unset,
+                                                has_echo_or_printf_or_read=(
+                                                    has_echo_or_printf_or_read
+                                                ),
+                                                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
+                                                has_may_passthrough_kw=has_may_passthrough_kw,
+                                                has_chain_sep_in_segment=has_chain_sep_in_segment,
+                                                has_compound_closers=has_compound_closers,
+                                            )
                                         )
-                                    )
+                                    if has_stage_stdin_redir:
+                                        echo_samples = [*echo_samples, *stage_redir_samples]
+                                        echo_unsupported = echo_unsupported or stage_redir_unsup
+                                        echo_unresolved_var = (
+                                            echo_unresolved_var or stage_redir_unres
+                                        )
                                     if echo_unsupported:
                                         return "safety_floor:shell_complexity_budget_exceeded"
                                     if echo_unresolved_var and not _is_embedded_fragment:
@@ -12252,33 +15866,55 @@ def _check_deobfuscated_commands_impl(
                                     or inherited_echo_samples is not None
                                     or inherited_echo_unsupported
                                     or inherited_echo_unresolved
+                                    or has_stage_stdin_redir
                                 ):
-                                    echo_samples, echo_unsupported, echo_unresolved_var = (
-                                        _collect_upstream_xargs_echo_samples(
-                                            segment_source,
-                                            stage_idx,
-                                            stage_entries,
-                                            pairs,
-                                            closers,
-                                            parsed_tok_cache,
-                                            effective_pos_samples=effective_pos_samples,
-                                            positional_sample=_positional_sample,
-                                            loop_vars=loop_vars,
-                                            has_for_keyword=has_for_keyword,
-                                            inherited_echo_samples=inherited_echo_samples,
-                                            inherited_unsupported=inherited_echo_unsupported,
-                                            inherited_unresolved_var=inherited_echo_unresolved,
-                                            _step_budget=_step_budget,
-                                            _char_budget=_char_budget,
-                                            group_echo_cache=group_echo_cache,
-                                            group_passthrough_cache=group_passthrough_cache,
-                                            group_may_passthrough_cache=(
-                                                group_may_passthrough_cache
-                                            ),
-                                            unwrap_cache=unwrap_cache,
-                                            split_cache=split_cache,
+                                    if (
+                                        stage_idx > 0
+                                        or inherited_echo_samples is not None
+                                        or inherited_echo_unsupported
+                                        or inherited_echo_unresolved
+                                    ):
+                                        echo_samples, echo_unsupported, echo_unresolved_var = (
+                                            _collect_upstream_xargs_echo_samples(
+                                                segment_source,
+                                                stage_idx,
+                                                stage_entries,
+                                                pairs,
+                                                closers,
+                                                parsed_tok_cache,
+                                                effective_pos_samples=effective_pos_samples,
+                                                positional_sample=_positional_sample,
+                                                loop_vars=loop_vars,
+                                                has_for_keyword=has_for_keyword,
+                                                inherited_echo_samples=inherited_echo_samples,
+                                                inherited_unsupported=inherited_echo_unsupported,
+                                                inherited_unresolved_var=inherited_echo_unresolved,
+                                                _step_budget=_step_budget,
+                                                _char_budget=_char_budget,
+                                                group_echo_cache=group_echo_cache,
+                                                group_passthrough_cache=group_passthrough_cache,
+                                                group_may_passthrough_cache=(
+                                                    group_may_passthrough_cache
+                                                ),
+                                                unwrap_cache=unwrap_cache,
+                                                split_cache=split_cache,
+                                                has_cond_or_case_kw=has_cond_or_case_kw,
+                                                has_eq_or_unset=has_eq_or_unset,
+                                                has_echo_or_printf_or_read=(
+                                                    has_echo_or_printf_or_read
+                                                ),
+                                                has_stdin_passthrough_kw=has_stdin_passthrough_kw,
+                                                has_may_passthrough_kw=has_may_passthrough_kw,
+                                                has_chain_sep_in_segment=has_chain_sep_in_segment,
+                                                has_compound_closers=has_compound_closers,
+                                            )
                                         )
-                                    )
+                                    if has_stage_stdin_redir:
+                                        echo_samples = [*echo_samples, *stage_redir_samples]
+                                        echo_unsupported = echo_unsupported or stage_redir_unsup
+                                        echo_unresolved_var = (
+                                            echo_unresolved_var or stage_redir_unres
+                                        )
                                     if echo_unsupported and is_xargs_danger_sink:
                                         return "safety_floor:shell_complexity_budget_exceeded"
                                     if (
@@ -12346,10 +15982,17 @@ def _check_deobfuscated_commands_impl(
                                         )
                                         if x_pat_violation is not None:
                                             return x_pat_violation
-                                        if _shell_cmd_name(xargs_tokens[0]) == "chmod":
+                                        xargs_head = _shell_cmd_name(xargs_tokens[0])
+                                        if xargs_head == "chmod":
                                             chmod_violation = _check_chmod_tokens(xargs_tokens)
                                             if chmod_violation is not None:
                                                 return chmod_violation
+                                        elif xargs_head in _OVERWRITE_STAGE_CMDS:
+                                            x_ow_viol = _check_overwrite_or_delete_stage_tokens(
+                                                xargs_head, xargs_tokens
+                                            )
+                                            if x_ow_viol is not None:
+                                                return x_ow_viol
                                         py_violation = _inspect_python_stage_tokens(
                                             xargs_tokens,
                                             _ast_depth=_ast_depth,
@@ -12526,6 +16169,7 @@ def _check_text_against_safety_patterns(
     _seen_texts: set[str] | None = None,
     _truncated_out: list[bool] | None = None,
     _is_embedded_fragment: bool = False,
+    _python_argv: list[str] | None = None,
 ) -> str | None:
     if _step_budget is None:
         _step_budget = [0]
@@ -12545,6 +16189,8 @@ def _check_text_against_safety_patterns(
         _cmd_depth=_cmd_depth,
         _seen_texts=_seen_texts,
         _truncated_out=_truncated_out,
+        _is_embedded_fragment=_is_embedded_fragment,
+        _python_argv=_python_argv,
     )
     if ast_violation is not None:
         return ast_violation

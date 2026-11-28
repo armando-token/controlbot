@@ -113,7 +113,10 @@ def create_effect_sim_app(
                 sim_state.persist()
                 return JSONResponse(
                     {
-                        "detail": f"Conflicting payload for idempotency_key={key!r}.",
+                        "detail": (
+                            f"Conflicting payload for idempotency_key={key!r}. "
+                            "Retry with a new idempotency_key or match the original payload."
+                        ),
                         "code": "IDEMPOTENCY_CONFLICT",
                     },
                     status_code=status.HTTP_409_CONFLICT,

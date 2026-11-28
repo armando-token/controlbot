@@ -68,7 +68,10 @@ export const Modal: React.FC<ModalProps> = ({
       if (!root) return;
       if (!root.contains(document.activeElement)) {
         const focusables = getFocusableElements(root);
-        const first = focusables[0];
+        const first =
+          root.querySelector<HTMLElement>('[autofocus], [data-autofocus]') ??
+          focusables.find((el) => el.getAttribute('aria-label') !== 'Close dialog') ??
+          focusables[0];
         (first ?? root).focus();
       }
     });
@@ -76,6 +79,7 @@ export const Modal: React.FC<ModalProps> = ({
     const onKey = (e: KeyboardEvent) => {
       if (e.isComposing) return;
       if (e.key === 'Escape') {
+        e.preventDefault();
         e.stopPropagation();
         onCloseRef.current();
         return;
@@ -104,19 +108,31 @@ export const Modal: React.FC<ModalProps> = ({
         }
       }
     };
-    window.addEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
     return () => {
       window.cancelAnimationFrame(raf);
-      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keydown', onKey, true);
       const restoreTarget = previousFocusRef.current;
       previousFocusRef.current = null;
-      if (restoreTarget && restoreTarget.isConnected) {
+      if (
+        restoreTarget &&
+        restoreTarget.isConnected &&
+        restoreTarget !== document.body &&
+        restoreTarget !== document.documentElement
+      ) {
         restoreTarget.focus();
+      } else {
+        const fallback = document.querySelector<HTMLElement>(
+          'textarea[aria-label="Message composer"], button[aria-label="Search and commands"]',
+        );
+        fallback?.focus();
       }
     };
   }, [open]);
 
   if (!open) return null;
+
+  const dialogLabel = ariaLabel ?? (title || 'Dialog');
 
   return (
     <div
@@ -136,7 +152,7 @@ export const Modal: React.FC<ModalProps> = ({
         aria-modal="true"
         aria-labelledby={!hideHeader && title ? titleId : undefined}
         aria-describedby={!hideHeader && subtitle ? subtitleId : undefined}
-        aria-label={ariaLabel ?? (!hideHeader && title ? undefined : 'Dialog')}
+        aria-label={`${dialogLabel}`}
         className={`w-full ${maxWidthClass} max-h-[90vh] flex flex-col overflow-hidden outline-none`}
         style={{
           backgroundColor: 'var(--bg-elevated)',

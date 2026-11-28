@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import smtplib
 import sqlite3
 import uuid
@@ -25,14 +26,14 @@ import httpx
 from src.adapters.config import FacilityConfig
 from src.adapters.web_search import EgressBlockedError, EgressGuard
 from src.contracts.common import InvalidStateTransitionError
-from src.contracts.enums import TERMINAL_TASK_STATUSES, TaskStatus
+from src.contracts.enums import TERMINAL_TASK_STATUSES, BackendMode, TaskStatus
 from src.contracts.envelope import (
     AirlockProvenance,
     Lane,
     VerdictState,
     VerifiedResponseMeta,
 )
-from src.contracts.models import TaskScope, TaskSpec
+from src.contracts.models import EvidenceRequirements, TaskScope, TaskSpec
 from src.engine.airlock import AirlockBlockedError, EvidenceAirlock, build_airlock_provenance
 from src.engine.policy_gateway import (
     PolicyGateway,
@@ -45,9 +46,10 @@ from src.storage.memory import MemoryAccessContext
 from src.web.live_browser import LiveBrowserController
 from src.web.protocols import CoordinatorProtocol, TaskSnapshot, maybe_await
 from src.web.v1.events import EventBus, scrub_v1_payload, utc_iso_now
-from src.web.v1.schemas import MAX_AUTO_REVIEW_RULE_LEN
+from src.web.v1.schemas import MAX_AUTO_REVIEW_RULE_LEN, contains_sensitive_scope_secret
 from src.web.v1.store import StoreNotFoundError, WorkspaceStore
 from src.web.workspace import (
+    _default_local_base_url,
     default_projects_root,
     find_agy_executable,
     resolve_project_dir,
@@ -247,9 +249,194 @@ def extract_page_blocks(text: str) -> list[tuple[str, str]]:
     return pages
 
 
-def _infer_tool_category(tool_name: str) -> str:
+_SHELL_TOOL_SUBSTRINGS: tuple[str, ...] = (
+    "command",
+    "shell",
+    "term",
+    "pty",
+    "bash",
+    "exec",
+    "subprocess",
+    "spawn_process",
+    "run_cmd",
+    "eval_tool",
+)
+_SHELL_TOOL_TOKENS: frozenset[str] = frozenset(
+    {
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "ash",
+        "csh",
+        "tcsh",
+        "fish",
+        "cmd",
+        "process",
+        "python",
+        "python2",
+        "python3",
+        "eval",
+        "script",
+    }
+)
+
+
+_EVENT_COMMAND_KEYS: tuple[str, ...] = (
+    "command",
+    "cmd",
+    "command_line",
+    "cmdline",
+    "CommandLine",
+    "script",
+    "code",
+    "shell",
+    "bash",
+    "argv",
+)
+_EVENT_COMMAND_KEYS_LOWER: tuple[str, ...] = tuple(
+    dict.fromkeys(k.lower() for k in _EVENT_COMMAND_KEYS)
+)
+_EVENT_NESTED_COMMAND_CONTAINER_KEYS_LOWER: tuple[str, ...] = (
+    "args",
+    "arguments",
+    "parameters",
+    "tool_params",
+    "input",
+    "tool_info",
+    "payload",
+    "data",
+)
+_EVENT_LIST_COMMAND_CONTAINER_KEYS_LOWER: frozenset[str] = frozenset(
+    {"args", "arguments", "input", "payload", "data"}
+)
+
+
+def _decode_event_mapping(raw: Any) -> Mapping[str, Any] | None:
+    if isinstance(raw, Mapping):
+        return raw or None
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                decoded = json.loads(stripped)
+                if isinstance(decoded, Mapping) and decoded:
+                    return decoded
+    return None
+
+
+def _normalize_event_command_values(raw: Any, *, _depth: int = 0) -> list[str]:
+    if raw is None or isinstance(raw, bool) or _depth > 4:
+        return []
+    if isinstance(raw, Mapping):
+        return _extract_event_command_strs(raw, _depth=_depth + 1)
+    if isinstance(raw, (list, tuple)):
+        if raw and all(isinstance(x, Mapping) for x in raw):
+            out_m: list[str] = []
+            seen_m: set[str] = set()
+            for x in raw:
+                for found_m in _extract_event_command_strs(x, _depth=_depth + 1):
+                    if found_m not in seen_m:
+                        seen_m.add(found_m)
+                        out_m.append(found_m)
+            return out_m
+        parts = [str(x) for x in raw if x is not None]
+        if not parts or not any(p.strip() for p in parts):
+            return []
+        joined = shlex.join(parts).strip()
+        return [joined] if joined else []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if len(text) >= 2 and (
+            (text[0] == '"' and text[-1] == '"')
+            or (text[0] == "[" and text[-1] == "]")
+            or (text[0] == "{" and text[-1] == "}")
+        ):
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                decoded = json.loads(text)
+                if isinstance(decoded, (str, list, tuple, Mapping)):
+                    nested = _normalize_event_command_values(decoded, _depth=_depth + 1)
+                    if nested:
+                        return nested
+        return [text]
+    return []
+
+
+def _normalize_event_command_value(raw: Any, *, _depth: int = 0) -> str | None:
+    vals = _normalize_event_command_values(raw, _depth=_depth)
+    return vals[0] if vals else None
+
+
+def _extract_event_list_commands(raw: Any, *, _depth: int = 0) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return _normalize_event_command_values(raw, _depth=_depth)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if len(stripped) >= 2 and stripped[0] == "[" and stripped[-1] == "]":
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                decoded = json.loads(stripped)
+                if isinstance(decoded, list):
+                    return _normalize_event_command_values(decoded, _depth=_depth)
+    return []
+
+
+def _extract_event_list_command(raw: Any, *, _depth: int = 0) -> str | None:
+    vals = _extract_event_list_commands(raw, _depth=_depth)
+    return vals[0] if vals else None
+
+
+def _extract_event_command_strs(ev: Mapping[str, Any], *, _depth: int = 0) -> list[str]:
+    if _depth > 4:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add_vals(vals: list[str]) -> None:
+        for item in vals:
+            if item not in seen:
+                seen.add(item)
+                found.append(item)
+
+    raw_cmds = ev.get("commands")
+    if isinstance(raw_cmds, (list, tuple)):
+        for elem in raw_cmds:
+            _add_vals(_normalize_event_command_values(elem, _depth=_depth + 1))
+
+    for k in _EVENT_COMMAND_KEYS:
+        if k in ev and ev[k] is not None:
+            _add_vals(_normalize_event_command_values(ev[k], _depth=_depth + 1))
+    for low_k in _EVENT_COMMAND_KEYS_LOWER:
+        for k, v in ev.items():
+            if v is not None and str(k).lower() == low_k:
+                _add_vals(_normalize_event_command_values(v, _depth=_depth + 1))
+    for container_low in _EVENT_NESTED_COMMAND_CONTAINER_KEYS_LOWER:
+        for k, v in ev.items():
+            if v is not None and str(k).lower() == container_low:
+                nested = _decode_event_mapping(v)
+                if nested is not None:
+                    _add_vals(_extract_event_command_strs(nested, _depth=_depth + 1))
+                elif container_low in _EVENT_LIST_COMMAND_CONTAINER_KEYS_LOWER:
+                    _add_vals(_extract_event_list_commands(v, _depth=_depth + 1))
+    return found
+
+
+def _extract_event_command_str(ev: Mapping[str, Any], *, _depth: int = 0) -> str | None:
+    cmds = _extract_event_command_strs(ev, _depth=_depth)
+    return cmds[0] if cmds else None
+
+
+def _infer_tool_category(tool_name: str, *, command: str | None = None) -> str:
+    if isinstance(command, str) and command.strip():
+        return "terminal"
     low = tool_name.lower()
-    if any(tok in low for tok in ("command", "shell", "term", "pty", "bash", "exec")):
+    tokens = {tok for tok in re.split(r"[^a-z0-9]+", low) if tok}
+    if (
+        any(tok in low for tok in _SHELL_TOOL_SUBSTRINGS)
+        or bool(tokens & _SHELL_TOOL_TOKENS)
+        or any(tok.startswith("python") for tok in tokens)
+    ):
         return "terminal"
     if any(
         tok in low for tok in ("browser", "web", "url", "http", "navigate", "click", "playwright")
@@ -276,15 +463,19 @@ def _infer_action_kind(
     category: str,
     *,
     known_read_only_mcp_tools: frozenset[str] = frozenset(),
+    command: str | None = None,
 ) -> str:
     low = tool_name.strip().lower()
+    has_command = isinstance(command, str) and bool(command.strip())
     if _is_mcp_tool(low):
-        return "read" if low in known_read_only_mcp_tools else "write"
+        return "read" if (not has_command and low in known_read_only_mcp_tools) else "write"
+    if has_command or category == "terminal":
+        return "write"
     if low.startswith(("scada.read", "maint.read")) or any(
         tok in low for tok in ("read_", "get_", "list_", "search", "inspect", "view", "extract")
     ):
         return "read"
-    if category in {"terminal"} or any(
+    if any(
         tok in low
         for tok in (
             "write",
@@ -302,6 +493,45 @@ def _infer_action_kind(
     ):
         return "write"
     return "read"
+
+
+def _close_unbalanced_shell_quotes(text: str) -> str | None:
+    """Close an unbalanced single/double quote at EOF when inspecting partial shell text."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+    if in_single:
+        return f"{text}'"
+    if in_double:
+        return f'{text}"'
+    return None
+
+
+def _find_unquoted_safety_variant(tool_name: str, text: str) -> str | None:
+    """Return a quote-normalized variant if it triggers a non-syntax safety_floor violation."""
+    candidates: list[str] = []
+    closed = _close_unbalanced_shell_quotes(text)
+    if closed and closed != text:
+        candidates.append(closed)
+    spaced = re.sub(r"[\'\"]", " ", text).strip()
+    if spaced and spaced != text and spaced not in candidates:
+        candidates.append(spaced)
+    for variant in candidates:
+        err = safety_floor(tool_name, {"command": variant})
+        if err is not None and not err.startswith("safety_floor:unparseable_shell_syntax"):
+            return variant
+    return None
 
 
 def _normalize_rule_token(word: str) -> str:
@@ -460,6 +690,117 @@ def _extract_page_context_id(
     return None
 
 
+_RAW_RUNTIME_ERROR_RE = re.compile(
+    r"(?:Traceback \(most recent call last\)|net::ERR_[A-Z_]+|\[Errno\s+\d+\]|"
+    r"Playwright error|SourceUnavailableError|All requested industrial sources failed|"
+    r"connection refused|ECONNREFUSED|https?://|"
+    r'"available_sources"\s*:\s*\[|"missing_sources"\s*:\s*\[|'
+    r"\b(?:OSError|RuntimeError|ValueError|TypeError|KeyError|AttributeError|"
+    r"ImportError|ConnectionError|TimeoutError|FileNotFoundError|PermissionError|"
+    r"sqlite3\.\w*Error)\s*:)",
+    re.IGNORECASE,
+)
+_ACTIONABLE_GUIDANCE_RE = re.compile(
+    r"(?i)\b(?:retry|reconnect|reload|try\s+again|switch\s+(?:to|engine|backend|mode|model)|"
+    r"please\s+(?:check|verify|select|enable|configure|install|start|open)|"
+    r"(?:check|verify)\s+(?:your|the|that|settings|network|connection)|"
+    r"(?:install|configure|enable)\s+(?:the|a|an|your|[a-z0-9_-]{2,}))\b"
+)
+
+
+def _format_runtime_error_message(
+    raw_answer: str,
+    partial_info: Mapping[str, Any] | None = None,
+) -> str:
+    """Sanitize raw runtime/transport failures into actionable, secret-free guidance."""
+    cleaned_raw = str(scrub_v1_payload(raw_answer or "")).strip()
+    source_names: list[str] = []
+    if isinstance(partial_info, Mapping):
+        raw_sources: list[str] = []
+        missing = partial_info.get("missing_sources")
+        if isinstance(missing, (list, tuple)):
+            raw_sources.extend(str(s) for s in missing if str(s).strip())
+        src_errs = partial_info.get("source_errors")
+        if isinstance(src_errs, Mapping):
+            raw_sources.extend(str(k) for k in src_errs if str(k).strip())
+        seen_src: set[str] = set()
+        for src in raw_sources:
+            base = src.split(":", 1)[0].strip().lower()
+            label = (
+                "SCADA"
+                if base == "scada"
+                else ("Maintenance" if base in {"maintenance", "maint"} else src.strip())
+            )
+            if label and label not in seen_src:
+                seen_src.add(label)
+                source_names.append(label)
+
+    if not cleaned_raw or _RAW_RUNTIME_ERROR_RE.search(cleaned_raw):
+        low = cleaned_raw.lower()
+        if source_names:
+            lead = f"Unable to reach the configured industrial sources ({', '.join(source_names)})."
+        elif (
+            "connection refused" in low
+            or "err_connection_refused" in low
+            or "econnrefused" in low
+        ):
+            lead = "Unable to connect to the configured service endpoint (connection refused)."
+        elif "timeout" in low or "timed out" in low:
+            lead = "The runtime request timed out before receiving a response."
+        else:
+            lead = "The runtime task could not be completed due to a service or execution error."
+        return (
+            f"{lead} Please check that the required services are running and reachable, "
+            "verify your facility or engine settings, and try again."
+        )
+
+    if not _ACTIONABLE_GUIDANCE_RE.search(cleaned_raw):
+        return (
+            f"{cleaned_raw.rstrip('.')}."
+            " Please check your service or facility configuration and try again."
+        )
+    return cleaned_raw
+
+
+def _format_partial_info_summary(partial_info: Any) -> list[str]:
+    """Format partial_info into human-readable lines without raw JSON/stack dumps."""
+    items: list[str] = []
+    if not partial_info:
+        return items
+    if not isinstance(partial_info, Mapping):
+        scrubbed = str(scrub_v1_payload(partial_info)).strip()
+        if scrubbed and not _RAW_RUNTIME_ERROR_RE.search(scrubbed):
+            items.append(scrubbed)
+        return items
+
+    avail = partial_info.get("available_sources")
+    if isinstance(avail, (list, tuple)) and avail:
+        items.append("Available sources: " + ", ".join(str(s) for s in avail))
+
+    missing = partial_info.get("missing_sources")
+    if isinstance(missing, (list, tuple)) and missing:
+        items.append("Unavailable sources: " + ", ".join(str(s) for s in missing))
+
+    rejected_ids = partial_info.get("rejected_record_ids")
+    if isinstance(rejected_ids, (list, tuple)) and rejected_ids:
+        items.append(
+            "Excluded stale/invalid records: " + ", ".join(str(rid) for rid in rejected_ids)
+        )
+
+    auth_exp = partial_info.get("auth_expired_sources")
+    if isinstance(auth_exp, (list, tuple)) and auth_exp:
+        items.append("Authentication expired for: " + ", ".join(str(s) for s in auth_exp))
+
+    unknown_steps = partial_info.get("unknown_step_ids")
+    if isinstance(unknown_steps, (list, tuple)) and unknown_steps:
+        items.append("Unresolved steps: " + ", ".join(str(s) for s in unknown_steps))
+
+    reason_val = partial_info.get("reason")
+    if reason_val and not items:
+        items.append(f"Detail: {scrub_v1_payload(str(reason_val))}")
+    return items
+
+
 class AgentTurnRunner:
     """Manages async bot turns, multi-bot handoffs, HITL approval resumes, and routines."""
 
@@ -567,6 +908,74 @@ class AgentTurnRunner:
         except Exception:  # noqa: BLE001
             return None
         return None
+
+    def _resolve_facility_config(self) -> FacilityConfig | None:
+        if self._facility_config is not None:
+            return self._facility_config
+        coord_cfg = getattr(self._coordinator, "_facility_config", None)
+        return coord_cfg if isinstance(coord_cfg, FacilityConfig) else None
+
+    def _resolve_runtime_scope(
+        self,
+        *,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
+        user_message: Mapping[str, Any] | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> TaskScope:
+        meta = user_message.get("metadata") if isinstance(user_message, Mapping) else None
+        meta_map = meta if isinstance(meta, Mapping) else {}
+
+        raw_fac: Any = facility_id
+        if raw_fac is None and isinstance(user_message, Mapping):
+            raw_fac = user_message.get("facility_id")
+        if raw_fac is None:
+            raw_fac = meta_map.get("facility_id")
+        if raw_fac is None:
+            cfg = self._resolve_facility_config()
+            if cfg is not None and cfg.facility_id:
+                raw_fac = cfg.facility_id
+        if raw_fac is None:
+            env_fac = os.environ.get("GROKBOT_FACILITY_ID", "").strip()
+            if env_fac:
+                raw_fac = env_fac
+        if raw_fac is None:
+            raw_fac = "facility-a"
+
+        resolved_fac = str(raw_fac).strip()
+        if not resolved_fac:
+            raise ValueError("facility_id must not be empty.")
+        if contains_sensitive_scope_secret(resolved_fac):
+            raise ValueError("facility_id must not contain sensitive credentials.")
+
+        raw_areas: Sequence[str] | None = allowed_areas
+        if not raw_areas and isinstance(user_message, Mapping):
+            msg_areas = user_message.get("allowed_areas")
+            if isinstance(msg_areas, (list, tuple)):
+                raw_areas = [str(a) for a in msg_areas]
+        if not raw_areas:
+            meta_areas = meta_map.get("allowed_areas")
+            if isinstance(meta_areas, (list, tuple)):
+                raw_areas = [str(a) for a in meta_areas]
+
+        cleaned_areas: list[str] = []
+        seen_areas: set[str] = set()
+        for raw_area in raw_areas or ():
+            area = str(raw_area).strip()
+            if not area:
+                continue
+            if contains_sensitive_scope_secret(area):
+                raise ValueError("allowed_areas must not contain sensitive credentials.")
+            if area not in seen_areas:
+                seen_areas.add(area)
+                cleaned_areas.append(area)
+
+        return TaskScope(
+            facility_id=resolved_fac,
+            allowed_areas=tuple(cleaned_areas),
+            allowed_tools=allowed_tools,
+            read_only=True,
+        )
 
     @property
     def active_turns_count(self) -> int:
@@ -746,6 +1155,8 @@ class AgentTurnRunner:
         skip_auto_review: bool = False,
         page_context_id: str | None = None,
         ui_lane: Lane | None = None,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> str:
         """Schedule turn synchronously; serialize per-thread after cancelling prior task."""
         prev_task = self._active_tasks.get(thread_id)
@@ -792,6 +1203,8 @@ class AgentTurnRunner:
                 skip_auto_review=skip_auto_review,
                 page_context_id=resolved_page_ctx,
                 ui_lane=ui_lane,
+                facility_id=facility_id,
+                allowed_areas=tuple(allowed_areas) if allowed_areas else None,
             )
         )
         self._active_tasks[thread_id] = task
@@ -820,6 +1233,8 @@ class AgentTurnRunner:
         skip_auto_review: bool,
         page_context_id: str | None,
         ui_lane: Lane | None,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> None:
         if previous_task is not None and not previous_task.done():
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -843,6 +1258,8 @@ class AgentTurnRunner:
                 skip_auto_review=skip_auto_review,
                 page_context_id=page_context_id,
                 ui_lane=ui_lane,
+                facility_id=facility_id,
+                allowed_areas=allowed_areas,
             )
 
     async def wait_for_active_turn(self, thread_id: str) -> None:
@@ -1101,6 +1518,8 @@ class AgentTurnRunner:
                     skill_ids=list(pending_ctx.get("skill_ids") or []),
                     skip_auto_review=True,
                     page_context_id=pending_ctx.get("page_context_id"),
+                    facility_id=pending_ctx.get("facility_id"),
+                    allowed_areas=pending_ctx.get("allowed_areas"),
                 )
             elif run_id_raw:
                 self._start_runtime_resume(
@@ -1598,6 +2017,8 @@ class AgentTurnRunner:
                     )
                 if snapshot.run.status == TaskStatus.FAILED:
                     final_status = "error"
+                    p_info = snapshot.result.partial_info if snapshot.result is not None else None
+                    answer = _format_runtime_error_message(answer, p_info)
                 verified_meta = self._build_runtime_meta(snapshot, lane=Lane.INDUSTRIAL)
             else:
                 cur_status = snapshot.run.status.value if snapshot is not None else "running"
@@ -2037,6 +2458,36 @@ class AgentTurnRunner:
             ':::page{title="Document Title"}\n<markdown content>\n:::'
         )
 
+        shell_policy_lines = [
+            "[EXECUTION & SHELL POLICY]",
+            "- When calling run_command/bash, NEVER use command substitution ($(...) or "
+            "backticks), process substitution (<(...) or >(...)), eval, exec, pipe-to-shell "
+            "(| sh / | bash), or chained rm (&& rm / ; rm); ControlBot PolicyGateway blocks "
+            "those shell patterns and aborts the turn.",
+            "- Use plain commands, standard pipes (|), or python3 -c / standalone scripts instead "
+            "(for example, never write VAR=$(curl ...); use curl ... | grep ... or python3).",
+        ]
+        if (
+            airlock_sanitize is None
+            and self._live_browser is not None
+            and self._is_app_enabled("app_playwright")
+        ):
+            local_base = _default_local_base_url()
+            shell_policy_lines.append(
+                f"- To open or show a webpage in ControlBot Studio's live browser panel, call "
+                f"POST {local_base}/api/browser/action with "
+                f'{{"type":"navigate","url":"https://..."}} '
+                f"(starts the browser automatically if stopped) and inspect it via "
+                f"GET {local_base}/api/browser/context. "
+                f"Whenever the user asks to show, open, or browse a website or product in the "
+                f"browser, you MUST call POST {local_base}/api/browser/action so the Live Browser "
+                f"panel on the right opens automatically inside ControlBot Studio; do not merely "
+                f"paste an external link. If a target site blocks this server region (e.g. HTTP "
+                f"403 / region restricted), explain that clearly and open an accessible product, "
+                f"datasheet, or search page in the live browser instead."
+            )
+        sections.append("\n".join(shell_policy_lines))
+
         # Memory placed right before [USER MESSAGE] so persona/skills prefix remains KV-cacheable
         mem_section = self._build_memory_section(
             bot=bot,
@@ -2392,10 +2843,6 @@ class AgentTurnRunner:
                     "error": f"Blocked by PolicyGateway: {decision.reason}",
                 }
 
-            msg = EmailMessage()
-            from_addr = str(
-                fields.get("from") or smtp_cfg.get("from_addr") or "controlbot@localhost"
-            )
             to_addr = str(fields.get("to") or "").strip()
             if not to_addr:
                 return {
@@ -2403,45 +2850,64 @@ class AgentTurnRunner:
                     "transport": "smtp",
                     "error": "Draft email missing recipient 'to' address.",
                 }
-            msg["From"] = from_addr
-            msg["To"] = to_addr
-            if fields.get("cc"):
-                msg["Cc"] = str(fields["cc"])
-            if fields.get("bcc"):
-                msg["Bcc"] = str(fields["bcc"])
-            msg["Subject"] = str(fields.get("subject") or "ControlBot Draft")
-            msg.set_content(str(fields.get("body") or ""))
-
-            # Safe attachment resolution strictly within self._uploads_dir
-            uploads_root = self._uploads_dir.resolve()
-            for att_name in list(fields.get("attachments") or []):
-                cand = (uploads_root / str(att_name)).resolve()
-                if cand.is_file() and cand.is_relative_to(uploads_root):
-                    msg.add_attachment(
-                        cand.read_bytes(),
-                        maintype="application",
-                        subtype="octet-stream",
-                        filename=cand.name,
-                    )
-
-            def _send_smtp() -> None:
-                host = str(smtp_cfg["host"])
-                port = int(smtp_cfg.get("port", 25))
-                timeout = float(smtp_cfg.get("timeout", 10.0))
-                if smtp_cfg.get("use_ssl"):
-                    with smtplib.SMTP_SSL(host, port, timeout=timeout) as srv:
-                        if smtp_cfg.get("username") and smtp_cfg.get("password"):
-                            srv.login(str(smtp_cfg["username"]), str(smtp_cfg["password"]))
-                        srv.send_message(msg)
-                else:
-                    with smtplib.SMTP(host, port, timeout=timeout) as srv:
-                        if smtp_cfg.get("use_tls"):
-                            srv.starttls()
-                        if smtp_cfg.get("username") and smtp_cfg.get("password"):
-                            srv.login(str(smtp_cfg["username"]), str(smtp_cfg["password"]))
-                        srv.send_message(msg)
 
             try:
+                msg = EmailMessage()
+                from_addr = str(
+                    fields.get("from") or smtp_cfg.get("from_addr") or "controlbot@localhost"
+                )
+                subject_val = str(fields.get("subject") or "ControlBot Draft")
+                cc_val = str(fields["cc"]) if fields.get("cc") else None
+                bcc_val = str(fields["bcc"]) if fields.get("bcc") else None
+                for hdr_name, hdr_val in (
+                    ("from", from_addr),
+                    ("to", to_addr),
+                    ("cc", cc_val),
+                    ("bcc", bcc_val),
+                    ("subject", subject_val),
+                ):
+                    if hdr_val is not None and ("\r" in hdr_val or "\n" in hdr_val):
+                        raise ValueError(
+                            f"Invalid CR/LF characters in email header '{hdr_name}'."
+                        )
+                msg["From"] = from_addr
+                msg["To"] = to_addr
+                if cc_val is not None:
+                    msg["Cc"] = cc_val
+                if bcc_val is not None:
+                    msg["Bcc"] = bcc_val
+                msg["Subject"] = subject_val
+                msg.set_content(str(fields.get("body") or ""))
+
+                # Safe attachment resolution strictly within self._uploads_dir
+                uploads_root = self._uploads_dir.resolve()
+                for att_name in list(fields.get("attachments") or []):
+                    cand = (uploads_root / str(att_name)).resolve()
+                    if cand.is_file() and cand.is_relative_to(uploads_root):
+                        msg.add_attachment(
+                            cand.read_bytes(),
+                            maintype="application",
+                            subtype="octet-stream",
+                            filename=cand.name,
+                        )
+
+                def _send_smtp() -> None:
+                    host = str(smtp_cfg["host"])
+                    port = int(smtp_cfg.get("port", 25))
+                    timeout = float(smtp_cfg.get("timeout", 10.0))
+                    if smtp_cfg.get("use_ssl"):
+                        with smtplib.SMTP_SSL(host, port, timeout=timeout) as srv:
+                            if smtp_cfg.get("username") and smtp_cfg.get("password"):
+                                srv.login(str(smtp_cfg["username"]), str(smtp_cfg["password"]))
+                            srv.send_message(msg)
+                    else:
+                        with smtplib.SMTP(host, port, timeout=timeout) as srv:
+                            if smtp_cfg.get("use_tls"):
+                                srv.starttls()
+                            if smtp_cfg.get("username") and smtp_cfg.get("password"):
+                                srv.login(str(smtp_cfg["username"]), str(smtp_cfg["password"]))
+                            srv.send_message(msg)
+
                 await asyncio.to_thread(_send_smtp)
                 return {
                     "delivered": True,
@@ -2627,6 +3093,8 @@ class AgentTurnRunner:
         skip_auto_review: bool,
         page_context_id: str | None = None,
         ui_lane: Lane | None = None,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> None:
         target_bots, is_channel = self._resolve_target_bots(thread_id, user_message)
         if not target_bots:
@@ -2733,6 +3201,8 @@ class AgentTurnRunner:
                         "thinking_level": thinking_level,
                         "skill_ids": skill_ids,
                         "page_context_id": page_context_id,
+                        "facility_id": facility_id,
+                        "allowed_areas": list(allowed_areas) if allowed_areas else [],
                     },
                 )
                 self._emit_presence(
@@ -2760,11 +3230,50 @@ class AgentTurnRunner:
         ):
             return
 
+        try:
+            effective_scope = self._resolve_runtime_scope(
+                facility_id=facility_id,
+                allowed_areas=allowed_areas,
+                user_message=user_message,
+            )
+        except ValueError as exc:
+            lead_bot = target_bots[0]
+            lead_id = str(lead_bot["id"])
+            err_msg = self._store.create_message(
+                thread_id=thread_id,
+                sender_type="bot",
+                sender_bot_id=lead_id,
+                sender_name=str(lead_bot["name"]),
+                content=f"Invalid runtime scope: {scrub_v1_payload(str(exc))}",
+                status="error",
+            )
+            self._event_bus.publish(
+                "message.completed",
+                {"message_id": err_msg["id"], "message": err_msg},
+                bot_id=lead_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            self._emit_presence(
+                lead_id,
+                state="error",
+                subtext="Invalid runtime scope",
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            return
+
         # 2-Stage LaneRouter classification
         route_decision = await self._router.route(
             content,
             ui_lane=ui_lane,
-            facility_config=self._facility_config,
+            facility_config=self._resolve_facility_config(),
+            area=(
+                effective_scope.allowed_areas[0]
+                if len(effective_scope.allowed_areas) == 1
+                else None
+            ),
+            allowed_areas=effective_scope.allowed_areas,
         )
         if route_decision.needs_clarification:
             lead_bot = target_bots[0]
@@ -2851,6 +3360,8 @@ class AgentTurnRunner:
                 handoff_context=handoff_context,
                 page_context_id=page_context_id,
                 route_decision=route_decision,
+                facility_id=facility_id,
+                allowed_areas=allowed_areas,
             )
             if response_text:
                 handoff_context = f"{bot['name']} responded:\n{response_text[:1500]}"
@@ -2870,6 +3381,8 @@ class AgentTurnRunner:
         handoff_context: str | None,
         page_context_id: str | None = None,
         route_decision: RouteDecision | None = None,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> str:
         bot_id = str(bot["id"])
         bot_name = str(bot["name"])
@@ -2939,6 +3452,8 @@ class AgentTurnRunner:
                     use_browser=use_browser,
                     is_channel=is_channel,
                     route_decision=route_decision,
+                    facility_id=facility_id,
+                    allowed_areas=allowed_areas,
                 )
 
             if engine_id == "controlbot_runtime":
@@ -2949,6 +3464,17 @@ class AgentTurnRunner:
                     message_id=msg_id,
                     prompt=str(user_message.get("content", "")),
                     lane=route_decision.lane if route_decision else Lane.INDUSTRIAL,
+                    user_message=user_message,
+                    resolved_model=resolved_model,
+                    resolved_thinking=resolved_thinking,
+                    skill_ids=skill_ids,
+                    handoff_context=handoff_context,
+                    page_context_id=page_context_id,
+                    allow_hydrogen=bool(settings.get("allow_hydrogen", False)),
+                    use_browser=use_browser,
+                    is_channel=is_channel,
+                    facility_id=facility_id,
+                    allowed_areas=allowed_areas,
                 )
 
             effective_prompt = self._build_bot_prompt(
@@ -3102,21 +3628,24 @@ class AgentTurnRunner:
         use_browser: bool,
         is_channel: bool,
         route_decision: RouteDecision,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> str:
         """Execute Industrial read -> EvidenceAirlock projection -> General synthesis."""
         bot_id = str(bot["id"])
         raw_query = str(user_message.get("content", ""))
 
         blocked_ids_set: set[str] = set()
-        if self._facility_config is not None:
-            for val in (self._facility_config.facility_id, self._facility_config.facility_name):
+        resolved_fac_cfg = self._resolve_facility_config()
+        if resolved_fac_cfg is not None:
+            for val in (resolved_fac_cfg.facility_id, resolved_fac_cfg.facility_name):
                 if val and len(val.strip()) >= 2:
                     blocked_ids_set.add(val.strip())
-            for area_id, area_cfg in self._facility_config.areas.items():
+            for area_id, area_cfg in resolved_fac_cfg.areas.items():
                 for val in (area_id, area_cfg.display_name):
                     if val and len(val.strip()) >= 2:
                         blocked_ids_set.add(val.strip())
-            for asset in self._facility_config.assets:
+            for asset in resolved_fac_cfg.assets:
                 for val in (
                     asset.asset_id,
                     asset.canonical_label,
@@ -3143,7 +3672,11 @@ class AgentTurnRunner:
                 task_id=f"mix-{uuid.uuid4().hex[:10]}",
                 user_id="operator",
                 profile_id="default",
-                scope=TaskScope(facility_id="facility-a", read_only=True),
+                scope=self._resolve_runtime_scope(
+                    facility_id=facility_id,
+                    allowed_areas=allowed_areas,
+                    user_message=user_message,
+                ),
                 query=raw_query or "Inspect equipment specs",
             )
             run = await maybe_await(self._coordinator.submit_task(task_spec))
@@ -3411,7 +3944,7 @@ class AgentTurnRunner:
         )
         return sse_msg
 
-    def _gate_mid_turn_tool(
+    def _gate_mid_turn_tool_with_status(
         self,
         *,
         bot_id: str,
@@ -3421,23 +3954,42 @@ class AgentTurnRunner:
         category: str,
         summary: str,
         command: str | None = None,
-    ) -> tuple[bool, str | None]:
-        """Enforce ConnectedApp toggles, human takeover lock, safety_floor, and PolicyGateway."""
+        commands: Sequence[str] | None = None,
+        allow_incomplete_syntax: bool = False,
+    ) -> tuple[bool, str | None, bool]:
+        """Enforce ConnectedApps, takeover lock, safety_floor, and PolicyGateway with deferral."""
+        cmd_candidates: list[str] = []
+        seen_cands: set[str] = set()
+        if isinstance(command, str) and command.strip():
+            c_clean = command.strip()
+            seen_cands.add(c_clean)
+            cmd_candidates.append(c_clean)
+        for cand in commands or ():
+            if isinstance(cand, str):
+                c_clean = cand.strip()
+                if c_clean and c_clean not in seen_cands:
+                    seen_cands.add(c_clean)
+                    cmd_candidates.append(c_clean)
+        primary_cmd = cmd_candidates[0] if cmd_candidates else None
+        has_command = bool(cmd_candidates)
+        if has_command or _infer_tool_category(tool_name, command=primary_cmd) == "terminal":
+            category = "terminal"
         if category == "browser" and not self._is_app_enabled("app_playwright"):
-            return False, "Playwright Browser app is disabled in Connected Apps."
+            return False, "Playwright Browser app is disabled in Connected Apps.", False
         if category == "terminal" and not self._is_app_enabled("app_pty"):
-            return False, "Workspace Terminal (PTY) app is disabled in Connected Apps."
+            return False, "Workspace Terminal (PTY) app is disabled in Connected Apps.", False
         action_kind = _infer_action_kind(
             tool_name,
             category,
             known_read_only_mcp_tools=self._known_read_only_mcp_tools,
+            command=primary_cmd,
         )
         if (
             category == "files"
             and action_kind == "write"
             and not self._is_app_enabled("app_files")
         ):
-            return False, "Workspace Files app is disabled in Connected Apps."
+            return False, "Workspace Files app is disabled in Connected Apps.", False
 
         if (
             category == "browser"
@@ -3445,22 +3997,91 @@ class AgentTurnRunner:
             and hasattr(self._computer_gateway, "is_human_takeover")
             and self._computer_gateway.is_human_takeover("default")
         ):
-            return False, "Blocked: Human takeover lock is active on computer session."
+            return False, "Blocked: Human takeover lock is active on computer session.", False
 
         is_mcp = _is_mcp_tool(tool_name)
-        mcp_known_ro = is_mcp and tool_name.strip().lower() in self._known_read_only_mcp_tools
+        mcp_known_ro = (
+            is_mcp
+            and not has_command
+            and tool_name.strip().lower() in self._known_read_only_mcp_tools
+        )
         req_action_kind: Literal["read", "write", "unknown_mcp"] = (
             ("read" if mcp_known_ro else "unknown_mcp")
             if is_mcp
             else ("write" if action_kind == "write" else "read")
         )
+        syntax_deferred = False
         if category == "terminal":
-            full_cmd = (command or "").strip()
-            policy_args: dict[str, Any] = (
-                {"command": full_cmd}
-                if full_cmd
-                else {"summary": summary, "command": summary}
-            )
+            if allow_incomplete_syntax:
+                if cmd_candidates:
+                    parseable_cmds: list[str] = []
+                    destructive_variants: list[str] = []
+                    any_deferred = False
+                    for cand in cmd_candidates:
+                        floor_violation = safety_floor(tool_name, {"command": cand})
+                        if floor_violation is not None and floor_violation.startswith(
+                            "safety_floor:unparseable_shell_syntax"
+                        ):
+                            destructive_variant = _find_unquoted_safety_variant(tool_name, cand)
+                            if destructive_variant is not None:
+                                destructive_variants.append(destructive_variant)
+                                parseable_cmds.append(cand)
+                            else:
+                                any_deferred = True
+                        else:
+                            parseable_cmds.append(cand)
+                    if destructive_variants:
+                        policy_args: dict[str, Any] = {
+                            "normalized_command": destructive_variants[0],
+                            "command": parseable_cmds[0],
+                        }
+                        if len(destructive_variants) > 1:
+                            policy_args["normalized_commands"] = destructive_variants
+                        if len(parseable_cmds) > 1:
+                            policy_args["commands"] = parseable_cmds
+                    elif parseable_cmds:
+                        policy_args = {"command": parseable_cmds[0]}
+                        if len(parseable_cmds) > 1:
+                            policy_args["commands"] = parseable_cmds
+                        if any_deferred:
+                            syntax_deferred = True
+                    else:
+                        syntax_deferred = True
+                        policy_args = {"deferred": True}
+                else:
+                    summary_text = summary.strip()
+                    summary_violation = (
+                        safety_floor(tool_name, {"summary": summary})
+                        if summary_text
+                        else None
+                    )
+                    if summary_violation is not None:
+                        if not summary_violation.startswith(
+                            "safety_floor:unparseable_shell_syntax"
+                        ):
+                            policy_args = {"summary": summary}
+                        else:
+                            destructive_variant = _find_unquoted_safety_variant(
+                                tool_name, summary_text
+                            )
+                            if destructive_variant is not None:
+                                policy_args = {
+                                    "normalized_command": destructive_variant,
+                                    "summary": summary,
+                                }
+                            else:
+                                syntax_deferred = True
+                                policy_args = {"deferred": True}
+                    else:
+                        syntax_deferred = True
+                        policy_args = {"deferred": True}
+            else:
+                if cmd_candidates:
+                    policy_args = {"command": cmd_candidates[0]}
+                    if len(cmd_candidates) > 1:
+                        policy_args["commands"] = cmd_candidates
+                else:
+                    policy_args = {"summary": summary, "command": summary}
         else:
             policy_args = {"summary": summary}
 
@@ -3478,8 +4099,208 @@ class AgentTurnRunner:
             )
         )
         if not decision.allowed:
-            return False, f"Blocked by PolicyGateway ({decision.reason})"
-        return True, None
+            return False, f"Blocked by PolicyGateway ({decision.reason})", False
+        return True, None, syntax_deferred
+
+    def _gate_mid_turn_tool(
+        self,
+        *,
+        bot_id: str,
+        turn_id: str,
+        lane: Lane,
+        tool_name: str,
+        category: str,
+        summary: str,
+        command: str | None = None,
+        commands: Sequence[str] | None = None,
+        allow_incomplete_syntax: bool = False,
+    ) -> tuple[bool, str | None]:
+        """Enforce ConnectedApp toggles, human takeover lock, safety_floor, and PolicyGateway."""
+        allowed, block_reason, _ = self._gate_mid_turn_tool_with_status(
+            bot_id=bot_id,
+            turn_id=turn_id,
+            lane=lane,
+            tool_name=tool_name,
+            category=category,
+            summary=summary,
+            command=command,
+            commands=commands,
+            allow_incomplete_syntax=allow_incomplete_syntax,
+        )
+        return allowed, block_reason
+
+    def gate_agy_stream_tool_event(
+        self,
+        *,
+        ev: Mapping[str, Any],
+        bot_id: str,
+        turn_id: str,
+        lane: Lane = Lane.GENERAL,
+        pending_syntax_tools: dict[str, dict[str, Any]],
+        tool_state_by_call: dict[str, dict[str, Any]],
+        active_unnamed_calls_by_tool: dict[str, str],
+        existing_call_ids: set[str] | None = None,
+    ) -> tuple[bool, str | None, dict[str, Any]]:
+        """Gate a streamed `agy` tool event through ConnectedApps, safety_floor & PolicyGateway."""
+        tool_name = str(ev.get("tool_name") or ev.get("name") or "tool")
+        raw_state = str(ev.get("state") or ev.get("status") or "ACTIVE").upper()
+        is_terminal_state = raw_state in {
+            "DONE",
+            "COMPLETED",
+            "SUCCESS",
+            "ERROR",
+            "FAILED",
+        }
+        raw_step_idx = ev.get("step_index")
+        parsed_step_idx: int | None = None
+        if isinstance(raw_step_idx, int) and not isinstance(raw_step_idx, bool):
+            parsed_step_idx = raw_step_idx
+        elif isinstance(raw_step_idx, str) and raw_step_idx.strip():
+            with contextlib.suppress(ValueError):
+                parsed_step_idx = int(raw_step_idx.strip())
+
+        if parsed_step_idx is not None:
+            call_id = f"tc_{parsed_step_idx}"
+        else:
+            existing_unnamed = active_unnamed_calls_by_tool.get(tool_name)
+            if existing_unnamed is not None:
+                call_id = existing_unnamed
+            else:
+                used_call_ids = (
+                    set(existing_call_ids or ())
+                    | set(tool_state_by_call)
+                    | set(active_unnamed_calls_by_tool.values())
+                )
+                candidate_idx = len(used_call_ids)
+                while f"tc_{candidate_idx}" in used_call_ids:
+                    candidate_idx += 1
+                call_id = f"tc_{candidate_idx}"
+                if not is_terminal_state:
+                    active_unnamed_calls_by_tool[tool_name] = call_id
+            if is_terminal_state:
+                active_unnamed_calls_by_tool.pop(tool_name, None)
+
+        command_strs = _extract_event_command_strs(ev)
+        command_str = command_strs[0] if command_strs else None
+        raw_summary = ev.get("summary")
+        if not (isinstance(raw_summary, str) and raw_summary.strip()):
+            raw_summary = command_str or ev.get("path")
+        incoming_summary = (
+            raw_summary.strip()
+            if isinstance(raw_summary, str) and raw_summary.strip()
+            else None
+        )
+        has_meaningful_summary = incoming_summary is not None and incoming_summary != tool_name
+
+        prev_state = tool_state_by_call.get(call_id) or pending_syntax_tools.get(call_id)
+        effective_cmds = list(command_strs)
+        if not effective_cmds and prev_state is not None:
+            prev_cmds = prev_state.get("commands")
+            if isinstance(prev_cmds, (list, tuple)):
+                effective_cmds = [
+                    c.strip() for c in prev_cmds if isinstance(c, str) and c.strip()
+                ]
+            if not effective_cmds:
+                prev_cmd = prev_state.get("command_str")
+                if isinstance(prev_cmd, str) and prev_cmd.strip():
+                    effective_cmds = [prev_cmd.strip()]
+        effective_cmd = effective_cmds[0] if effective_cmds else None
+        category = _infer_tool_category(tool_name, command=effective_cmd)
+
+        prev_summary = (
+            str(prev_state["summary"])
+            if prev_state is not None
+            and isinstance(prev_state.get("summary"), str)
+            and prev_state["summary"].strip()
+            else None
+        )
+        prev_had_rich_summary = bool(prev_state and prev_state.get("has_rich_summary"))
+        if has_meaningful_summary:
+            assert incoming_summary is not None
+            summary = incoming_summary
+        elif command_str is None and prev_summary is not None and prev_had_rich_summary:
+            summary = prev_summary
+        else:
+            summary = incoming_summary or tool_name
+
+        if is_terminal_state:
+            pending_syntax_tools.pop(call_id, None)
+            tool_state_by_call.pop(call_id, None)
+
+        allowed, block_reason, syntax_deferred = self._gate_mid_turn_tool_with_status(
+            bot_id=bot_id,
+            turn_id=turn_id,
+            lane=lane,
+            tool_name=tool_name,
+            category=category,
+            summary=summary,
+            command=effective_cmd,
+            commands=effective_cmds,
+            allow_incomplete_syntax=not is_terminal_state,
+        )
+        meta: dict[str, Any] = {
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "category": category,
+            "summary": summary,
+            "raw_state": raw_state,
+        }
+        if not allowed:
+            return False, block_reason, meta
+
+        if not is_terminal_state:
+            state_record = {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "category": category,
+                "summary": summary,
+                "has_rich_summary": (
+                    has_meaningful_summary
+                    or (command_str is None and prev_had_rich_summary)
+                ),
+                "command_str": effective_cmd,
+                "commands": effective_cmds,
+            }
+            tool_state_by_call[call_id] = state_record
+            if syntax_deferred:
+                pending_syntax_tools[call_id] = state_record
+            else:
+                pending_syntax_tools.pop(call_id, None)
+
+        return True, None, meta
+
+    def finalize_agy_stream_pending_tools(
+        self,
+        *,
+        bot_id: str,
+        turn_id: str,
+        lane: Lane = Lane.GENERAL,
+        pending_syntax_tools: dict[str, dict[str, Any]],
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
+        """Re-check any syntax-deferred ACTIVE tool calls strictly at stream end."""
+        for pending in list(pending_syntax_tools.values()):
+            p_cmd = pending.get("command_str")
+            p_cmds = pending.get("commands")
+            p_allowed, p_reason, _ = self._gate_mid_turn_tool_with_status(
+                bot_id=bot_id,
+                turn_id=turn_id,
+                lane=lane,
+                tool_name=str(pending["tool_name"]),
+                category=str(pending["category"]),
+                summary=str(pending["summary"]),
+                command=str(p_cmd) if isinstance(p_cmd, str) else None,
+                commands=(
+                    [c for c in p_cmds if isinstance(c, str)]
+                    if isinstance(p_cmds, (list, tuple))
+                    else None
+                ),
+                allow_incomplete_syntax=False,
+            )
+            if not p_allowed:
+                pending_syntax_tools.clear()
+                return False, p_reason, pending
+        pending_syntax_tools.clear()
+        return True, None, None
 
     async def _execute_agy_engine(
         self,
@@ -3600,6 +4421,10 @@ class AgentTurnRunner:
         )
 
         policy_blocked_reason: str | None = None
+        pending_syntax_tools: dict[str, dict[str, Any]] = {}
+        tool_state_by_call: dict[str, dict[str, Any]] = {}
+        active_unnamed_calls_by_tool: dict[str, str] = {}
+        next_unnamed_idx = 0
         try:
             async for ev in gen:
                 ev_type = str(ev.get("type", ""))
@@ -3611,25 +4436,104 @@ class AgentTurnRunner:
                             with contextlib.suppress(StoreNotFoundError):
                                 self._store.update_bot(bot_id, {"conversation_id": conv_id})
                 elif ev_type == "tool":
-                    step_idx = int(ev.get("step_index", len(tool_calls)))
-                    call_id = f"tc_{step_idx}"
-                    tool_name = str(ev.get("tool_name") or "tool")
-                    raw_state = str(ev.get("state") or "ACTIVE").upper()
-                    summary = str(ev.get("summary") or tool_name)
-                    raw_cmd = ev.get("command")
-                    command_str = (
-                        str(raw_cmd) if isinstance(raw_cmd, str) and raw_cmd.strip() else None
-                    )
-                    category = _infer_tool_category(tool_name)
+                    tool_name = str(ev.get("tool_name") or ev.get("name") or "tool")
+                    raw_state = str(ev.get("state") or ev.get("status") or "ACTIVE").upper()
+                    is_terminal_state = raw_state in {
+                        "DONE",
+                        "COMPLETED",
+                        "SUCCESS",
+                        "ERROR",
+                        "FAILED",
+                    }
+                    raw_step_idx = ev.get("step_index")
+                    parsed_step_idx: int | None = None
+                    if isinstance(raw_step_idx, int) and not isinstance(raw_step_idx, bool):
+                        parsed_step_idx = raw_step_idx
+                    elif isinstance(raw_step_idx, str) and raw_step_idx.strip():
+                        with contextlib.suppress(ValueError):
+                            parsed_step_idx = int(raw_step_idx.strip())
 
-                    allowed, block_reason = self._gate_mid_turn_tool(
+                    if parsed_step_idx is not None:
+                        call_id = f"tc_{parsed_step_idx}"
+                    else:
+                        existing_unnamed = active_unnamed_calls_by_tool.get(tool_name)
+                        if existing_unnamed is not None:
+                            call_id = existing_unnamed
+                        else:
+                            used_call_ids = (
+                                set(tool_index_map)
+                                | set(tool_state_by_call)
+                                | set(active_unnamed_calls_by_tool.values())
+                            )
+                            candidate_idx = max(next_unnamed_idx, len(tool_calls))
+                            while f"tc_{candidate_idx}" in used_call_ids:
+                                candidate_idx += 1
+                            next_unnamed_idx = candidate_idx + 1
+                            call_id = f"tc_{candidate_idx}"
+                            if not is_terminal_state:
+                                active_unnamed_calls_by_tool[tool_name] = call_id
+                        if is_terminal_state:
+                            active_unnamed_calls_by_tool.pop(tool_name, None)
+
+                    raw_summary = ev.get("summary")
+                    incoming_summary = (
+                        raw_summary.strip()
+                        if isinstance(raw_summary, str) and raw_summary.strip()
+                        else None
+                    )
+                    has_meaningful_summary = (
+                        incoming_summary is not None and incoming_summary != tool_name
+                    )
+                    command_strs = _extract_event_command_strs(ev)
+                    command_str = command_strs[0] if command_strs else None
+
+                    prev_state = tool_state_by_call.get(call_id) or pending_syntax_tools.get(
+                        call_id
+                    )
+                    effective_cmds = list(command_strs)
+                    if not effective_cmds and prev_state is not None:
+                        prev_cmds = prev_state.get("commands")
+                        if isinstance(prev_cmds, (list, tuple)):
+                            effective_cmds = [
+                                c.strip() for c in prev_cmds if isinstance(c, str) and c.strip()
+                            ]
+                        if not effective_cmds:
+                            prev_cmd = prev_state.get("command_str")
+                            if isinstance(prev_cmd, str) and prev_cmd.strip():
+                                effective_cmds = [prev_cmd.strip()]
+                    effective_cmd = effective_cmds[0] if effective_cmds else None
+                    category = _infer_tool_category(tool_name, command=effective_cmd)
+
+                    prev_summary = (
+                        str(prev_state["summary"])
+                        if prev_state is not None
+                        and isinstance(prev_state.get("summary"), str)
+                        and prev_state["summary"].strip()
+                        else None
+                    )
+                    prev_had_rich_summary = bool(prev_state and prev_state.get("has_rich_summary"))
+                    if has_meaningful_summary:
+                        assert incoming_summary is not None
+                        summary = incoming_summary
+                    elif command_str is None and prev_summary is not None and prev_had_rich_summary:
+                        summary = prev_summary
+                    else:
+                        summary = incoming_summary or tool_name
+
+                    if is_terminal_state:
+                        pending_syntax_tools.pop(call_id, None)
+                        tool_state_by_call.pop(call_id, None)
+
+                    allowed, block_reason, syntax_deferred = self._gate_mid_turn_tool_with_status(
                         bot_id=bot_id,
                         turn_id=turn_id,
                         lane=lane,
                         tool_name=tool_name,
                         category=category,
                         summary=summary,
-                        command=command_str,
+                        command=effective_cmd,
+                        commands=effective_cmds,
+                        allow_incomplete_syntax=not is_terminal_state,
                     )
                     if not allowed:
                         entry = {
@@ -3655,6 +4559,24 @@ class AgentTurnRunner:
                         policy_blocked_reason = block_reason
                         final_status = "error"
                         break
+                    if not is_terminal_state:
+                        state_record = {
+                            "call_id": call_id,
+                            "tool_name": tool_name,
+                            "category": category,
+                            "summary": summary,
+                            "has_rich_summary": (
+                                has_meaningful_summary
+                                or (command_str is None and prev_had_rich_summary)
+                            ),
+                            "command_str": effective_cmd,
+                            "commands": effective_cmds,
+                        }
+                        tool_state_by_call[call_id] = state_record
+                        if syntax_deferred:
+                            pending_syntax_tools[call_id] = state_record
+                        else:
+                            pending_syntax_tools.pop(call_id, None)
 
                     call_status = (
                         "error"
@@ -3729,6 +4651,52 @@ class AgentTurnRunner:
                     final_status = "error"
         finally:
             await gen.aclose()
+
+        if not policy_blocked_reason and pending_syntax_tools:
+            for pending in list(pending_syntax_tools.values()):
+                p_cmd = pending.get("command_str")
+                p_cmds = pending.get("commands")
+                p_allowed, p_reason, _ = self._gate_mid_turn_tool_with_status(
+                    bot_id=bot_id,
+                    turn_id=turn_id,
+                    lane=lane,
+                    tool_name=str(pending["tool_name"]),
+                    category=str(pending["category"]),
+                    summary=str(pending["summary"]),
+                    command=str(p_cmd) if isinstance(p_cmd, str) else None,
+                    commands=(
+                        [c for c in p_cmds if isinstance(c, str)]
+                        if isinstance(p_cmds, (list, tuple))
+                        else None
+                    ),
+                    allow_incomplete_syntax=False,
+                )
+                if not p_allowed:
+                    p_call_id = str(pending["call_id"])
+                    entry = {
+                        "call_id": p_call_id,
+                        "tool_name": str(pending["tool_name"]),
+                        "category": str(pending["category"]),
+                        "status": "error",
+                        "summary": str(pending["summary"]),
+                        "output_preview": p_reason or "Blocked by PolicyGateway",
+                    }
+                    if p_call_id in tool_index_map:
+                        tool_calls[tool_index_map[p_call_id]] = entry
+                    else:
+                        tool_index_map[p_call_id] = len(tool_calls)
+                        tool_calls.append(entry)
+                    self._event_bus.publish(
+                        "tool.call.updated",
+                        {"message_id": message_id, **entry},
+                        bot_id=bot_id,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                    )
+                    policy_blocked_reason = p_reason
+                    final_status = "error"
+                    break
+            pending_syntax_tools.clear()
 
         if policy_blocked_reason:
             chunks.append(f"\n\n[Policy Block] {policy_blocked_reason}")
@@ -3882,6 +4850,19 @@ class AgentTurnRunner:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await wait_task
 
+    def _runtime_backend_kind(
+        self,
+    ) -> Literal["local_http", "emulated_industrial", "stub_or_test"]:
+        inner = getattr(self._coordinator, "_coordinator", None)
+        if inner is None:
+            inner = getattr(self._coordinator, "coordinator", None)
+        model_client = getattr(inner, "_model_client", None)
+        if type(model_client).__name__ == "LocalHttpModelClient":
+            return "local_http"
+        if inner is not None and getattr(model_client, "_turn_factory", None) is not None:
+            return "emulated_industrial"
+        return "stub_or_test"
+
     @staticmethod
     def _build_runtime_meta(snapshot: TaskSnapshot, *, lane: Lane) -> dict[str, Any]:
         result = snapshot.result
@@ -3901,17 +4882,22 @@ class AgentTurnRunner:
 
         if result is not None:
             if result.partial_info:
-                partial.append(json.dumps(result.partial_info, default=str))
+                partial.extend(_format_partial_info_summary(result.partial_info))
             for obs in result.verified_observations:
                 if obs.authorized_evidence:
                     agreements.append(
                         f"{obs.source}:{obs.observed_label}={obs.value} {obs.unit or ''}".strip()
                     )
 
+        domain_profile = (
+            "industrial_ot"
+            if lane == Lane.INDUSTRIAL
+            else ("mixed_industrial_web" if lane == Lane.MIXED else "general_office")
+        )
         return VerifiedResponseMeta(
             verdict=verdict,
             lane=lane,
-            domain_profile="industrial_ot" if lane == Lane.INDUSTRIAL else "mixed_industrial_web",
+            domain_profile=domain_profile,
             agreements=tuple(agreements),
             contradictions=contradictions,
             partial_evidence=tuple(partial),
@@ -3926,10 +4912,24 @@ class AgentTurnRunner:
         message_id: str,
         prompt: str,
         lane: Lane = Lane.INDUSTRIAL,
+        user_message: dict[str, Any] | None = None,
+        resolved_model: str | None = None,
+        resolved_thinking: str | None = None,
+        skill_ids: list[str] | None = None,
+        handoff_context: str | None = None,
+        page_context_id: str | None = None,
+        allow_hydrogen: bool = False,
+        use_browser: bool = False,
+        is_channel: bool = False,
+        facility_id: str | None = None,
+        allowed_areas: Sequence[str] | None = None,
     ) -> str:
         bot_id = str(bot["id"])
         if not self._is_app_enabled("app_runtime"):
-            disabled_msg = "ControlBot Runtime app is disabled in Connected Apps."
+            disabled_msg = (
+                "ControlBot Runtime app is disabled in Connected Apps. "
+                "Please enable it in Settings -> Connected Apps or switch this bot's engine."
+            )
             self._finalize_pages_and_message(
                 bot_id=bot_id,
                 thread_id=thread_id,
@@ -3950,6 +4950,83 @@ class AgentTurnRunner:
             )
             return ""
 
+        backend_kind = self._runtime_backend_kind()
+        if lane == Lane.GENERAL and backend_kind == "emulated_industrial":
+            if self._is_app_enabled("app_agy") and find_agy_executable() is not None:
+                settings = self._store.get_settings()
+                effective_user_msg = (
+                    user_message if user_message is not None else {"content": prompt}
+                )
+                effective_thinking = resolved_thinking or str(
+                    bot.get("thinking_level") or "medium"
+                )
+                effective_prompt = self._build_bot_prompt(
+                    bot=bot,
+                    thread_id=thread_id,
+                    user_message=effective_user_msg,
+                    skill_ids=skill_ids or [],
+                    thinking_level=effective_thinking,
+                    handoff_context=handoff_context,
+                    page_context_id=page_context_id,
+                )
+                effective_model = resolved_model or str(
+                    bot.get("model_id")
+                    or settings.get("default_model_id")
+                    or "gemini-4-carbon-low"
+                )
+                return await self._execute_agy_engine(
+                    bot=bot,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    message_id=message_id,
+                    prompt=effective_prompt,
+                    model_id=effective_model,
+                    allow_hydrogen=allow_hydrogen,
+                    use_browser_context=use_browser,
+                    is_channel=is_channel,
+                    lane=Lane.GENERAL,
+                )
+
+            unavailable_msg = (
+                "General chat cannot run on the industrial-only emulated runtime because "
+                "Antigravity CLI (`agy`) and a local LLM endpoint are unavailable. "
+                "Please configure GROKBOT_LLM_BASE_URL, enable/install `agy`, or "
+                "switch this bot's engine."
+            )
+            err_meta = VerifiedResponseMeta(
+                verdict=VerdictState.CONTRADICTED,
+                lane=Lane.GENERAL,
+                domain_profile="general_office",
+                degraded_banner=unavailable_msg,
+            ).model_dump(mode="json")
+            self._event_bus.publish(
+                "message.delta",
+                {"message_id": message_id, "text_delta": unavailable_msg},
+                bot_id=bot_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            self._finalize_pages_and_message(
+                bot_id=bot_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_id=message_id,
+                content=unavailable_msg,
+                tool_calls=[],
+                conversation_id=None,
+                status="error",
+                metadata=err_meta,
+            )
+            self._emit_presence(
+                bot_id,
+                state="error",
+                subtext="General chat backend unavailable",
+                computer_active=False,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            return ""
+
         self._emit_presence(
             bot_id,
             state="working",
@@ -3960,13 +5037,37 @@ class AgentTurnRunner:
             turn_id=turn_id,
         )
 
-        task_spec = TaskSpec(
-            task_id=f"task-{uuid.uuid4().hex[:12]}",
-            user_id="operator",
-            profile_id="default",
-            scope=TaskScope(facility_id="facility-a", read_only=True),
-            query=prompt.strip() or "Inspect system status",
-        )
+        if lane == Lane.GENERAL and backend_kind == "local_http":
+            task_spec = TaskSpec(
+                task_id=f"task-{uuid.uuid4().hex[:12]}",
+                user_id="operator",
+                profile_id="default",
+                scope=self._resolve_runtime_scope(
+                    facility_id=facility_id,
+                    allowed_areas=allowed_areas,
+                    user_message=user_message,
+                    allowed_tools=("__general_chat__",),
+                ),
+                query=prompt.strip() or "Inspect system status",
+                backend_mode=BackendMode.LOCAL_HTTP,
+                evidence_requirements=EvidenceRequirements(
+                    min_sources=1,
+                    require_source_timestamp=False,
+                    require_quality_check=False,
+                ),
+            )
+        else:
+            task_spec = TaskSpec(
+                task_id=f"task-{uuid.uuid4().hex[:12]}",
+                user_id="operator",
+                profile_id="default",
+                scope=self._resolve_runtime_scope(
+                    facility_id=facility_id,
+                    allowed_areas=allowed_areas,
+                    user_message=user_message,
+                ),
+                query=prompt.strip() or "Inspect system status",
+            )
         run = await maybe_await(self._coordinator.submit_task(task_spec))
         self._active_runtime_runs[thread_id] = run.run_id
 
@@ -4071,6 +5172,8 @@ class AgentTurnRunner:
                     )
                 if snapshot.run.status == TaskStatus.FAILED:
                     final_status = "error"
+                    p_info = snapshot.result.partial_info if snapshot.result is not None else None
+                    final_answer = _format_runtime_error_message(final_answer, p_info)
 
         if not final_answer:
             final_answer = (
@@ -4388,6 +5491,10 @@ class AgentTurnRunner:
                     with contextlib.suppress(ValueError):
                         project_dir = resolve_project_dir(default_projects_root(), proj_name)
                 chunks: list[str] = []
+                pending_syntax_tools: dict[str, dict[str, Any]] = {}
+                tool_state_by_call: dict[str, dict[str, Any]] = {}
+                active_unnamed_calls_by_tool: dict[str, str] = {}
+                routine_turn_id = f"rtn_{run_id}"
                 gen = stream_agy_prompt(
                     prompt=(
                         f"[SCHEDULED ROUTINE: {routine['name']}]\n"
@@ -4401,12 +5508,46 @@ class AgentTurnRunner:
                 )
                 try:
                     async for ev in gen:
-                        if ev.get("type") == "delta":
+                        ev_type = str(ev.get("type") or "")
+                        if ev_type == "tool":
+                            allowed, block_reason, _ = self.gate_agy_stream_tool_event(
+                                ev=ev,
+                                bot_id=bot_id,
+                                turn_id=routine_turn_id,
+                                lane=Lane.GENERAL,
+                                pending_syntax_tools=pending_syntax_tools,
+                                tool_state_by_call=tool_state_by_call,
+                                active_unnamed_calls_by_tool=active_unnamed_calls_by_tool,
+                            )
+                            if not allowed:
+                                error_msg = block_reason or "Blocked by PolicyGateway"
+                                break
+                        elif ev_type == "delta":
                             chunks.append(str(ev.get("text") or ""))
-                        elif ev.get("type") == "done" and not chunks:
-                            chunks.append(str(ev.get("response") or ""))
-                        elif ev.get("type") == "error":
+                        elif ev_type == "done":
+                            if pending_syntax_tools:
+                                p_ok, p_reason, _ = self.finalize_agy_stream_pending_tools(
+                                    bot_id=bot_id,
+                                    turn_id=routine_turn_id,
+                                    lane=Lane.GENERAL,
+                                    pending_syntax_tools=pending_syntax_tools,
+                                )
+                                if not p_ok:
+                                    error_msg = p_reason or "Blocked by PolicyGateway"
+                                    break
+                            if not chunks:
+                                chunks.append(str(ev.get("response") or ""))
+                        elif ev_type == "error":
                             error_msg = str(ev.get("message") or "Routine execution error")
+                    if not error_msg and pending_syntax_tools:
+                        p_ok, p_reason, _ = self.finalize_agy_stream_pending_tools(
+                            bot_id=bot_id,
+                            turn_id=routine_turn_id,
+                            lane=Lane.GENERAL,
+                            pending_syntax_tools=pending_syntax_tools,
+                        )
+                        if not p_ok:
+                            error_msg = p_reason or "Blocked by PolicyGateway"
                 finally:
                     await gen.aclose()
                 summary = "".join(chunks).strip()
@@ -4418,7 +5559,7 @@ class AgentTurnRunner:
                         task_id=f"rtn-{uuid.uuid4().hex[:10]}",
                         user_id="operator",
                         profile_id="default",
-                        scope=TaskScope(facility_id="facility-a", read_only=True),
+                        scope=self._resolve_runtime_scope(),
                         query=instruction or routine["name"],
                     )
                     coord_run = await maybe_await(self._coordinator.submit_task(task_spec))

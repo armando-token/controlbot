@@ -16,10 +16,13 @@ export const ThinkingAccordion: React.FC<ThinkingAccordionProps> = ({
 
   if (!text && !streaming) return null;
 
+  const thinkingLabel = summary || (streaming ? 'Thinking' : 'Thought process');
+
   return (
     <div className="mb-2">
       <button
         type="button"
+        aria-label={`${thinkingLabel}`}
         onClick={() => setOpen((v) => !v)}
         className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[12px] transition-colors hover:bg-[var(--bg-active)]"
         style={{

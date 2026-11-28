@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import sqlite3
+import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from html.parser import HTMLParser
@@ -45,14 +46,17 @@ from src.contracts.common import (
     PlanValidationError,
     validate_http_origin,
 )
+from src.contracts.envelope import Lane
 from src.contracts.models import ActionReceipt, Run, TaskSpec
 from src.contracts.redaction import REDACTED_PLACEHOLDER
+from src.engine.policy_gateway import PolicyRequest
 from src.storage.errors import ConflictError, NotFoundError
 from src.storage.memory import MemoryStore
 from src.storage.redaction import (
     contains_unredacted_secret_strict,
     is_sensitive_key_strict,
     redact_payload_strict,
+    redact_string_strict,
 )
 from src.web.auth import (
     DEFAULT_RATE_LIMITS,
@@ -68,7 +72,7 @@ from src.web.diagnostics import (
     DiagnosticsRecorder,
     create_diagnostics_router,
 )
-from src.web.live_browser import LiveBrowserController
+from src.web.live_browser import LiveBrowserController, _scrub_browser_str
 from src.web.live_terminal import LiveTerminalSession
 from src.web.protocols import CoordinatorProtocol, SessionManagerProtocol, TaskSnapshot, maybe_await
 from src.web.schemas import (
@@ -88,7 +92,11 @@ from src.web.v1 import (
     create_computer_router,
     create_v1_router,
 )
-from src.web.v1.computer import coerce_finite_int
+from src.web.v1.computer import (
+    _describe_browser_action,
+    _emit_event_bus,
+    coerce_finite_int,
+)
 from src.web.v1.memory_routes import create_memory_router
 from src.web.workspace import (
     default_agy_brain_root,
@@ -624,11 +632,29 @@ def _extract_system_info(
     else:
         backend_mode = "emulated"
 
-    llm_origin = (
-        getattr(app.state, "llm_origin", None)
-        or os.environ.get("GROKBOT_LLM_BASE_URL", "").strip()
-        or None
-    )
+    llm_origin: str | None = getattr(app.state, "llm_origin", None) or None
+    if llm_origin is None:
+        raw_llm_url = os.environ.get("GROKBOT_LLM_BASE_URL", "").strip()
+        if raw_llm_url:
+            with contextlib.suppress(ValueError):
+                parsed_fallback = urlparse(raw_llm_url)
+                has_sensitive_parts = bool(
+                    parsed_fallback.username
+                    or parsed_fallback.password
+                    or parsed_fallback.query
+                )
+                if (
+                    not has_sensitive_parts
+                    and parsed_fallback.scheme
+                    and parsed_fallback.hostname
+                ):
+                    host = parsed_fallback.hostname
+                    if ":" in host and not host.startswith("["):
+                        host = f"[{host}]"
+                    port_part = (
+                        f":{parsed_fallback.port}" if parsed_fallback.port is not None else ""
+                    )
+                    llm_origin = f"{parsed_fallback.scheme}://{host}{port_part}"
     llm_model_id = (
         getattr(app.state, "llm_model_id", None)
         or os.environ.get("GROKBOT_LLM_MODEL_ID", "").strip()
@@ -909,7 +935,11 @@ def create_app(
         uploads_dir=uploads_dir,
         memory_store=memory_store,
         computer_gateway=computer_gateway,
-        facility_config=(active_runtime.facility_config if active_runtime is not None else None),
+        facility_config=(
+            active_runtime.facility_config
+            if active_runtime is not None
+            else getattr(coord, "_facility_config", None)
+        ),
         allow_loopback_webhooks=effective_allow_loopback_webhooks,
     )
 
@@ -1281,13 +1311,41 @@ def create_app(
 
     async def _prepare_agy_turn(
         payload: AgySendRequest,
-    ) -> tuple[Path | None, dict[str, Any] | None]:
+    ) -> tuple[Path | None, dict[str, Any] | None, str]:
         if not payload.prompt.strip():
             raise HTTPException(status_code=422, detail="prompt must not be empty.")
         if "hydrogen" in payload.model.lower() and not payload.allow_hydrogen:
             raise HTTPException(
                 status_code=422,
                 detail="Hydrogen models are disabled by policy; enable opt-in or use carbon/neon.",
+            )
+        if not v1_runner._is_app_enabled("app_agy"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Antigravity CLI ('agy') is disabled in Connected Apps.",
+            )
+
+        agy_turn_id = f"agy_{uuid.uuid4().hex[:10]}"
+        prompt_decision = v1_runner._policy_gateway.evaluate_and_record(
+            PolicyRequest(
+                actor_id="agy_api",
+                actor_role="operator",
+                lane=Lane.GENERAL,
+                tool_id="agy.prompt",
+                action_kind="write",
+                arguments={"prompt": payload.prompt},
+                task_id=agy_turn_id,
+            )
+        )
+        if not prompt_decision.allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(
+                    _scrub_and_verify(
+                        f"Blocked by PolicyGateway ({prompt_decision.reason}).",
+                        label="policy_block",
+                    )
+                ),
             )
 
         project_dir: Path | None = None
@@ -1307,11 +1365,15 @@ def create_app(
             )
 
         browser_ctx: dict[str, Any] | None = None
-        if payload.include_browser_context and live_browser.running:
+        if (
+            payload.include_browser_context
+            and v1_runner._is_app_enabled("app_playwright")
+            and live_browser.running
+        ):
             browser_ctx = await live_browser.extract_page_context(
                 screenshot_path=live_profile_root.parent / "live_browser_latest.jpg"
             )
-        return project_dir, browser_ctx
+        return project_dir, browser_ctx, agy_turn_id
 
     def _request_base_url(request: Request) -> str | None:
         if request.url.port:
@@ -1320,7 +1382,7 @@ def create_app(
 
     @app.post("/api/agy/send")
     async def api_agy_send(request: Request, payload: AgySendRequest) -> JSONResponse:
-        project_dir, browser_ctx = await _prepare_agy_turn(payload)
+        project_dir, browser_ctx, _ = await _prepare_agy_turn(payload)
 
         try:
             result = await send_agy_prompt(
@@ -1359,7 +1421,7 @@ def create_app(
 
     @app.post("/api/agy/stream")
     async def api_agy_stream(request: Request, payload: AgySendRequest) -> StreamingResponse:
-        project_dir, browser_ctx = await _prepare_agy_turn(payload)
+        project_dir, browser_ctx, agy_turn_id = await _prepare_agy_turn(payload)
         browser_url = str(browser_ctx.get("url", "")) if browser_ctx is not None else None
         local_base = _request_base_url(request)
 
@@ -1385,16 +1447,71 @@ def create_app(
                 browser_context=browser_ctx,
                 base_url=local_base,
             )
+            pending_syntax_tools: dict[str, dict[str, Any]] = {}
+            tool_state_by_call: dict[str, dict[str, Any]] = {}
+            active_unnamed_calls_by_tool: dict[str, str] = {}
+            blocked = False
             try:
                 async for ev in gen:
-                    if ev.get("type") == "done":
+                    ev_type = str(ev.get("type") or "")
+                    if ev_type == "tool":
+                        allowed, block_reason, _ = v1_runner.gate_agy_stream_tool_event(
+                            ev=ev,
+                            bot_id="agy_api",
+                            turn_id=agy_turn_id,
+                            lane=Lane.GENERAL,
+                            pending_syntax_tools=pending_syntax_tools,
+                            tool_state_by_call=tool_state_by_call,
+                            active_unnamed_calls_by_tool=active_unnamed_calls_by_tool,
+                        )
+                        if not allowed:
+                            blocked = True
+                            yield _sse_line(
+                                {
+                                    "type": "error",
+                                    "message": block_reason or "Blocked by PolicyGateway",
+                                }
+                            )
+                            break
+                    elif ev_type == "done":
+                        if pending_syntax_tools:
+                            p_ok, p_reason, _ = v1_runner.finalize_agy_stream_pending_tools(
+                                bot_id="agy_api",
+                                turn_id=agy_turn_id,
+                                lane=Lane.GENERAL,
+                                pending_syntax_tools=pending_syntax_tools,
+                            )
+                            if not p_ok:
+                                blocked = True
+                                yield _sse_line(
+                                    {
+                                        "type": "error",
+                                        "message": p_reason or "Blocked by PolicyGateway",
+                                    }
+                                )
+                                break
                         ev["browser_context_used"] = browser_ctx is not None
                         ev["browser_url"] = browser_url
                     yield _sse_line(ev)
+                if not blocked and pending_syntax_tools:
+                    p_ok, p_reason, _ = v1_runner.finalize_agy_stream_pending_tools(
+                        bot_id="agy_api",
+                        turn_id=agy_turn_id,
+                        lane=Lane.GENERAL,
+                        pending_syntax_tools=pending_syntax_tools,
+                    )
+                    if not p_ok:
+                        yield _sse_line(
+                            {
+                                "type": "error",
+                                "message": p_reason or "Blocked by PolicyGateway",
+                            }
+                        )
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001
-                yield _sse_line({"type": "error", "message": str(exc)[:300]})
+                safe_msg = redact_string_strict(str(exc))[:300]
+                yield _sse_line({"type": "error", "message": safe_msg})
             finally:
                 await gen.aclose()
 
@@ -1409,6 +1526,34 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(await live_browser.status(), label="BrowserStatus"),
+        )
+
+    @app.get("/api/desktop/status")
+    async def api_desktop_status() -> JSONResponse:
+        comp_st = await computer_gateway.get_status("default", live_browser=live_browser)
+        desktop_caps: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            from src.adapters.desktop import check_desktop_capabilities
+
+            cap_report = check_desktop_capabilities()
+            desktop_caps = {
+                "status": cap_report.status,
+                "display_server": cap_report.display_server.value,
+                "at_spi_available": bool(cap_report.at_spi_available),
+                "x11_available": bool(cap_report.x11_available),
+                "wayland_available": bool(cap_report.wayland_available),
+            }
+        payload: dict[str, Any] = {
+            **comp_st,
+            "running": bool(comp_st.get("vnc_available") or comp_st.get("browser_running")),
+            "vnc_host": computer_gateway.vnc_host,
+            "vnc_port": computer_gateway.vnc_port,
+        }
+        if desktop_caps is not None:
+            payload["desktop_capabilities"] = desktop_caps
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=_scrub_and_verify(payload, label="DesktopStatus"),
         )
 
     @app.get("/api/browser/context")
@@ -1432,6 +1577,46 @@ def create_app(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(ctx or {"running": False}, label="BrowserContext"),
         )
+
+    async def _publish_browser_state_event(
+        action_event: dict[str, Any],
+        browser_st: dict[str, Any] | None = None,
+    ) -> None:
+        ev_type = str(action_event.get("type", "")).strip().lower()
+        st_dict = browser_st if isinstance(browser_st, dict) else {}
+        if ev_type == "stop":
+            computer_gateway.update_browser_metadata(
+                "default",
+                url="",
+                title="",
+                step_summary=None,
+            )
+        else:
+            url = str(st_dict.get("url", ""))
+            title = str(st_dict.get("title", ""))
+            desc = _describe_browser_action(action_event, url=url)
+            tab_changed = computer_gateway.update_browser_metadata(
+                "default",
+                url=url,
+                title=title,
+                step_summary=desc,
+            )
+            if tab_changed:
+                await computer_gateway.broadcast_control(
+                    "default",
+                    {
+                        "op": "browser.tab_changed",
+                        "vm_id": "default",
+                        "url": _scrub_browser_str(url),
+                        "title": _scrub_browser_str(title),
+                    },
+                )
+        comp_st = await computer_gateway.get_status("default", live_browser=live_browser)
+        await computer_gateway.broadcast_control(
+            "default",
+            {"op": "computer.state", "status": comp_st},
+        )
+        await _emit_event_bus(event_bus, "computer.state", comp_st)
 
     @app.post("/api/browser/action")
     async def api_browser_action(request: Request) -> JSONResponse:
@@ -1464,6 +1649,11 @@ def create_app(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=str(_scrub_and_verify(str(exc), label="error")),
             ) from exc
+        raw_st = action_result.get("status")
+        await _publish_browser_state_event(
+            parsed,
+            raw_st if isinstance(raw_st, dict) else None,
+        )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(action_result, label="BrowserAction"),
@@ -1483,7 +1673,19 @@ def create_app(
         try:
             st = await live_browser.start(initial_url=initial_url)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=422,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(_scrub_and_verify(str(exc), label="error")),
+            ) from exc
+        await _publish_browser_state_event(
+            {"type": "start", **({"url": initial_url} if initial_url else {})},
+            st,
+        )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(st, label="BrowserStatus"),
@@ -1492,6 +1694,7 @@ def create_app(
     @app.post("/api/browser/stop")
     async def api_browser_stop() -> JSONResponse:
         st = await live_browser.stop()
+        await _publish_browser_state_event({"type": "stop"}, st)
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content=_scrub_and_verify(st, label="BrowserStatus"),
@@ -1505,19 +1708,29 @@ def create_app(
         if computer_gateway.is_human_takeover("default"):
             await websocket.close(code=4423, reason="Human takeover active")
             return
+        def _scrub_browser_ws_payload(payload: dict[str, Any]) -> dict[str, Any]:
+            cleaned = dict(payload)
+            if isinstance(cleaned.get("url"), str):
+                cleaned["url"] = _scrub_browser_str(cleaned["url"])
+            if isinstance(cleaned.get("title"), str):
+                cleaned["title"] = _scrub_browser_str(cleaned["title"])
+            return cleaned
+
         await websocket.accept()
-        await websocket.send_json({"type": "status", **(await live_browser.status())})
+        await websocket.send_json(
+            _scrub_browser_ws_payload({"type": "status", **(await live_browser.status())})
+        )
         initial_frame = await live_browser.capture_frame()
         if initial_frame is not None:
-            await websocket.send_json(initial_frame)
+            await websocket.send_json(_scrub_browser_ws_payload(initial_frame))
 
         async def _send_state_and_frame() -> None:
-            st = await live_browser.status()
-            await websocket.send_json({"type": "status", **st})
+            st = _scrub_browser_ws_payload({"type": "status", **(await live_browser.status())})
+            await websocket.send_json(st)
             if st.get("running"):
                 frame = await live_browser.capture_frame()
                 if frame is not None:
-                    await websocket.send_json(frame)
+                    await websocket.send_json(_scrub_browser_ws_payload(frame))
 
         mutating_browser_ops = frozenset(
             {
@@ -1579,12 +1792,14 @@ def create_app(
                         await live_browser.handle_input(msg)
                     await _send_state_and_frame()
                 except ValueError as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    await websocket.send_json(
+                        {"type": "error", "message": _scrub_browser_str(str(exc))}
+                    )
                 except Exception as exc:  # noqa: BLE001
                     await websocket.send_json(
                         {
                             "type": "error",
-                            "message": str(_scrub_and_verify(str(exc), label="ws_error")),
+                            "message": _scrub_browser_str(str(exc)),
                         }
                     )
 
@@ -1594,7 +1809,7 @@ def create_app(
                 if live_browser.running:
                     frame = await live_browser.capture_frame()
                     if frame is not None:
-                        await websocket.send_json(frame)
+                        await websocket.send_json(_scrub_browser_ws_payload(frame))
 
         reader_task = asyncio.create_task(_reader())
         ticker_task = asyncio.create_task(_ticker())
@@ -1627,7 +1842,12 @@ def create_app(
             try:
                 cwd = resolve_project_dir(default_projects_root(), project_name)
             except ValueError as exc:
-                await websocket.send_json({"type": "error", "message": str(exc)})
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "message": str(_scrub_and_verify(str(exc), label="error")),
+                    }
+                )
                 await websocket.close(code=1008)
                 return
         else:

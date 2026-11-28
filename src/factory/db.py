@@ -139,6 +139,18 @@ class FactoryStore:
         finally:
             conn.close()
 
+    @contextmanager
+    def write_tx(self) -> Iterator[sqlite3.Connection]:
+        """Public locked write transaction context manager."""
+        with self._write_tx() as conn:
+            yield conn
+
+    @contextmanager
+    def read_tx(self) -> Iterator[sqlite3.Connection]:
+        """Public read-only transaction context manager."""
+        with self._read_tx() as conn:
+            yield conn
+
     def init_db(self) -> None:
         """Create isolated factory schema with 0o700 dir / 0o600 file permissions."""
         parent = self._db_path.parent
@@ -268,6 +280,138 @@ class FactoryStore:
                     decision TEXT NOT NULL,
                     detail_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qa_campaigns (
+                    campaign_id TEXT PRIMARY KEY,
+                    base_sha TEXT NOT NULL,
+                    last_accepted_sha TEXT,
+                    qa_branch TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qa_items (
+                    item_id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES qa_campaigns(campaign_id),
+                    factory_item_id TEXT UNIQUE REFERENCES factory_backlog(item_id),
+                    parent_item_id TEXT REFERENCES qa_items(item_id),
+                    dedup_key TEXT NOT NULL,
+                    case_id TEXT NOT NULL,
+                    subsystem TEXT NOT NULL,
+                    normalized_signature TEXT NOT NULL,
+                    severity TEXT NOT NULL CHECK(severity IN ('P0', 'P1', 'P2', 'P3')),
+                    state TEXT NOT NULL CHECK(state IN (
+                        'observed', 'reproduced', 'flaky', 'in_repair',
+                        'candidate_verified', 'accepted_qa', 'blocked', 'parked'
+                    )),
+                    source TEXT NOT NULL DEFAULT 'e2e',
+                    summary TEXT NOT NULL,
+                    first_seen_sha TEXT NOT NULL,
+                    last_seen_sha TEXT NOT NULL,
+                    environment_lane TEXT NOT NULL,
+                    repro_command TEXT NOT NULL DEFAULT '',
+                    repro_test_path TEXT,
+                    blocked_reason TEXT,
+                    flaky_reason TEXT,
+                    next_diagnostic TEXT,
+                    occurrence_count INTEGER NOT NULL DEFAULT 1,
+                    pass_count INTEGER NOT NULL DEFAULT 0,
+                    fail_count INTEGER NOT NULL DEFAULT 1,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    run_ids_json TEXT NOT NULL DEFAULT '[]',
+                    correlation_ids_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_paths_json TEXT NOT NULL DEFAULT '[]',
+                    candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+                    payload_json TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    UNIQUE(campaign_id, dedup_key, environment_lane)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_qa_items_triage
+                    ON qa_items(
+                        campaign_id, state, severity, occurrence_count DESC, first_seen_at ASC
+                    );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qa_run_records (
+                    run_id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES qa_campaigns(campaign_id),
+                    case_id TEXT NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    candidate_sha TEXT,
+                    build_hash TEXT,
+                    lane TEXT NOT NULL,
+                    ui_variant TEXT NOT NULL,
+                    backend_mode TEXT NOT NULL,
+                    runtime_mode TEXT NOT NULL,
+                    emulated INTEGER NOT NULL,
+                    passed INTEGER NOT NULL,
+                    duration_ms REAL NOT NULL,
+                    simulated_services TEXT NOT NULL DEFAULT '[]',
+                    real_services TEXT NOT NULL DEFAULT '[]',
+                    assertions TEXT NOT NULL DEFAULT '{}',
+                    request_ids TEXT NOT NULL DEFAULT '[]',
+                    artifact_paths TEXT NOT NULL DEFAULT '[]',
+                    payload_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_qa_run_records_case_sha
+                    ON qa_run_records(campaign_id, case_id, base_sha, finished_at DESC);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qa_log_cursors (
+                    cursor_key TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES qa_campaigns(campaign_id),
+                    file_name TEXT NOT NULL,
+                    inode_dev INTEGER,
+                    inode_ino INTEGER,
+                    byte_offset INTEGER NOT NULL DEFAULT 0,
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    seen_diag_ids_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qa_candidates (
+                    candidate_id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES qa_campaigns(campaign_id),
+                    item_id TEXT NOT NULL REFERENCES qa_items(item_id),
+                    proposal_hash TEXT,
+                    base_sha TEXT NOT NULL,
+                    candidate_sha TEXT,
+                    branch_name TEXT NOT NULL,
+                    author_model TEXT,
+                    reviewer_model TEXT,
+                    auditor_model TEXT,
+                    status TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -861,6 +1005,150 @@ class FactoryStore:
                     now_iso,
                 ),
             )
+
+    def update_budget_limits(
+        self,
+        budget_id: str = "default",
+        *,
+        max_cycles: int | None = None,
+        max_attempts: int | None = None,
+    ) -> CycleBudget:
+        """Update budget limits while clamping >= used counters and preserving usage."""
+        now_iso = ensure_utc(self._clock()).isoformat()
+        with self._write_tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM factory_budgets WHERE budget_id = ?;",
+                (budget_id,),
+            ).fetchone()
+            if row is None:
+                target = CycleBudget(
+                    budget_id=budget_id,
+                    max_cycles=max(1, max_cycles or 4),
+                    max_attempts=max(1, max_attempts or 2),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO factory_budgets (
+                        budget_id, max_cycles, cycles_used, max_attempts, attempts_used,
+                        attempt_count, budget_used, max_wall_seconds, wall_seconds_used, updated_at
+                    ) VALUES (?, ?, 0, ?, 0, 0, 0, ?, 0.0, ?);
+                    """,
+                    (
+                        target.budget_id,
+                        target.max_cycles,
+                        target.max_attempts,
+                        target.max_wall_seconds,
+                        now_iso,
+                    ),
+                )
+                return target
+            cycles_used = int(row["cycles_used"])
+            attempts_used = int(row["attempts_used"])
+            new_max_cycles = (
+                max(1, cycles_used, max_cycles)
+                if max_cycles is not None
+                else int(row["max_cycles"])
+            )
+            new_max_attempts = (
+                max(1, attempts_used, max_attempts)
+                if max_attempts is not None
+                else int(row["max_attempts"])
+            )
+            conn.execute(
+                """
+                UPDATE factory_budgets
+                SET max_cycles = ?, max_attempts = ?, updated_at = ?
+                WHERE budget_id = ?;
+                """,
+                (new_max_cycles, new_max_attempts, now_iso, budget_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM factory_budgets WHERE budget_id = ?;",
+                (budget_id,),
+            ).fetchone()
+            assert updated is not None
+            return self._row_to_budget(updated)
+
+    def list_leases(self, item_id: str | None = None) -> list[FactoryLease]:
+        with self._read_tx() as conn:
+            if item_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM factory_leases WHERE item_id = ? ORDER BY generation ASC;",
+                    (item_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM factory_leases ORDER BY item_id ASC, generation ASC;"
+                ).fetchall()
+        return [self._row_to_lease(r) for r in rows]
+
+    def get_latest_lease(self, item_id: str) -> FactoryLease | None:
+        with self._read_tx() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM factory_leases
+                WHERE item_id = ?
+                ORDER BY generation DESC
+                LIMIT 1;
+                """,
+                (item_id,),
+            ).fetchone()
+        return self._row_to_lease(row) if row is not None else None
+
+    def get_latest_manifest(self, candidate_id: str) -> RollbackManifest | None:
+        with self._read_tx() as conn:
+            row = conn.execute(
+                """
+                SELECT manifest_json FROM factory_manifests
+                WHERE candidate_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1;
+                """,
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RollbackManifest.model_validate_json(str(row["manifest_json"]))
+
+    def list_manifests(self) -> list[RollbackManifest]:
+        with self._read_tx() as conn:
+            rows = conn.execute(
+                "SELECT manifest_json FROM factory_manifests ORDER BY created_at ASC;"
+            ).fetchall()
+        return [RollbackManifest.model_validate_json(str(r["manifest_json"])) for r in rows]
+
+    def record_promoted_manifest(
+        self,
+        manifest: RollbackManifest,
+        *,
+        mark_item_completed: str | None = None,
+    ) -> None:
+        now_iso = ensure_utc(self._clock()).isoformat()
+        manifest_id = f"fman-{manifest.candidate_id}-{uuid.uuid4().hex[:8]}"
+        with self._write_tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO factory_manifests (
+                    manifest_id, candidate_id, previous_commit, new_commit,
+                    manifest_json, rolled_back, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?);
+                """,
+                (
+                    manifest_id,
+                    manifest.candidate_id,
+                    manifest.previous_commit,
+                    manifest.new_commit,
+                    manifest.model_dump_json(),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            if mark_item_completed is not None:
+                conn.execute(
+                    "UPDATE factory_backlog SET status = 'completed', updated_at = ? "
+                    "WHERE item_id = ?;",
+                    (now_iso, mark_item_completed),
+                )
 
     def append_audit_log(
         self,

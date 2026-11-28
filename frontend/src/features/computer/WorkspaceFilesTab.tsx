@@ -229,6 +229,7 @@ export const WorkspaceFilesTab: React.FC<WorkspaceFilesTabProps> = ({
                 <ChevronRight size={12} style={{ color: 'var(--text-muted)' }} />
                 <button
                   type="button"
+                  aria-label={`Open folder ${seg}`}
                   onClick={() => setRelPath(target)}
                   className="px-1.5 py-0.5 rounded hover:bg-[var(--bg-subtle)]"
                   style={{ color: 'var(--text-primary)' }}
@@ -263,6 +264,7 @@ export const WorkspaceFilesTab: React.FC<WorkspaceFilesTabProps> = ({
             >
               <button
                 type="button"
+                aria-label={`${entry.name}`}
                 onClick={() => {
                   if (entry.is_dir) {
                     setRelPath(entry.rel_path);
@@ -356,6 +358,7 @@ export const WorkspaceFilesTab: React.FC<WorkspaceFilesTabProps> = ({
             <>
               <textarea
                 rows={18}
+                aria-label="File content editor"
                 value={fileDraft}
                 onChange={(e) => setFileDraft(e.target.value)}
                 className="w-full p-3.5 rounded-xl text-[12.5px] font-mono leading-relaxed outline-none resize-y"
@@ -388,6 +391,7 @@ export const WorkspaceFilesTab: React.FC<WorkspaceFilesTabProps> = ({
                   </button>
                   <button
                     type="button"
+                    aria-label="Save file"
                     disabled={writeFileMutation.isPending || !previewPath}
                     onClick={() =>
                       previewPath &&

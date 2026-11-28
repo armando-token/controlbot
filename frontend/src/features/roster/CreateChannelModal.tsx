@@ -118,6 +118,7 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({ bots }) 
                   <button
                     key={bot.id}
                     type="button"
+                    aria-label={`${bot.name}`}
                     onClick={() => toggleBot(bot.id)}
                     className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors"
                     style={{
@@ -178,6 +179,7 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({ bots }) 
           </button>
           <button
             type="submit"
+            aria-label="Create group chat"
             disabled={!canSubmit || createMutation.isPending}
             className="px-4 py-2 text-[13px] font-medium rounded-lg transition-opacity disabled:opacity-45"
             style={{

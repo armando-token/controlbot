@@ -569,6 +569,7 @@ export const SettingsDialog: React.FC = () => {
               <button
                 key={t.id}
                 type="button"
+                aria-label={`${t.label}`}
                 onClick={() => setTab(t.id)}
                 className="flex items-center gap-2 px-3 py-2 rounded-xl text-[13px] font-medium whitespace-nowrap transition-colors"
                 style={{
@@ -607,6 +608,7 @@ export const SettingsDialog: React.FC = () => {
                     <button
                       key={opt.id}
                       type="button"
+                      aria-label={`${opt.label}`}
                       onClick={() => handleThemeChange(opt.id)}
                       className="px-3 py-2 rounded-xl text-[13px] font-medium transition-colors"
                       style={{
@@ -637,6 +639,7 @@ export const SettingsDialog: React.FC = () => {
                       <button
                         key={opt.id}
                         type="button"
+                        aria-label={`${opt.label}`}
                         onClick={() => handleAccentChange(opt.id)}
                         className="px-3 py-2 rounded-xl text-[13px] font-medium"
                         style={{
@@ -919,6 +922,7 @@ export const SettingsDialog: React.FC = () => {
                       <span>{toggle.label}</span>
                       <input
                         type="checkbox"
+                        aria-label={`${toggle.label}`}
                         checked={toggle.checked}
                         onChange={(e) => {
                           const next = e.target.checked;

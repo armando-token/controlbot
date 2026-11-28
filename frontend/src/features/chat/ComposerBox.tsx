@@ -107,10 +107,12 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const sendAbortRef = useRef<AbortController | null>(null);
   const prevDictationNonceRef = useRef(dictationToggleNonce);
 
   const [uploading, setUploading] = useState(false);
   const [dictating, setDictating] = useState(false);
+  const [stoppingPendingSend, setStoppingPendingSend] = useState(false);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionIdx, setMentionIdx] = useState(0);
   const [overrideModelId, setOverrideModelId] = useState<string>('');
@@ -329,22 +331,33 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
   }, [mentionQuery, allBots, allChannels, skillsQuery.data, routinesQuery.data, appsQuery.data]);
 
   const sendMutation = useMutation({
-    mutationFn: (payload: {
-      content: string;
-      reply_to_id: string | null;
-      mentions: string[];
-      attachment_ids: string[];
-      page_context_id: string | null;
-      override_model_id?: string | null;
-      override_thinking_level?: string | null;
-      include_browser_context?: boolean | null;
-    }) => threadsApi.send(threadId, payload),
+    mutationFn: ({
+      payload,
+      signal,
+    }: {
+      payload: {
+        content: string;
+        reply_to_id: string | null;
+        mentions: string[];
+        attachment_ids: string[];
+        page_context_id: string | null;
+        override_model_id?: string | null;
+        override_thinking_level?: string | null;
+        include_browser_context?: boolean | null;
+      };
+      signal?: AbortSignal;
+    }) => threadsApi.send(threadId, payload, { signal }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['thread-messages', threadId] });
       void queryClient.invalidateQueries({ queryKey: ['roster'] });
     },
     onError: (err: Error) => {
+      if (err.name === 'AbortError') return;
       pushToast({ tone: 'error', title: 'Could not send message', description: err.message });
+    },
+    onSettled: () => {
+      sendAbortRef.current = null;
+      setStoppingPendingSend(false);
     },
   });
 
@@ -422,18 +435,34 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
     setReplyTo(threadId, null);
     setMentionQuery(null);
 
+    const controller = new AbortController();
+    sendAbortRef.current = controller;
+
     sendMutation.mutate({
-      content: trimmed || '(Attachment)',
-      reply_to_id: replyId,
-      mentions,
-      attachment_ids: attachmentIds,
-      page_context_id: pageContextId ?? null,
-      ...(overrideModelId ? { override_model_id: overrideModelId } : {}),
-      ...(overrideThinkingLevel ? { override_thinking_level: overrideThinkingLevel } : {}),
-      ...(includeBrowserContext !== null
-        ? { include_browser_context: includeBrowserContext }
-        : {}),
+      payload: {
+        content: trimmed || '(Attachment)',
+        reply_to_id: replyId,
+        mentions,
+        attachment_ids: attachmentIds,
+        page_context_id: pageContextId ?? null,
+        ...(overrideModelId ? { override_model_id: overrideModelId } : {}),
+        ...(overrideThinkingLevel ? { override_thinking_level: overrideThinkingLevel } : {}),
+        ...(includeBrowserContext !== null
+          ? { include_browser_context: includeBrowserContext }
+          : {}),
+      },
+      signal: controller.signal,
     });
+  };
+
+  const handleStop = () => {
+    if (sendMutation.isPending) {
+      setStoppingPendingSend(true);
+      sendAbortRef.current?.abort();
+      interruptMutation.mutate();
+      return;
+    }
+    interruptMutation.mutate();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -478,7 +507,11 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
         : 'Send a message…';
 
   const canSend = draft.trim().length > 0 || attachments.length > 0;
-  const isRunning = Boolean(activeTurn);
+  const isRunning = Boolean(activeTurn) || sendMutation.isPending;
+  const dictationTitle = dictating
+    ? 'Stop voice dictation (Cmd/Ctrl+D)'
+    : 'Voice dictation (Cmd/Ctrl+D)';
+  const dictationLabel = dictating ? 'Stop voice dictation' : 'Start voice dictation';
 
   return (
     <div className="px-4 sm:px-6 pb-4 pt-2 shrink-0">
@@ -503,6 +536,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
               <button
                 key={item.id}
                 type="button"
+                aria-label={`${item.label}`}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   insertMention(item);
@@ -633,8 +667,8 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
           />
 
           {/* Bottom Controls */}
-          <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 pb-2.5 pt-1">
-            <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+          <div className="flex items-center justify-between gap-1.5 px-2.5 pb-2.5 pt-1">
+            <div className="flex items-center gap-0.5 xl:gap-1 min-w-0 flex-1 overflow-hidden">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -648,7 +682,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
                 onClick={() => fileInputRef.current?.click()}
                 title="Attach files"
                 aria-label="Attach files"
-                className="p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+                className="shrink-0 p-1 xl:p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-subtle)] disabled:opacity-50"
                 style={{ color: 'var(--text-secondary)' }}
               >
                 {uploading ? (
@@ -661,10 +695,10 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
               <button
                 type="button"
                 onClick={toggleDictation}
-                title={dictating ? 'Stop voice dictation (Cmd/Ctrl+D)' : 'Voice dictation (Cmd/Ctrl+D)'}
-                aria-label={dictating ? 'Stop voice dictation' : 'Start voice dictation'}
+                title={`${dictationTitle}`}
+                aria-label={`${dictationLabel}`}
                 aria-pressed={dictating}
-                className="p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-subtle)]"
+                className="shrink-0 p-1 xl:p-1.5 rounded-lg transition-colors hover:bg-[var(--bg-subtle)]"
                 style={{
                   backgroundColor: dictating ? 'var(--status-danger-bg)' : 'transparent',
                   color: dictating ? 'var(--status-danger)' : 'var(--text-secondary)',
@@ -683,7 +717,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
                 title="Per-turn model override"
                 value={overrideModelId}
                 onChange={(e) => setOverrideModelId(e.target.value)}
-                className="max-w-[140px] px-2 py-1 rounded-lg text-[11.5px] outline-none cursor-pointer truncate"
+                className="min-w-0 shrink max-w-[74px] xl:max-w-[116px] px-1 xl:px-1.5 py-1 rounded-lg text-[11.5px] outline-none cursor-pointer truncate"
                 style={{
                   backgroundColor: overrideModelId ? 'var(--bg-active)' : 'var(--bg-subtle)',
                   color: overrideModelId ? 'var(--text-primary)' : 'var(--text-secondary)',
@@ -703,7 +737,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
                 title="Per-turn thinking level override"
                 value={overrideThinkingLevel}
                 onChange={(e) => setOverrideThinkingLevel(e.target.value as ThinkingLevel | '')}
-                className="px-2 py-1 rounded-lg text-[11.5px] outline-none cursor-pointer"
+                className="min-w-0 shrink max-w-[74px] xl:max-w-[112px] px-1 xl:px-1.5 py-1 rounded-lg text-[11.5px] outline-none cursor-pointer truncate"
                 style={{
                   backgroundColor: overrideThinkingLevel ? 'var(--bg-active)' : 'var(--bg-subtle)',
                   color: overrideThinkingLevel ? 'var(--text-primary)' : 'var(--text-secondary)',
@@ -719,7 +753,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
               </select>
 
               <div
-                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11.5px]"
+                className="inline-flex items-center gap-0.5 xl:gap-1 px-1 xl:px-1.5 py-1 rounded-lg text-[11.5px] min-w-0 shrink max-w-[92px] xl:max-w-none"
                 style={{
                   backgroundColor:
                     includeBrowserContext === true
@@ -734,7 +768,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
                   border: '1px solid var(--border-subtle)',
                 }}
               >
-                <Globe size={12} strokeWidth={1.75} />
+                <Globe size={12} strokeWidth={1.75} className="shrink-0" />
                 <select
                   aria-label="Include browser context for this message"
                   title="Per-turn browser context"
@@ -751,7 +785,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
                       val === 'default' ? null : val === 'on',
                     );
                   }}
-                  className="bg-transparent outline-none cursor-pointer text-[11.5px]"
+                  className="min-w-0 w-full max-w-[68px] xl:max-w-[106px] bg-transparent outline-none cursor-pointer text-[11.5px] truncate"
                 >
                   <option value="default">Browser: Default</option>
                   <option value="on">Browser: On</option>
@@ -760,7 +794,7 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
               </div>
 
               <span
-                className="text-[11.5px] hidden lg:inline ml-0.5"
+                className="text-[11.5px] hidden 2xl:inline ml-0.5 shrink-0"
                 style={{ color: 'var(--text-muted)' }}
               >
                 @ to mention
@@ -771,8 +805,8 @@ export const ComposerBox: React.FC<ComposerBoxProps> = ({
               {isRunning && (
                 <button
                   type="button"
-                  onClick={() => interruptMutation.mutate()}
-                  disabled={interruptMutation.isPending}
+                  onClick={handleStop}
+                  disabled={interruptMutation.isPending || stoppingPendingSend}
                   title="Stop current generation"
                   aria-label="Stop current generation"
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[12.5px] font-medium transition-opacity hover:opacity-90"

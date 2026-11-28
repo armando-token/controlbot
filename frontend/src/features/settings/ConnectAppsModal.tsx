@@ -220,8 +220,12 @@ export const ConnectAppsModal: React.FC = () => {
                     >
                       <SlidersHorizontal size={14} strokeWidth={1.75} />
                     </button>
+                    {(() => {
+                      const connLabel = app.connected ? 'Connected' : 'Connect';
+                      return (
                     <button
                       type="button"
+                      aria-label={`${connLabel}`}
                       disabled={isRowPending}
                       onClick={() =>
                         updateMutation.mutate({
@@ -245,6 +249,8 @@ export const ConnectAppsModal: React.FC = () => {
                       {app.connected && <Check size={13} strokeWidth={2.3} />}
                       {app.connected ? 'Connected' : 'Connect'}
                     </button>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -325,6 +331,7 @@ export const ConnectAppsModal: React.FC = () => {
                       </button>
                       <button
                         type="submit"
+                        aria-label="Save"
                         disabled={isRowPending}
                         className="px-3 py-1 rounded-lg text-[12px] font-medium disabled:opacity-50"
                         style={{

@@ -372,6 +372,13 @@ def create_v1_router(
                 )
         settings = store.get_settings()
         sender_name = str(settings.get("display_name") or "You")
+        msg_meta: dict[str, Any] | None = None
+        if payload.facility_id is not None or payload.allowed_areas:
+            msg_meta = {}
+            if payload.facility_id is not None:
+                msg_meta["facility_id"] = payload.facility_id
+            if payload.allowed_areas:
+                msg_meta["allowed_areas"] = list(payload.allowed_areas)
         user_msg = store.create_message(
             thread_id=thread_id,
             sender_type="user",
@@ -381,6 +388,7 @@ def create_v1_router(
             reply_to_id=payload.reply_to_id,
             mentions=payload.mentions,
             attachment_ids=payload.attachment_ids,
+            metadata=msg_meta,
             status="done",
         )
         turn_id = runner.start_turn(
@@ -391,6 +399,8 @@ def create_v1_router(
             thinking_level=payload.thinking_level,
             skill_ids=payload.skill_ids,
             page_context_id=payload.page_context_id,
+            facility_id=payload.facility_id,
+            allowed_areas=payload.allowed_areas,
         )
         return _json_response(
             {
@@ -1426,8 +1436,7 @@ def create_v1_router(
             event_bus.stream_sse(effective_last_id, keepalive_seconds=15.0),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+                "Cache-Control": "no-cache, no-transform",
                 "X-Accel-Buffering": "no",
             },
         )

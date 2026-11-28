@@ -56,15 +56,12 @@ export const useComputerStore = create<ComputerState>((set) => ({
       const vmKey = status.vm_id || 'default';
       const vncUnavailable = !status.vnc_available;
       let nextPreferred = s.preferredSource;
-      if (vncUnavailable && s.preferredSource === 'vnc' && !s.hasExplicitSourceChoice) {
-        nextPreferred = 'screencast';
-      } else if (
-        !vncUnavailable &&
-        status.display_mode === 'vnc' &&
-        s.preferredSource === 'screencast' &&
-        !s.hasExplicitSourceChoice
-      ) {
-        nextPreferred = 'vnc';
+      if (!s.hasExplicitSourceChoice) {
+        if (vncUnavailable || status.browser_running) {
+          nextPreferred = 'screencast';
+        } else if (status.display_mode === 'vnc' && s.preferredSource === 'screencast') {
+          nextPreferred = 'vnc';
+        }
       }
       return {
         byVmId: {

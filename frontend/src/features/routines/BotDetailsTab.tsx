@@ -541,6 +541,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
             >
               <button
                 type="button"
+                aria-label={`${m.name}`}
                 onClick={() =>
                   setActiveTarget({ kind: 'bot', id: m.id, threadId: m.thread_id })
                 }
@@ -588,6 +589,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
               <button
                 key={candidate.id}
                 type="button"
+                aria-label={`Add ${candidate.name} to channel`}
                 onClick={() =>
                   updateChannelMutation.mutate({
                     bot_ids: [...channel.bot_ids, candidate.id],
@@ -631,6 +633,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
     secretVal || secretUsername.trim() || Object.keys(buildVaultFields()).length > 0,
   );
   const canSubmitSkill = Boolean(skillName.trim() && (skillMd.trim() || skillDesc.trim()));
+  const avatarBtnLabel = avatarEditorOpen ? 'Done editing avatar' : 'Customize avatar';
 
   return (
     <div className="h-full overflow-y-auto p-4 space-y-5">
@@ -662,6 +665,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
             </div>
             <button
               type="button"
+              aria-label={`${avatarBtnLabel}`}
               onClick={() => setAvatarEditorOpen((v) => !v)}
               className="text-[11.5px] mt-0.5 hover:underline"
               style={{ color: 'var(--accent-computer)' }}
@@ -717,6 +721,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
             <label className="inline-flex items-center gap-2 text-[12px] cursor-pointer">
               <input
                 type="checkbox"
+                aria-label="Larger expressive eyes"
                 checked={effectiveEyesLarge}
                 onChange={(e) => {
                   const next = e.target.checked;
@@ -805,6 +810,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
             <span style={{ color: 'var(--text-secondary)' }}>Hold outbound drafts for approval</span>
             <input
               type="checkbox"
+              aria-label="Hold outbound drafts for approval"
               checked={effectiveDraftsEnabled}
               onChange={(e) => {
                 const next = e.target.checked;
@@ -845,6 +851,10 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
           <div className="space-y-1.5">
             {(routinesQuery.data?.routines ?? []).map((rtn) => {
               const effectiveEnabled = optimisticRoutines[rtn.id] ?? rtn.enabled;
+              const toggleAria = effectiveEnabled
+                ? `Pause routine ${rtn.name}`
+                : `Resume routine ${rtn.name}`;
+              const toggleTitle = effectiveEnabled ? 'Pause routine' : 'Resume routine';
               return (
               <div
                 key={rtn.id}
@@ -857,6 +867,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
                 <div className="flex items-start justify-between gap-2">
                   <button
                     type="button"
+                    aria-label={`Inspect routine ${rtn.name}`}
                     onClick={() => {
                       setRoutineEditInitial(false);
                       setSelectedRoutineId(rtn.id);
@@ -897,14 +908,14 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
 
                   <input
                     type="checkbox"
-                    aria-label={effectiveEnabled ? `Pause routine ${rtn.name}` : `Resume routine ${rtn.name}`}
+                    aria-label={`${toggleAria}`}
                     checked={effectiveEnabled}
                     onChange={(e) => {
                       const next = e.target.checked;
                       setOptimisticRoutines((prev) => ({ ...prev, [rtn.id]: next }));
                       toggleRoutineMutation.mutate({ id: rtn.id, enabled: next });
                     }}
-                    title={effectiveEnabled ? 'Pause routine' : 'Resume routine'}
+                    title={`${toggleTitle}`}
                     className="mt-1 cursor-pointer"
                   />
                 </div>
@@ -1294,6 +1305,7 @@ export const BotDetailsTab: React.FC<BotDetailsTabProps> = ({
       <div className="pt-3" style={{ borderTop: '1px solid var(--border-subtle)' }}>
         <button
           type="button"
+          aria-label="Share and create template copy"
           onClick={() => cloneTemplateMutation.mutate()}
           disabled={cloneTemplateMutation.isPending}
           className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-[12.5px] font-medium transition-colors hover:bg-[var(--bg-active)]"

@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import time
 from collections.abc import AsyncGenerator
@@ -21,7 +22,9 @@ _UUID_RE = re.compile(
 )
 _CONV_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 _USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
-_INLINE_TOKEN_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pou]_[A-Za-z0-9_]{8,})\b")
+_INLINE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b"
+)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _MODEL_LINE_RE = re.compile(r"^([a-z0-9][a-z0-9._-]+)\s+(.+)$")
 _SKIP_DIR_NAMES: frozenset[str] = frozenset(
@@ -41,6 +44,9 @@ _FALLBACK_MODELS: tuple[dict[str, Any], ...] = (
 _MODELS_CACHE_TTL_S = 120.0
 _models_cache: tuple[float, list[dict[str, Any]]] | None = None
 _MAX_STDERR_BYTES = 64 * 1024
+_AGY_TRUNCATION_ELLIPSIS = "\u2026"
+_AGY_TRUNCATION_MIN_LEN = 64
+_MAX_TRANSCRIPT_TAIL_BYTES = 2 * 1024 * 1024
 
 
 def _default_local_base_url() -> str:
@@ -309,18 +315,324 @@ def build_agy_prompt_with_browser_context(
     return "\n".join(lines)
 
 
-def _summarize_tool_params(params: Any) -> str:
-    if not isinstance(params, dict) or not params:
-        return ""
-    for key in ("toolSummary", "CommandLine", "url", "Path", "Query", "SearchQuery"):
-        raw = params.get(key)
-        if raw is None:
+_COMMAND_PARAM_KEYS: tuple[str, ...] = (
+    "CommandLine",
+    "command",
+    "cmd",
+    "command_line",
+    "cmdline",
+    "script",
+    "code",
+    "shell",
+    "bash",
+    "argv",
+)
+_COMMAND_PARAM_KEYS_LOWER: tuple[str, ...] = tuple(k.lower() for k in _COMMAND_PARAM_KEYS)
+_NESTED_COMMAND_CONTAINER_KEYS_LOWER: tuple[str, ...] = (
+    "tool_info",
+    "parameters",
+    "arguments",
+    "args",
+    "input",
+    "payload",
+    "data",
+)
+_LIST_COMMAND_CONTAINER_KEYS_LOWER: frozenset[str] = frozenset(
+    {"args", "arguments", "input", "payload", "data"}
+)
+_SUMMARY_PARAM_KEYS: tuple[str, ...] = (
+    "toolSummary",
+    "CommandLine",
+    "command",
+    "cmd",
+    "command_line",
+    "cmdline",
+    "script",
+    "code",
+    "shell",
+    "bash",
+    "argv",
+    "url",
+    "Path",
+    "Query",
+    "SearchQuery",
+)
+_SUMMARY_PARAM_KEYS_LOWER: tuple[str, ...] = tuple(k.lower() for k in _SUMMARY_PARAM_KEYS)
+
+
+def _decode_tool_params(params: Any) -> dict[str, Any] | None:
+    if isinstance(params, dict):
+        return params or None
+    if isinstance(params, str):
+        stripped = params.strip()
+        if stripped.startswith("{"):
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                decoded = json.loads(stripped)
+                if isinstance(decoded, dict) and decoded:
+                    return decoded
+    return None
+
+
+def _lookup_param_case_insensitive(
+    params: dict[str, Any],
+    preferred_keys: tuple[str, ...],
+    lowered_keys: tuple[str, ...],
+) -> Any:
+    for key in preferred_keys:
+        if key in params and params[key] is not None:
+            return params[key]
+    lowered_map = {str(k).lower(): v for k, v in params.items() if v is not None}
+    for low_key in lowered_keys:
+        if low_key in lowered_map:
+            return lowered_map[low_key]
+    return None
+
+
+def _normalize_command_values(raw: Any, *, depth: int = 0) -> list[str]:
+    if raw is None or isinstance(raw, bool) or depth > 4:
+        return []
+    if isinstance(raw, dict):
+        return _extract_tool_commands_from_dict(raw, depth=depth + 1)
+    if isinstance(raw, (list, tuple)):
+        if raw and all(isinstance(item, dict) for item in raw):
+            out_m: list[str] = []
+            seen_m: set[str] = set()
+            for item in raw:
+                for found_m in _extract_tool_commands_from_dict(item, depth=depth + 1):
+                    if found_m not in seen_m:
+                        seen_m.add(found_m)
+                        out_m.append(found_m)
+            return out_m
+        parts = [str(item) for item in raw if item is not None]
+        if not parts or not any(part.strip() for part in parts):
+            return []
+        joined = shlex.join(parts).strip()
+        return [joined] if joined else []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if len(text) >= 2 and (
+            (text[0] == '"' and text[-1] == '"')
+            or (text[0] == "[" and text[-1] == "]")
+            or (text[0] == "{" and text[-1] == "}")
+        ):
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                decoded = json.loads(text)
+                if isinstance(decoded, (str, list, tuple, dict)):
+                    nested = _normalize_command_values(decoded, depth=depth + 1)
+                    if nested:
+                        return nested
+        return [text]
+    text = str(raw).strip()
+    return [text] if text else []
+
+
+def _normalize_command_value(raw: Any, *, depth: int = 0) -> str | None:
+    vals = _normalize_command_values(raw, depth=depth)
+    return vals[0] if vals else None
+
+
+def _extract_list_command_values(raw: Any, *, depth: int = 0) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return _normalize_command_values(raw, depth=depth)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if len(stripped) >= 2 and stripped[0] == "[" and stripped[-1] == "]":
+            with contextlib.suppress(json.JSONDecodeError, ValueError):
+                decoded = json.loads(stripped)
+                if isinstance(decoded, list):
+                    return _normalize_command_values(decoded, depth=depth)
+    return []
+
+
+def _extract_list_command_value(raw: Any, *, depth: int = 0) -> str | None:
+    vals = _extract_list_command_values(raw, depth=depth)
+    return vals[0] if vals else None
+
+
+def _extract_tool_commands_from_dict(parsed: dict[str, Any], *, depth: int = 0) -> list[str]:
+    if depth > 4:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add_vals(vals: list[str]) -> None:
+        for item in vals:
+            if item not in seen:
+                seen.add(item)
+                found.append(item)
+
+    for key in _COMMAND_PARAM_KEYS:
+        if key in parsed and parsed[key] is not None:
+            _add_vals(_normalize_command_values(parsed[key], depth=depth + 1))
+    for low_key in _COMMAND_PARAM_KEYS_LOWER:
+        for k, v in parsed.items():
+            if v is not None and str(k).lower() == low_key:
+                _add_vals(_normalize_command_values(v, depth=depth + 1))
+    for container_low in _NESTED_COMMAND_CONTAINER_KEYS_LOWER:
+        for k, v in parsed.items():
+            if v is not None and str(k).lower() == container_low:
+                nested = _decode_tool_params(v)
+                if nested:
+                    _add_vals(_extract_tool_commands_from_dict(nested, depth=depth + 1))
+                elif container_low in _LIST_COMMAND_CONTAINER_KEYS_LOWER:
+                    _add_vals(_extract_list_command_values(v, depth=depth + 1))
+    return found
+
+
+def _extract_tool_command_from_dict(parsed: dict[str, Any], *, depth: int = 0) -> str | None:
+    cmds = _extract_tool_commands_from_dict(parsed, depth=depth)
+    return cmds[0] if cmds else None
+
+
+def _extract_tool_commands(params: Any) -> list[str]:
+    """Extract all scrubbed command candidates from agy tool parameters for policy checks."""
+    parsed = _decode_tool_params(params)
+    if not parsed:
+        return []
+    cmds = _extract_tool_commands_from_dict(parsed, depth=0)
+    out: list[str] = []
+    seen: set[str] = set()
+    for cmd in cmds:
+        scrubbed = _scrub_text(cmd)
+        if scrubbed and scrubbed not in seen:
+            seen.add(scrubbed)
+            out.append(scrubbed)
+    return out
+
+
+def _extract_tool_command(params: Any) -> str | None:
+    """Extract the full, untruncated shell command from agy tool parameters for policy checks."""
+    cmds = _extract_tool_commands(params)
+    return cmds[0] if cmds else None
+
+
+def _lookup_untruncated_agy_command(
+    conversation_id: str,
+    truncated_cmd: str,
+    *,
+    step_index: int | None = None,
+    brain_root: Path | None = None,
+) -> str | None:
+    """Hydrate a `…`-truncated agy stream-json command from the local agy transcript."""
+    if not truncated_cmd.endswith(_AGY_TRUNCATION_ELLIPSIS):
+        return None
+    if len(truncated_cmd) < _AGY_TRUNCATION_MIN_LEN:
+        return None
+    cid = conversation_id.strip()
+    if not cid or _CONV_ID_RE.fullmatch(cid) is None:
+        return None
+    prefix = truncated_cmd[:-1]
+    if not prefix:
+        return None
+    try:
+        root = (brain_root if brain_root is not None else default_agy_brain_root()).resolve()
+        conv_dir = (root / cid).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not conv_dir.is_relative_to(root) or conv_dir == root or not conv_dir.is_dir():
+        return None
+
+    fallback_match: str | None = None
+    for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+        try:
+            log_path = (conv_dir / ".system_generated" / "logs" / fname).resolve()
+        except (OSError, RuntimeError):
             continue
+        if not log_path.is_relative_to(conv_dir) or not log_path.is_file():
+            continue
+        try:
+            size = log_path.stat().st_size
+            with log_path.open("rb") as handle:
+                if size > _MAX_TRANSCRIPT_TAIL_BYTES:
+                    handle.seek(size - _MAX_TRANSCRIPT_TAIL_BYTES)
+                    handle.readline()
+                raw_text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+
+        for raw_line in reversed(raw_text.splitlines()):
+            line = raw_line.strip()
+            if not line or "tool_calls" not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            tool_calls = entry.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            entry_step = entry.get("step_index")
+            step_matches = (
+                step_index is None
+                or (
+                    isinstance(entry_step, int)
+                    and not isinstance(entry_step, bool)
+                    and entry_step in {step_index, step_index - 1}
+                )
+            )
+            for tc in reversed(tool_calls):
+                if not isinstance(tc, dict):
+                    continue
+                for cand in _extract_tool_commands(tc.get("args")):
+                    if len(cand) <= len(prefix) or cand.endswith(_AGY_TRUNCATION_ELLIPSIS):
+                        continue
+                    redacted_cand = str(redact_payload_strict(cand))
+                    if cand.startswith(prefix) or redacted_cand.startswith(prefix):
+                        if step_matches:
+                            return redacted_cand
+                        if fallback_match is None:
+                            fallback_match = redacted_cand
+        if fallback_match is not None:
+            return fallback_match
+    return None
+
+
+def _hydrate_truncated_agy_commands(
+    cmds: list[str],
+    *,
+    conversation_id: str,
+    step_index: int | None = None,
+    brain_root: Path | None = None,
+) -> list[str]:
+    if not conversation_id or not any(c.endswith(_AGY_TRUNCATION_ELLIPSIS) for c in cmds):
+        return cmds
+    out: list[str] = []
+    seen: set[str] = set()
+    for cmd in cmds:
+        resolved = (
+            _lookup_untruncated_agy_command(
+                conversation_id,
+                cmd,
+                step_index=step_index,
+                brain_root=brain_root,
+            )
+            or cmd
+        )
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
+def _summarize_tool_params(params: Any) -> str:
+    parsed = _decode_tool_params(params)
+    if not parsed:
+        return ""
+    raw = _lookup_param_case_insensitive(
+        parsed,
+        _SUMMARY_PARAM_KEYS,
+        _SUMMARY_PARAM_KEYS_LOWER,
+    )
+    if raw is not None:
         cleaned = re.sub(r"\s+", " ", str(raw)).strip().strip('"')
         if cleaned:
             return _scrub_text(cleaned)[:120]
-    first_k = next(iter(params))
-    val = re.sub(r"\s+", " ", str(params[first_k])).strip()
+    first_k = next(iter(parsed))
+    val = re.sub(r"\s+", " ", str(parsed[first_k])).strip()
     return _scrub_text(f"{first_k}={val}")[:120]
 
 
@@ -357,13 +669,41 @@ def parse_agy_stream_event(raw_line: str) -> dict[str, Any] | None:
         if step_type == "tool":
             tool_info = _as_dict(su.get("tool_info"))
             tool_name = str(su.get("tool_name") or tool_info.get("name") or "tool")
+            tool_params = tool_info.get("parameters")
+            all_cmds: list[str] = []
+            seen_cmds: set[str] = set()
+            for cmd_source in (tool_params, tool_info, su):
+                for cmd_cand in _extract_tool_commands(cmd_source):
+                    if cmd_cand not in seen_cmds:
+                        seen_cmds.add(cmd_cand)
+                        all_cmds.append(cmd_cand)
+            raw_step_index = su.get("step_index")
+            step_index: int | None = None
+            if isinstance(raw_step_index, int) and not isinstance(raw_step_index, bool):
+                step_index = raw_step_index
+            elif isinstance(raw_step_index, str) and raw_step_index.strip():
+                with contextlib.suppress(ValueError):
+                    step_index = int(raw_step_index.strip())
+            step_conv_id = str(
+                su.get("conversation_id") or obj.get("conversation_id") or ""
+            ).strip()
+            if all_cmds and step_conv_id:
+                all_cmds = _hydrate_truncated_agy_commands(
+                    all_cmds,
+                    conversation_id=step_conv_id,
+                    step_index=step_index,
+                )
+            full_cmd = all_cmds[0] if all_cmds else None
             out = {
                 "type": "tool",
-                "step_index": int(su.get("step_index", 0)),
+                "step_index": step_index,
                 "state": str(su.get("state", "ACTIVE")),
                 "tool_name": _scrub_text(tool_name)[:60],
-                "summary": _summarize_tool_params(tool_info.get("parameters")),
+                "summary": _summarize_tool_params(tool_params),
             }
+            if full_cmd is not None:
+                out["command"] = full_cmd
+                out["commands"] = all_cmds
         elif step_type == "agent_response":
             delta = su.get("text_delta")
             if isinstance(delta, str) and delta:
@@ -562,6 +902,7 @@ async def stream_agy_prompt(
     deadline = time.monotonic() + float(bounded_timeout + 15)
     saw_done = False
     saw_error = False
+    active_cid = cleaned_cid or ""
     assert proc.stdout is not None
     assert proc.stderr is not None
 
@@ -589,6 +930,36 @@ async def stream_agy_prompt(
             parsed = parse_agy_stream_event(raw_line.decode("utf-8", errors="replace"))
             if parsed is None:
                 continue
+            if parsed.get("type") == "init":
+                init_cid = str(parsed.get("conversation_id") or "").strip()
+                if init_cid:
+                    active_cid = init_cid
+            elif parsed.get("type") == "tool" and active_cid:
+                raw_cmds = parsed.get("commands")
+                cmd_list = (
+                    [str(c) for c in raw_cmds if isinstance(c, str) and c]
+                    if isinstance(raw_cmds, list)
+                    else (
+                        [str(parsed["command"])]
+                        if isinstance(parsed.get("command"), str) and parsed["command"]
+                        else []
+                    )
+                )
+                if cmd_list and any(c.endswith(_AGY_TRUNCATION_ELLIPSIS) for c in cmd_list):
+                    raw_sidx = parsed.get("step_index")
+                    sidx = (
+                        raw_sidx
+                        if isinstance(raw_sidx, int) and not isinstance(raw_sidx, bool)
+                        else None
+                    )
+                    hydrated = _hydrate_truncated_agy_commands(
+                        cmd_list,
+                        conversation_id=active_cid,
+                        step_index=sidx,
+                    )
+                    if hydrated != cmd_list:
+                        parsed["command"] = hydrated[0]
+                        parsed["commands"] = hydrated
             if parsed.get("type") == "done":
                 parsed["model"] = cleaned_model
                 if not parsed.get("conversation_id") and cleaned_cid:

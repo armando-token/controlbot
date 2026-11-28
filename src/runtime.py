@@ -779,6 +779,18 @@ def make_industrial_turn_factory(
                     )
                 )
 
+        if not tool_map:
+            return EmulatedTurn(
+                decision=ModelDecision(
+                    decision_type="final",
+                    final_answer=(
+                        "No industrial tools were enabled for this turn. "
+                        "Please switch to a general chat engine or enable industrial tools."
+                    ),
+                    usage=usage,
+                )
+            )
+
         return EmulatedTurn(
             decision=ModelDecision(
                 decision_type="final",
@@ -900,7 +912,20 @@ class RuntimeCoordinatorAdapter:
 
     def submit_task(self, task_spec: TaskSpec) -> Run:
         effective_spec = task_spec
-        if not task_spec.scope.allowed_origins and self._facility_config is not None:
+        if (
+            self._facility_config is not None
+            and "__general_chat__" not in task_spec.scope.allowed_tools
+            and task_spec.scope.facility_id != self._facility_config.facility_id
+        ):
+            raise PlanValidationError(
+                f"TaskScope facility_id {task_spec.scope.facility_id!r} does not match "
+                f"configured facility {self._facility_config.facility_id!r}."
+            )
+        if (
+            not task_spec.scope.allowed_origins
+            and "__general_chat__" not in task_spec.scope.allowed_tools
+            and self._facility_config is not None
+        ):
             default_origins = tuple(
                 sorted(
                     {

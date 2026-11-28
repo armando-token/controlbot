@@ -178,7 +178,7 @@ export const AppShell: React.FC = () => {
   // Global Keyboard Shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.isComposing) return;
+      if (e.defaultPrevented || e.isComposing) return;
       const mod = e.metaKey || e.ctrlKey;
       const key = e.key.toLowerCase();
       const ui = useUiStore.getState();
@@ -321,9 +321,9 @@ export const AppShell: React.FC = () => {
           className="h-full flex flex-col items-center justify-center p-6 text-center space-y-3"
           style={{ backgroundColor: 'var(--bg-canvas)' }}
         >
-          <div className="text-[16px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+          <h1 className="m-0 text-[16px] font-semibold" style={{ color: 'var(--text-primary)' }}>
             Welcome to Grok Bot
-          </div>
+          </h1>
           <p className="text-[13.5px] max-w-sm" style={{ color: 'var(--text-secondary)' }}>
             Select a teammate from the sidebar or create a new bot to start working.
           </p>

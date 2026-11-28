@@ -36,6 +36,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
         borderLeft: '1px solid var(--border-subtle)',
       }}
     >
+      <h2 className="sr-only">Inspector</h2>
       {/* Top 3-tab bar */}
       <div
         className="h-13 px-3 flex items-center justify-between gap-2 shrink-0"
@@ -51,6 +52,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={active}
+                aria-label={`${t.label}`}
                 onClick={() => setInspectorTab(t.id)}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium transition-colors"
                 style={{

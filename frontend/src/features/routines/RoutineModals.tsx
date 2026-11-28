@@ -135,6 +135,7 @@ export const CreateRoutineModal: React.FC<CreateRoutineModalProps> = ({
               <button
                 key={opt.id}
                 type="button"
+                aria-label={`${opt.label}`}
                 onClick={() => setScheduleType(opt.id)}
                 className="px-2.5 py-2 rounded-xl text-[12.5px] font-medium"
                 style={{
@@ -170,11 +171,17 @@ export const CreateRoutineModal: React.FC<CreateRoutineModalProps> = ({
               />
             </div>
             <div>
-              <label className="block text-[12px] font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+              <label
+                htmlFor="create-routine-timezone"
+                className="block text-[12px] font-medium mb-1"
+                style={{ color: 'var(--text-secondary)' }}
+              >
                 Timezone
               </label>
               <input
+                id="create-routine-timezone"
                 type="text"
+                aria-label="Timezone"
                 value={timezone}
                 onChange={(e) => setTimezone(e.target.value)}
                 className="w-full px-3 py-2 rounded-lg text-[13px] outline-none"
@@ -225,6 +232,7 @@ export const CreateRoutineModal: React.FC<CreateRoutineModalProps> = ({
           </button>
           <button
             type="submit"
+            aria-label="Create routine"
             disabled={!name.trim() || !instruction.trim() || createMutation.isPending}
             className="px-4 py-2 rounded-lg text-[13px] font-medium disabled:opacity-45"
             style={{
@@ -411,6 +419,7 @@ export const RoutineDetailModal: React.FC<RoutineDetailModalProps> = ({
                 <button
                   key={opt.id}
                   type="button"
+                  aria-label={`${opt.label}`}
                   onClick={() => setScheduleTypeDraft(opt.id)}
                   className="px-2.5 py-2 rounded-xl text-[12.5px] font-medium"
                   style={{
@@ -474,6 +483,7 @@ export const RoutineDetailModal: React.FC<RoutineDetailModalProps> = ({
               <label className="flex items-center gap-2 text-[13px] pt-5 cursor-pointer">
                 <input
                   type="checkbox"
+                  aria-label="Enabled"
                   checked={enabledDraft}
                   onChange={(e) => setEnabledDraft(e.target.checked)}
                 />
@@ -495,6 +505,7 @@ export const RoutineDetailModal: React.FC<RoutineDetailModalProps> = ({
               </button>
               <button
                 type="submit"
+                aria-label="Save changes"
                 disabled={!nameDraft.trim() || !instructionDraft.trim() || updateMutation.isPending}
                 className="px-4 py-2 rounded-lg text-[13px] font-medium disabled:opacity-45"
                 style={{
@@ -587,6 +598,7 @@ export const RoutineDetailModal: React.FC<RoutineDetailModalProps> = ({
                 <button
                   key={box.id}
                   type="button"
+                  aria-label={`Copy ${box.label}`}
                   onClick={() => void copyBox(box.id, box.value)}
                   className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors hover:bg-[var(--bg-active)]"
                   style={{
@@ -621,6 +633,7 @@ export const RoutineDetailModal: React.FC<RoutineDetailModalProps> = ({
                 </span>
                 <button
                   type="button"
+                  aria-label="Test now"
                   onClick={() => testMutation.mutate()}
                   disabled={testMutation.isPending}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[12px] font-medium"

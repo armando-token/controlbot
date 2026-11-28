@@ -36,6 +36,7 @@ import type {
   WorkspaceFileRead,
   WorkspaceFilesListing,
 } from './types';
+import { reportClientError } from './diagnostics';
 
 export class ApiError extends Error {
   status: number;
@@ -121,14 +122,38 @@ export async function apiFetch<T>(
     finalHeaders.set('Idempotency-Key', idempotencyKey);
   }
 
-  const res = await fetch(withAuthToken(url), {
-    ...rest,
-    headers: finalHeaders,
-    body,
-  });
+  let res: Response;
+  try {
+    res = await fetch(withAuthToken(url), {
+      ...rest,
+      headers: finalHeaders,
+      body,
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw err;
+    }
+    const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    reportClientError({
+      kind: 'fetch_network_error',
+      message,
+      stack: err instanceof Error ? err.stack ?? null : null,
+      url,
+      method: (rest.method ?? 'GET').toUpperCase(),
+    });
+    throw err;
+  }
 
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
+    reportClientError({
+      kind: 'api_http_error',
+      message: detail,
+      url,
+      method: (rest.method ?? 'GET').toUpperCase(),
+      status_code: res.status,
+      request_id: res.headers.get('x-request-id'),
+    });
     throw new ApiError(res.status, detail);
   }
 
@@ -239,12 +264,14 @@ export const threadsApi = {
       page_context_id?: string | null;
       skill_ids?: string[];
     },
+    options?: { signal?: AbortSignal },
   ) =>
     apiFetch<{ user_message: Message; turn_id: string; status: string }>(
       `/api/v1/threads/${encodeURIComponent(threadId)}/messages`,
       {
         method: 'POST',
         body: JSON.stringify(payload),
+        signal: options?.signal,
       },
     ),
   interrupt: (threadId: string) =>

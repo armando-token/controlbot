@@ -397,6 +397,8 @@ export function MemoryModal(): React.JSX.Element | null {
 
   const items: MemoryItem[] = memoryQuery.data?.items ?? [];
 
+  const createBtnLabel = createOpen ? 'Cancel' : 'New memory';
+
   return (
     <Modal
       open={open}
@@ -430,6 +432,7 @@ export function MemoryModal(): React.JSX.Element | null {
             <label className="inline-flex items-center gap-1.5 text-[12px] cursor-pointer">
               <input
                 type="checkbox"
+                aria-label="Include expired"
                 checked={includeExpired}
                 onChange={(e) => setIncludeExpired(e.target.checked)}
               />
@@ -478,6 +481,7 @@ export function MemoryModal(): React.JSX.Element | null {
 
             <button
               type="button"
+              aria-label={`${createBtnLabel}`}
               onClick={handleOpenCreate}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium"
               style={{
@@ -606,6 +610,7 @@ export function MemoryModal(): React.JSX.Element | null {
               <label className="space-y-1 text-[11.5px]">
                 <span style={{ color: 'var(--text-muted)' }}>ACL Scope</span>
                 <select
+                  aria-label="ACL Scope"
                   value={newScope}
                   onChange={(e) => {
                     const next = e.target.value as MemoryScope;
@@ -651,6 +656,7 @@ export function MemoryModal(): React.JSX.Element | null {
               <label className="space-y-1 text-[11.5px]">
                 <span style={{ color: 'var(--text-muted)' }}>Kind</span>
                 <select
+                  aria-label="Kind"
                   value={newKind}
                   onChange={(e) => setNewKind(e.target.value as MemoryKind)}
                   className="w-full px-2.5 py-1.5 rounded-lg text-[12.5px] outline-none"
@@ -670,6 +676,7 @@ export function MemoryModal(): React.JSX.Element | null {
               <label className="space-y-1 text-[11.5px]">
                 <span style={{ color: 'var(--text-muted)' }}>Provenance</span>
                 <select
+                  aria-label="Provenance"
                   value={newProvenance}
                   onChange={(e) => setNewProvenance(e.target.value)}
                   className="w-full px-2.5 py-1.5 rounded-lg text-[12.5px] outline-none"
@@ -850,6 +857,7 @@ export function MemoryModal(): React.JSX.Element | null {
                 <span style={{ color: 'var(--text-muted)' }}>Title</span>
                 <input
                   type="text"
+                  aria-label="Title"
                   value={editing.title}
                   onChange={(e) => setEditing({ ...editing, title: e.target.value })}
                   className="w-full px-2.5 py-1.5 rounded-lg text-[12.5px] outline-none"
@@ -880,6 +888,7 @@ export function MemoryModal(): React.JSX.Element | null {
               <span style={{ color: 'var(--text-muted)' }}>Content</span>
               <textarea
                 rows={4}
+                aria-label="Content"
                 value={editing.content}
                 onChange={(e) => setEditing({ ...editing, content: e.target.value })}
                 className="w-full px-2.5 py-1.5 rounded-lg text-[12.5px] outline-none resize-y"

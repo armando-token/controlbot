@@ -155,7 +155,7 @@ def resolve_cors_config(explicit_origins: Sequence[str] | None = None) -> CorsCo
 
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     allow_headers = ["Authorization", "Content-Type", "Idempotency-Key", "Last-Event-ID"]
-    expose_headers = ["Content-Disposition", "Retry-After"]
+    expose_headers = ["Content-Disposition", "Retry-After", "X-Request-Id"]
 
     if origins:
         if "*" in origins:

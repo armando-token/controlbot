@@ -102,6 +102,9 @@ class CandidatePatch(FrozenModel):
     files_to_modify: dict[str, str] = Field(default_factory=dict)
     repro_test_path: str | None = None
     repro_test_content: str | None = None
+    author_model: str | None = None
+    auditor_model: str | None = None
+    write_area: str | None = None
 
 
 class RollbackManifest(FrozenModel):
@@ -141,6 +144,8 @@ class CandidateRunRecord(FrozenModel):
     reason: NonEmptyStr
     manifest_path: str | None = None
     created_at: UtcDatetime = Field(default_factory=utc_now)
+    author_model: str | None = None
+    auditor_model: str | None = None
 
 
 class LessonRecord(FrozenModel):

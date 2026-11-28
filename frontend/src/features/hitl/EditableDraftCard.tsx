@@ -216,6 +216,7 @@ export const EditableDraftCard: React.FC<EditableDraftCardProps> = ({ card }) =>
             </span>
             <input
               type="text"
+              aria-label="To"
               disabled={!isPending}
               value={to}
               onFocus={() => {
@@ -241,6 +242,7 @@ export const EditableDraftCard: React.FC<EditableDraftCardProps> = ({ card }) =>
             </span>
             <input
               type="text"
+              aria-label="Bcc"
               disabled={!isPending}
               value={bcc}
               onFocus={() => {
@@ -269,6 +271,7 @@ export const EditableDraftCard: React.FC<EditableDraftCardProps> = ({ card }) =>
           </span>
           <input
             type="text"
+            aria-label="Subject"
             disabled={!isPending}
             value={subject}
             onFocus={() => {
@@ -295,6 +298,7 @@ export const EditableDraftCard: React.FC<EditableDraftCardProps> = ({ card }) =>
           </span>
           <textarea
             rows={4}
+            aria-label="Body"
             disabled={!isPending}
             value={body}
             onFocus={() => {
@@ -320,6 +324,7 @@ export const EditableDraftCard: React.FC<EditableDraftCardProps> = ({ card }) =>
             <label className="inline-flex items-center gap-2 text-[12px] cursor-pointer select-none">
               <input
                 type="checkbox"
+                aria-label="Remove signature"
                 checked={removeSignature}
                 onChange={(e) => {
                   dirtyRef.current.removeSignature = true;
